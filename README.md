@@ -2,7 +2,7 @@
 
 *क़ानूनगो — the officer who audited the patwaris' records.* qanungo is the **read-side application client** over your AI-coding session archive: it mirrors what munshi captured and patwari stored, derives insight at read time, and turns it into standups, coaching, cost analysis, instruction suggestions, and answers to plain-language questions about your past work — across every machine and every harness, from any browser. No VS Code.
 
-qanungo is the read-side analysis client designed and deferred in munshi [ADR 0012](https://github.com/surdy/munshi/blob/main/docs/adr/0012-defer-the-analysis-client-until-a-first-consumer-exists.md). Building it is the "first consumer" event that ADR waits for. Its web dashboard surface is named **darpan** (*दर्पण — the mirror*): the reflection qanungo holds up to your habits.
+qanungo is the read-side analysis client designed and deferred in munshi [ADR 0012](https://github.com/surdy/munshi/blob/main/docs/adr/0012-defer-the-analysis-client-until-a-first-consumer-exists.md). Building it is the "first consumer" event that ADR waits for. It exposes a web dashboard — just "the qanungo dashboard," a UI surface in this repo, not a separately-named product.
 
 Lineage: **munshi** (the scribe) → **patwari** (the record-keeper) → **qanungo** (the auditor who reviews the records).
 
@@ -12,7 +12,7 @@ Lineage: **munshi** (the scribe) → **patwari** (the record-keeper) → **qanun
 coding session → munshi (capture, normalize, summarize) → patwari (permanent, verified archive)
                                                                   │
                                                         qanungo (this repo)
-                                                        incremental mirror → derive → application commands → darpan dashboard
+                                                        incremental mirror → derive → application commands → dashboard
 ```
 
 - **munshi** captures and normalizes sessions; **patwari** is the central, permanent, content-addressed archive of every machine. qanungo consumes them; it never captures.
@@ -30,9 +30,9 @@ ADR 0012 anticipated qanungo carrying "application commands such as a prompt-cor
 - **cost** — token/cost breakdown by model/repo/machine, and premium-waste flags.
 - **skill & agent finder** — detects repeated multi-step prompt patterns and drafts a reusable skill or custom subagent from them.
 
-## darpan — the dashboard
+## The dashboard
 
-A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring munshi-dashboard's read-only, contract-consuming posture. Score cards + anti-pattern findings first, then timeline/heatmaps/output/context-health/chronicle. Every finding, chart point, and session row deep-links into `session-recall` → the uncapped, verified transcript in Patwari.
+A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring munshi-dashboard's read-only, contract-consuming posture. Score cards + anti-pattern findings first, then timeline/heatmaps/output/context-health/chronicle. Every finding, chart point, and session row deep-links into `session-recall` → the verified transcript in Patwari, **redacted** on the way to the browser (redaction is toggleable, default on).
 
 ## Skills & agents
 
