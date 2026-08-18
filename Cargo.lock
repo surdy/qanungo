@@ -398,7 +398,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "munshi-transcript"
 version = "0.1.0"
-source = "git+ssh://git@github.com/surdy/munshi.git?rev=b255f4ff728d716cf1302e80ef74f1d1cf330c9d#b255f4ff728d716cf1302e80ef74f1d1cf330c9d"
+source = "git+ssh://git@github.com/surdy/munshi.git?rev=352a9d3#352a9d34ac2b9666958eebef1aebf4b0784e245b"
 dependencies = [
  "chrono",
  "serde",

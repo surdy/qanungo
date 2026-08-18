@@ -159,6 +159,10 @@ fn fire_and_forget_fires_on_one_request_with_unattended_errors() {
     let session = claude("rules/fire-and-forget.jsonl");
     assert_eq!(session.summary.user_requests, 1);
     assert_eq!(session.summary.tool_activities, 50);
+    // The fixture's 25 shell commands are all distinct on purpose: since munshi#77 typed
+    // the `command` field for claude-code, a fixture that re-ran one command 25 times
+    // would trip RetryLoop too, and this fixture exists to isolate FireAndForget.
+    assert_eq!(session.commands.busiest_runs(), Some(1));
     assert_eq!(session.tools.total.errors, 4);
 
     let findings = fires_only(&session, RuleId::FireAndForget);
@@ -170,9 +174,10 @@ fn fire_and_forget_fires_on_one_request_with_unattended_errors() {
     );
 }
 
-/// The one shape in the pinned interpreter that puts a `command` field on a tool event: a Codex
-/// rollout whose `local_shell_call` records run the same command six times, with two one-off
-/// commands interleaved so the fold has to group by value rather than count events.
+/// A Codex rollout whose `local_shell_call` records run the same command six times, with two
+/// one-off commands interleaved so the fold has to group by value rather than count events.
+/// (`local_shell_call` was the one shape carrying a `command` field when this fixture was cut;
+/// munshi#77 has since typed it for the claude-code and copilot shells too.)
 #[test]
 fn retry_loop_fires_on_one_command_re_run_within_a_session() {
     let session = fold("rules/retry-loop.jsonl", "codex-cli");
@@ -195,28 +200,35 @@ fn retry_loop_fires_on_one_command_re_run_within_a_session() {
     );
 }
 
-/// The claude-code and copilot fixtures run plenty of shell commands, but their harnesses keep
-/// the command inside `input` / `arguments` rather than in a `command` field, so the fold claims
-/// nothing about their churn — not zero churn.
+/// The munshi#77 pull loop closed: the interpreter now types a `command` field for claude-code
+/// and copilot shell events, so fixtures that run shell commands carry a churn reading with no
+/// qanungo changes. A session whose tool activity records no command still claims nothing — the
+/// no-signal-no-claim posture outlives the field landing; it just applies to fewer sessions.
 #[test]
-fn harnesses_that_record_no_command_field_get_no_churn_reading() {
+fn churn_reads_exactly_the_sessions_that_record_a_command_field() {
     for (relative, agent) in [
-        ("munshi/claude-code-2.1.44-normal.jsonl", "claude-code"),
         ("munshi/copilot-1.0.76-tool-activity.jsonl", "copilot-cli"),
         ("rules/high-tool-error-rate.jsonl", "claude-code"),
     ] {
         let session = fold(relative, agent);
         assert!(
-            session.summary.tool_activities > 0,
-            "{relative} must have tool activity to make the point"
+            session.commands.measurable(),
+            "{relative} runs shell commands, so the typed field must give it a reading"
         );
-        assert!(
-            !session.commands.measurable(),
-            "{relative} recorded no command field"
-        );
-        assert_eq!(session.commands.repeat_share(), None);
-        assert_eq!(session.commands.busiest_runs(), None);
+        assert!(session.commands.repeat_share().is_some());
     }
+
+    let session = fold("munshi/claude-code-2.1.44-normal.jsonl", "claude-code");
+    assert!(
+        session.summary.tool_activities > 0,
+        "the no-claim case needs tool activity to make the point"
+    );
+    assert!(
+        !session.commands.measurable(),
+        "no shell command recorded means no churn reading, not zero"
+    );
+    assert_eq!(session.commands.repeat_share(), None);
+    assert_eq!(session.commands.busiest_runs(), None);
 }
 
 #[test]

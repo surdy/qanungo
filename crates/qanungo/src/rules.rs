@@ -26,10 +26,9 @@
 //! should start — but they are now arbitrary at a *measured* point rather than at a guessed one,
 //! and the measurement is written down beside them.
 //!
-//! [`thresholds::RETRY_LOOP_REPEATS`] is a third case, and the weakest: the signal it reads does
-//! not appear in the archive at all yet, so it was set against a proxy measurement of a different
-//! field. What was measured, and how far that is from what the rule tests, is written down beside
-//! it too.
+//! [`thresholds::RETRY_LOOP_REPEATS`] was briefly a third case — set against a proxy while the
+//! archive held none of the signal it reads — until munshi#77 typed the `command` field and the
+//! live fold confirmed the proxy's numbers. Both rounds are written down beside it.
 
 use crate::format;
 use crate::metrics::{SessionMetrics, ToolTally};
@@ -50,21 +49,15 @@ pub mod thresholds {
     /// Times one *exact* command value must run inside a single session before the repetition
     /// reads as a retry loop rather than as ordinary re-checking.
     ///
-    /// **Measured, but at one remove — this is the weakest-founded constant here.** The rule
-    /// reads the `command` field, which in the pinned interpreter only Codex's `local_shell_call`
-    /// records, and the 2026-08-18 mirror holds *no* Codex transcripts at all (623 sessions:
-    /// claude-code 250, copilot-cli 373). There was therefore nothing in the archive to measure
-    /// the threshold against directly.
-    ///
-    /// It was set against a **proxy** instead: the same exact-match fold run offline over the
-    /// shell command nested inside claude-code's `tool_use.input` and copilot's
-    /// `tool.execution_start.arguments`, which the fold itself does not read. 415 of the 623
-    /// sessions carry one, and their busiest-command run counts are p50 1, p75 2, p90 4, p95 5,
-    /// p99 11, max 27; pooled, 5.1% of command-bearing calls are repeats. Six is just past that
-    /// p95 and selects 20 of 415 sessions (4.8%) — the same order as the marathon rule's 4.4%,
-    /// which is the only calibration claimed for it. Re-measure against real command fields when
-    /// a harness that emits them appears in the archive; until then this is a shape estimate from
-    /// a different signal, not a reading of the one the rule tests.
+    /// **Measured against the archive, in two rounds.** First calibrated (2026-08-18) against a
+    /// proxy — the same exact-match fold run offline over the command nested inside claude-code's
+    /// `tool_use.input` and copilot's `arguments`, before the interpreter typed the field —
+    /// giving busiest-run p95 = 5 and 5.1% pooled repeats over 415 command-bearing sessions.
+    /// Then munshi#77 promoted the field the same day and the live fold confirmed the proxy
+    /// almost exactly: 408 of 623 sessions measurable, 5% pooled repeats, and six-or-more
+    /// selecting 20 of 408 (4.9%, busiest run 27) — the same order as the marathon rule's 4.4%.
+    /// Still arbitrary in the doctrinal sense (nothing says the p95 is where coaching starts),
+    /// but no longer estimated from a different signal than the one the rule reads.
     pub const RETRY_LOOP_REPEATS: u64 = 6;
 
     /// Gap between consecutive records past which the operator is taken to have walked away.

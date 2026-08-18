@@ -42,21 +42,19 @@
 //!
 //! # What counts as a command
 //!
-//! Only a literal `command` **field** on a tool event enters the churn fold. In the pinned
-//! interpreter exactly one classifier writes that key: Codex's `local_shell_call`, from
-//! `payload.action.command`. Every other shape keeps the shell command one level down inside a
-//! JSON blob the interpreter carries verbatim but does not open — Claude Code's `tool_use.input`,
-//! Copilot's `tool.execution_start.arguments`, and Codex's own more common `function_call` /
-//! `shell` shape — and none of those is read here.
+//! Only a literal `command` **field** on a tool event enters the churn fold. The pinned
+//! interpreter types that key for every shell shape it certifies (munshi#77's first field
+//! promotion, the pull this metric named): Claude Code's `Bash` `tool_use`, Copilot's `bash` /
+//! `local_shell` execution events, and Codex's `local_shell_call` and `function_call`/`shell`.
+//! Extraction lives upstream on purpose — reaching into the `input`/`arguments` blobs from here
+//! would be this crate re-parsing transcript payloads, which is precisely what read-time
+//! interpretation through the shared crate exists to prevent.
 //!
-//! A session whose harness never records the field therefore has **no churn reading**, not a
-//! zero one, exactly as a harness that cannot express tool failure gets no error rate rather than
-//! a flattering zero. That under-claim is currently the whole archive: the 2026-08-18 mirror is
-//! 623 sessions of `claude-code` and `copilot-cli` and **zero** Codex transcripts, so the metric
-//! is dormant on real data and lives on fixtures until a typed command field lands for the other
-//! harnesses (munshi#77's one-field-at-a-time pull loop, qanungo#2). Reaching into `input` /
-//! `arguments` from here instead would be this crate re-parsing transcript payloads, which is
-//! precisely what read-time interpretation through the shared crate exists to prevent.
+//! A session that never records the field still has **no churn reading**, not a zero one,
+//! exactly as a harness that cannot express tool failure gets no error rate rather than a
+//! flattering zero. Post-promotion that is the honest minority: on the 2026-08-18 mirror,
+//! 408 of 623 sessions carry at least one command, and the rest — sessions that ran no shell —
+//! claim nothing.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
