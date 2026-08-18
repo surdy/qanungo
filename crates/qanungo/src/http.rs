@@ -7,10 +7,12 @@
 //! store with no TLS policy knobs (munshi ADR 0013); plain `http://` stays fully supported
 //! because the production archive is reached over the trusted LAN.
 //!
-//! Only what a read client needs is implemented: `GET`, response headers, chunked bodies (the
-//! artifact-content route streams, so its body always arrives chunked), and a per-request byte
-//! ceiling. There is no connection reuse and no retry — Patwari serves ~8 concurrent requests
-//! with a 30s timeout, and a client that retries into a busy LAN server makes things worse.
+//! Only what a read client needs is implemented: `GET`, response headers, both body framings
+//! (`Content-Length` is what the artifact-content route actually sends, since the server knows
+//! the stored size before it starts streaming; chunked is supported as the fallback), and a
+//! per-request byte ceiling on the buffered path. There is no connection reuse and no retry —
+//! Patwari serves ~8 concurrent requests with a 30s timeout, and a client that retries into a
+//! busy LAN server makes things worse.
 //!
 //! # Two ways to read a response
 //!
@@ -39,6 +41,12 @@
 //! read-progress timeout is for; a server that has given up mid-body closes the connection, the
 //! transfer comes up short of its declared size, and the download path refuses it as a
 //! verification failure rather than caching a prefix.
+//!
+//! The consequence is worth stating plainly: a peer that trickles one byte just inside every
+//! timeout window holds a streamed download open indefinitely, and by design nothing here stops
+//! it. Against the real archive that cannot happen, because the archive's own whole-body deadline
+//! bounds the transfer long before this client would care. A no-progress timeout is the right
+//! bound to reach for if this client ever has to read from something less disciplined.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -397,9 +405,11 @@ pub fn get(endpoint: &Endpoint, timeout: Duration, target: &str) -> Result<Respo
     get_with_limit(endpoint, timeout, target, MAX_RESPONSE_BYTES)
 }
 
-/// Like [`get`], but bounds the response at `max_response_bytes`. An artifact download raises the
-/// ceiling to the stored size the listing already declared, so a body longer than declared is
-/// truncated into a digest-verification failure rather than read into memory unbounded.
+/// Like [`get`], but bounds the response at `max_response_bytes`.
+///
+/// The bound is applied to the socket read rather than to the parsed document, so it covers the
+/// status line and headers as well as the body. Every caller is a JSON surface; artifact content
+/// goes through [`get_streaming`] instead, which has no whole-response ceiling.
 pub fn get_with_limit(
     endpoint: &Endpoint,
     timeout: Duration,
@@ -434,15 +444,7 @@ pub fn get_streaming(
     let head = read_head(&mut reader)?;
     let (status, headers) = parse_head(&head)?;
 
-    let chunked = header(&headers, "transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let length =
-        header(&headers, "content-length").and_then(|value| value.trim().parse::<u64>().ok());
-    let (framing, remaining) = match (chunked, length) {
-        (true, _) => (Framing::Chunked, 0),
-        (false, Some(length)) => (Framing::Length, length),
-        (false, None) => (Framing::UntilClose, 0),
-    };
+    let (framing, remaining) = framing_of(&headers)?;
 
     Ok(StreamingResponse {
         status,
@@ -455,6 +457,29 @@ pub fn get_streaming(
             finished: false,
         },
     })
+}
+
+/// Decides how the body ends, and how much of it the first frame owes.
+///
+/// A `Content-Length` that will not parse is a protocol error rather than a reason to fall back to
+/// reading until close. The digests would catch the resulting body either way, but they would
+/// catch it as a *verification* failure — reporting a peer that cannot write a header as an
+/// archive serving corrupt content is the wrong finding, and the difference matters in a Gaps
+/// line someone has to act on.
+fn framing_of(headers: &[(String, String)]) -> Result<(Framing, u64), HttpError> {
+    if header(headers, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return Ok((Framing::Chunked, 0));
+    }
+    match header(headers, "content-length") {
+        None => Ok((Framing::UntilClose, 0)),
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .map(|length| (Framing::Length, length))
+            .map_err(|_| HttpError::Protocol("unparseable content-length".to_owned())),
+    }
 }
 
 /// Reads exactly up to and including the `\r\n\r\n` head terminator, leaving the first body byte
@@ -685,6 +710,46 @@ mod tests {
         assert_eq!(status, 404);
         assert_eq!(header(&headers, "content-length"), Some("7"));
         assert_eq!(header(&headers, "X-PATWARI-COMPRESSION"), Some("zstd"));
+    }
+
+    #[test]
+    fn chooses_the_framing_the_headers_describe() {
+        let headers = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+
+        assert_eq!(
+            framing_of(&headers(&[("content-length", "1234")])).unwrap(),
+            (Framing::Length, 1234)
+        );
+        assert_eq!(
+            framing_of(&headers(&[])).unwrap(),
+            (Framing::UntilClose, 0),
+            "no framing header at all runs to end of stream"
+        );
+        assert_eq!(
+            framing_of(&headers(&[
+                ("transfer-encoding", "chunked"),
+                ("content-length", "1234"),
+            ]))
+            .unwrap(),
+            (Framing::Chunked, 0),
+            "chunked takes precedence over a length, per RFC 9112"
+        );
+
+        // A length that will not parse is the peer's protocol violation, not a reason to guess.
+        for bad in ["", "abc", "-1", "12 34"] {
+            assert!(
+                matches!(
+                    framing_of(&headers(&[("content-length", bad)])),
+                    Err(HttpError::Protocol(_))
+                ),
+                "content-length {bad:?} must not silently downgrade the framing"
+            );
+        }
     }
 
     #[test]

@@ -21,6 +21,10 @@
 //! file load-bearing rather than incidental: unverified bytes really do touch the disk, and the
 //! rename is the moment they become a blob.
 //!
+//! Because a staged write is now potentially hundreds of megabytes, and because the drop guard
+//! that removes it cannot run if the process is killed outright, [`BlobCache::open`] sweeps
+//! staged writes older than a day.
+//!
 //! [`stage`]: BlobCache::stage
 //! [`commit`]: BlobWrite::commit
 
@@ -28,6 +32,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -45,6 +50,11 @@ const BLOB_DIR: &str = "blobs";
 /// Write buffer in front of a staged blob file. A streaming decoder can emit small writes, and
 /// this keeps them from becoming small `write(2)` calls without holding anything of consequence.
 const STAGE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// How old a staged write must be before [`BlobCache::open`] treats it as orphaned and deletes
+/// it. A day is far longer than any download can plausibly take and far shorter than anyone would
+/// like to keep paying for a dead one.
+const ORPHAN_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Whether a run served a transcript from the cache or had to fetch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +80,54 @@ impl BlobCache {
         let root = root.into();
         create_private_dir(&root)?;
         create_private_dir(&root.join(BLOB_DIR))?;
-        Ok(Self { root })
+        let cache = Self { root };
+        cache.sweep_orphaned_temporaries();
+        Ok(cache)
+    }
+
+    /// Removes staged writes old enough that nothing can still be writing them.
+    ///
+    /// [`BlobWrite`]'s drop guard handles every failure the process survives, which is all of them
+    /// except the ones where it does not: `SIGKILL`, an OOM kill, a power cut. Those leave a
+    /// temporary behind, and a temporary is now potentially a few hundred megabytes of transcript
+    /// in a cache that has no eviction — so it has to be swept, or a handful of unlucky runs
+    /// quietly costs a gigabyte.
+    ///
+    /// The rule is deliberately blunt: older than [`ORPHAN_TEMPORARY_AGE`], delete. No pid
+    /// liveness check and no lock file, because the age already separates the two cases — a live
+    /// write is minutes old at the very most, and anything from a previous day is not coming back.
+    /// Failures here are ignored throughout: a cache that cannot be tidied is still a usable
+    /// cache, and this is housekeeping, not the caller's errand.
+    fn sweep_orphaned_temporaries(&self) {
+        let Ok(shards) = fs::read_dir(self.root.join(BLOB_DIR)) else {
+            return;
+        };
+        for shard in shards.filter_map(Result::ok) {
+            let Ok(entries) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let is_temporary = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.starts_with("tmp-"));
+                if !is_temporary {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| {
+                        modified
+                            .elapsed()
+                            .is_ok_and(|age| age >= ORPHAN_TEMPORARY_AGE)
+                    });
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
     }
 
     /// Opens the cache at the default location: `$XDG_CACHE_HOME/qanungo`, falling back to
@@ -365,6 +422,52 @@ mod tests {
             .read_to_string(&mut read_back)
             .unwrap();
         assert_eq!(read_back, "first second");
+    }
+
+    /// The sweep is the backstop for the failures the drop guard cannot see — a kill, an OOM, a
+    /// power cut — so what it must get right is the discrimination: stale staged writes go, live
+    /// ones and committed blobs stay.
+    #[test]
+    fn opening_sweeps_orphaned_staged_writes_and_spares_everything_else() {
+        use std::fs::FileTimes;
+        use std::time::SystemTime;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("qanungo");
+        let cache = BlobCache::open(&root).unwrap();
+        cache.store(DIGEST, b"a committed blob").unwrap();
+
+        let shard = root.join(BLOB_DIR).join(&DIGEST[..2]);
+        let orphan = shard.join(format!("{DIGEST}.tmp-1-0"));
+        let in_flight = shard.join(format!("{DIGEST}.tmp-2-0"));
+        fs::write(&orphan, b"a staged write nobody will finish").unwrap();
+        fs::write(&in_flight, b"a staged write in progress").unwrap();
+
+        // Age the orphan past the threshold — and the committed blob with it, since a blob must
+        // survive the sweep at any age at all.
+        let aged = FileTimes::new()
+            .set_modified(SystemTime::now() - ORPHAN_TEMPORARY_AGE - Duration::from_secs(60));
+        for path in [&orphan, &shard.join(DIGEST)] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(aged)
+                .unwrap();
+        }
+
+        drop(cache);
+        let swept = BlobCache::open(&root).unwrap();
+
+        assert!(!orphan.exists(), "a day-old staged write must be swept");
+        assert!(
+            in_flight.exists(),
+            "a staged write that could still be in progress must survive"
+        );
+        assert!(
+            swept.contains(DIGEST),
+            "a committed blob is not a temporary at any age"
+        );
     }
 
     #[test]

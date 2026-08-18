@@ -23,8 +23,18 @@
 //! [`ReadClient::download_transcript`] streams. The stored bytes are read off the socket a buffer
 //! at a time, hashed and counted as they arrive, decoded per the declared compression, and the
 //! recovered original bytes are hashed, counted, and written straight through to the caller's
-//! sink. Peak memory is the transfer buffer, whatever the transcript weighs — a 231 MB session
-//! and a 4 KB one cost the same RAM.
+//! sink.
+//!
+//! Peak memory is a fixed set of buffers, whatever the transcript weighs — a 231 MB session and a
+//! 4 KB one cost the same RAM. Per download in flight that is the transfer buffer
+//! ([`TRANSFER_BUFFER_BYTES`], 256 KiB), the socket reader (`http::STREAM_BUFFER_BYTES`, 64 KiB),
+//! the decoder's output buffer (libzstd's `ZSTD_DStreamOutSize`, ~128 KiB), the decompression
+//! window ([`MAX_DECOMPRESSION_WINDOW_LOG`], 8 MiB), and the cache's write buffer
+//! (`cache::STAGE_BUFFER_BYTES`, 64 KiB) — call it 8.5 MiB, times the worker count.
+//!
+//! The window is the only one of those that is not a constant we chose outright, and it is the
+//! only one a hostile artifact could otherwise inflate, so it is pinned explicitly below rather
+//! than left at libzstd's default.
 //!
 //! Nothing is *accepted* until every declaration has checked out: the transferred stored bytes
 //! must match the declared stored size and digest, and the recovered original must match the
@@ -76,14 +86,30 @@ const MAX_LISTING_PAGES: usize = 10_000;
 /// Sanity ceiling on the sizes an artifact *declares*, in either its stored or its original form.
 ///
 /// This is a disk-space guard, not a memory bound. The download streams, so a transcript costs
-/// the transfer buffer and nothing more however large it is; what this stops is a lying listing
-/// talking the mirror into filling the cache filesystem before a single digest can disagree with
-/// it. It is deliberately far above any plausible transcript — a coaching report should never see
-/// this fire, and if it does, the archive is wrong rather than the session being long.
+/// the same fixed set of buffers however large it is (see the module docs); what this stops is a
+/// lying listing talking the mirror into filling the cache filesystem before a single digest can
+/// disagree with it. It is deliberately far above any plausible transcript — a coaching report
+/// should never see this fire, and if it does, the archive is wrong rather than the session long.
 pub const MAX_DECLARED_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// Stored bytes read from the socket per pass. Sets the peak memory of a download, together with
-/// the decoder's own output buffer.
+/// Stored bytes read from the socket per pass. One of the fixed buffers a download's peak memory
+/// is made of; see the module docs for the rest.
 const TRANSFER_BUFFER_BYTES: usize = 256 * 1024;
+/// Base-2 log of the largest zstd back-reference window this client will decode with: 2^23, or
+/// 8 MiB.
+///
+/// libzstd defaults `windowLogMax` to 2^27 — 128 MiB of window per decoder, which a hostile frame
+/// can demand simply by declaring it, and which four mirror workers would turn into half a
+/// gigabyte. Nothing the archive actually holds needs anywhere near that: Munshi compresses
+/// transcripts at zstd level 3, whose window is 2^21 (2 MiB), and even level 19 stays at 2^23. So
+/// this is set to 2^23 — comfortable headroom over anything an honest capture produces, and a
+/// hard ceiling on what a dishonest one can cost. A frame declaring a larger window fails to
+/// decode and is refused as a [`PatwariError::Decompression`].
+const MAX_DECOMPRESSION_WINDOW_LOG: u32 = 23;
+/// Longest `error.code` this client will render. Comfortably over Patwari's own longest code and
+/// far under anything that could turn a Gaps line into a paragraph.
+const MAX_ERROR_CODE_CHARS: usize = 64;
+/// Stands in for an `error.code` that is not shaped like one.
+const INVALID_ERROR_CODE: &str = "invalid-error-code";
 
 /// The reserved logical path of the raw transcript inside a Munshi artifact set (Patwari ADR
 /// 0005: artifact roles are conveyed by logical path alone).
@@ -321,10 +347,14 @@ impl ReadClient {
         let mut original = MeteredSink::new(sink, original_size);
         let transferred = {
             let mut decode = match compression.as_str() {
-                "zstd" => Decode::Zstd(Box::new(
-                    zstd::stream::write::Decoder::new(&mut original)
-                        .map_err(|error| PatwariError::Decompression(error.to_string()))?,
-                )),
+                "zstd" => {
+                    let mut decoder = zstd::stream::write::Decoder::new(&mut original)
+                        .map_err(|error| PatwariError::Decompression(error.to_string()))?;
+                    decoder
+                        .window_log_max(MAX_DECOMPRESSION_WINDOW_LOG)
+                        .map_err(|error| PatwariError::Decompression(error.to_string()))?;
+                    Decode::Zstd(Box::new(decoder))
+                }
                 _ => Decode::Identity(&mut original),
             };
             transfer(response.body(), &mut stored, &mut decode)
@@ -619,11 +649,33 @@ pub fn strip_digest(value: &str) -> String {
     value.strip_prefix("sha256:").unwrap_or(value).to_owned()
 }
 
-/// Patwari's stable machine-readable `error.code`, when the body carries one.
+/// Patwari's stable machine-readable `error.code`, when the body carries one — clamped to a shape
+/// that is safe to render.
+///
+/// This is the only string this client lifts out of a response body it did not ask to parse, and
+/// it ends up in the report's Gaps section, so it is the one place a peer gets to put characters
+/// of its choosing into a document sworn to carry no upstream free text. The archive's own codes
+/// are short snake-case tokens (`artifact_not_found`, `request_timeout`); anything that is not
+/// shaped like one is not a code, whether the peer is confused, compromised, or not Patwari at
+/// all. Such a value is replaced rather than truncated, because a prefix of arbitrary text is
+/// still arbitrary text.
 fn error_code(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
+    let code = serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|value| nested_str(&value, &["error", "code"]))
+        .and_then(|value| nested_str(&value, &["error", "code"]))?;
+    Some(
+        if code.len() <= MAX_ERROR_CODE_CHARS && !code.is_empty() && code.bytes().all(is_code_byte)
+        {
+            code
+        } else {
+            INVALID_ERROR_CODE.to_owned()
+        },
+    )
+}
+
+/// Whether a byte may appear in a rendered `error.code`: lowercase alphanumerics, `_`, and `-`.
+fn is_code_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
 }
 
 fn header_digest(response: &StreamingResponse, name: &str) -> Result<String, PatwariError> {
@@ -693,6 +745,52 @@ mod tests {
         let mut meter = Meter::new(4);
         assert!(!meter.observe(b"abcde"));
         assert_eq!(meter.count, 0);
+    }
+
+    /// `error.code` is the only upstream string that reaches a rendered report, so the clamp on
+    /// it is a redaction control, not tidiness.
+    #[test]
+    fn an_error_code_is_rendered_only_when_it_is_shaped_like_one() {
+        let code = |body: &str| error_code(body.as_bytes());
+
+        assert_eq!(
+            code(r#"{"error":{"code":"artifact_not_found"}}"#).as_deref(),
+            Some("artifact_not_found")
+        );
+        assert_eq!(
+            code(r#"{"error":{"code":"request-timeout-2"}}"#).as_deref(),
+            Some("request-timeout-2")
+        );
+
+        // A body with no code at all stays absent rather than becoming a placeholder.
+        assert_eq!(code(r#"{"error":{"message":"nope"}}"#), None);
+        assert_eq!(code("not json at all"), None);
+
+        // Anything else is replaced wholesale: a prefix of arbitrary text is still arbitrary text.
+        for hostile in [
+            r#"{"error":{"code":"has spaces"}}"#,
+            r#"{"error":{"code":"UPPERCASE"}}"#,
+            r#"{"error":{"code":"newline\ninjected"}}"#,
+            r#"{"error":{"code":"markup <b>|</b>"}}"#,
+            r#"{"error":{"code":""}}"#,
+        ] {
+            assert_eq!(
+                code(hostile).as_deref(),
+                Some(INVALID_ERROR_CODE),
+                "{hostile}"
+            );
+        }
+
+        let overlong = "a".repeat(MAX_ERROR_CODE_CHARS + 1);
+        assert_eq!(
+            code(&format!(r#"{{"error":{{"code":"{overlong}"}}}}"#)).as_deref(),
+            Some(INVALID_ERROR_CODE)
+        );
+        let at_the_limit = "a".repeat(MAX_ERROR_CODE_CHARS);
+        assert_eq!(
+            code(&format!(r#"{{"error":{{"code":"{at_the_limit}"}}}}"#)).as_deref(),
+            Some(at_the_limit.as_str())
+        );
     }
 
     #[test]

@@ -41,6 +41,11 @@ enum Corruption {
     /// read. Only the client's own declared-size bound can stop this one, and it has to stop it
     /// mid-stream rather than after the fact.
     ExtraStoredBytes,
+    /// The content headers declare a different original size than the listing did. Both are the
+    /// archive's own renderings of one manifest row, so disagreement means the archive is
+    /// contradicting itself — and the client has to refuse rather than pick a winner, because
+    /// whichever it picked would become the bound it enforces the transfer against.
+    HeaderSizeDisagreement,
 }
 
 /// The digest the [`Corruption::ListingDigest`] case advertises instead of the truth.
@@ -64,6 +69,9 @@ struct ArchivedSession {
     /// The `original_size_bytes` the archive advertises, in both the listing and the content
     /// headers, when that is deliberately not the truth. `None` means it is.
     declared_original_bytes: Option<u64>,
+    /// Serve the body as `Transfer-Encoding: chunked` in chunks of this size. `None` is
+    /// `Content-Length`, which is what the real server sends for a download.
+    wire_chunks: Option<usize>,
     /// A summary-only capture has no `transcript.jsonl` artifact at all.
     has_transcript: bool,
     corruption: Corruption,
@@ -90,6 +98,7 @@ impl ArchivedSession {
             stored,
             compression,
             declared_original_bytes: None,
+            wire_chunks: None,
             has_transcript: true,
             corruption: Corruption::None,
         }
@@ -107,10 +116,20 @@ impl ArchivedSession {
         &self.stored
     }
 
-    /// The `original_size_bytes` the archive advertises — the truth unless a fixture overrides it.
+    /// The `original_size_bytes` the *listing* advertises — the truth unless a fixture overrides
+    /// it.
     fn declared_original_bytes(&self) -> u64 {
         self.declared_original_bytes
             .unwrap_or(self.transcript.len() as u64)
+    }
+
+    /// The `original_size_bytes` the *content headers* advertise. The same number, except when a
+    /// fixture is deliberately making the archive contradict itself.
+    fn header_original_bytes(&self) -> u64 {
+        match self.corruption {
+            Corruption::HeaderSizeDisagreement => self.declared_original_bytes() + 1,
+            _ => self.declared_original_bytes(),
+        }
     }
 
     /// The `original_sha256` the *listing* advertises.
@@ -312,7 +331,7 @@ fn content_response(session: &ArchivedSession) -> Vec<u8> {
     let declared_stored_len = session.stored().len();
     let mut compression = session.compression;
     let mut body = session.stored().to_vec();
-    let mut chunked = false;
+    let mut chunk_size = session.wire_chunks;
     match session.corruption {
         Corruption::StoredBytes => {
             // Same length, one flipped byte: the size check passes, the digest check must not.
@@ -328,11 +347,11 @@ fn content_response(session: &ArchivedSession) -> Vec<u8> {
             // Chunked, so the client's read is not bounded by `Content-Length` and the declared
             // stored size is the only thing left that can stop the overrun.
             body.extend(std::iter::repeat_n(b'x', declared_stored_len + 4096));
-            chunked = true;
+            chunk_size = Some(body.len().max(1));
         }
-        Corruption::None | Corruption::ListingDigest => {}
+        Corruption::None | Corruption::ListingDigest | Corruption::HeaderSizeDisagreement => {}
     }
-    let framing = if chunked {
+    let framing = if chunk_size.is_some() {
         "Transfer-Encoding: chunked".to_owned()
     } else {
         format!("Content-Length: {declared_stored_len}")
@@ -346,16 +365,20 @@ fn content_response(session: &ArchivedSession) -> Vec<u8> {
          x-patwari-original-sha256: sha256:{}\r\n\
          x-patwari-stored-size-bytes: {declared_stored_len}\r\n\
          x-patwari-stored-sha256: sha256:{declared_stored_sha}\r\n\r\n",
-        session.declared_original_bytes(),
+        session.header_original_bytes(),
         session.original_sha256,
     )
     .into_bytes();
-    if chunked {
-        response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
-        response.extend_from_slice(&body);
-        response.extend_from_slice(b"\r\n0\r\n\r\n");
-    } else {
-        response.extend_from_slice(&body);
+    match chunk_size {
+        Some(size) => {
+            for chunk in body.chunks(size.max(1)) {
+                response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                response.extend_from_slice(chunk);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+        }
+        None => response.extend_from_slice(&body),
     }
     response
 }
@@ -552,6 +575,10 @@ fn corrupt_content_is_refused_at_every_stage_and_never_cached() {
             Corruption::ExtraStoredBytes,
             "stored bytes ran past the declared",
         ),
+        (
+            Corruption::HeaderSizeDisagreement,
+            "declared sizes disagree",
+        ),
     ] {
         let (base, requests) = spawn_archive(vec![ArchivedSession::corrupt(20, corruption)]);
         let (directory, cache) = cache();
@@ -665,6 +692,81 @@ fn a_transcript_past_the_old_cap_streams_verifies_caches_and_folds() {
     assert_eq!(fold.tools.by_tool["Bash"].attempts, 1);
     assert_eq!(fold.tools.by_tool["Bash"].errors, 0);
     assert_eq!(fold.summary.user_requests, 521);
+}
+
+/// `Content-Length` is what the real archive sends, so chunked framing is the path least likely
+/// to be exercised by accident and most likely to be wrong. Many small chunks put a chunk boundary
+/// inside almost every read, which is what makes the client carry the pending-terminator state
+/// across reads rather than resolving it within one.
+#[test]
+fn a_body_arriving_in_many_small_chunks_is_reassembled_and_verified() {
+    let mut session = ArchivedSession::claude(33, TRANSCRIPT, "zstd");
+    session.wire_chunks = Some(7);
+    let wire_bytes = session.stored().len() as u64;
+    assert!(
+        wire_bytes > 7 * 4,
+        "the fixture must span several chunks, or this proves nothing"
+    );
+
+    let (base, _requests) = spawn_archive(vec![session]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(
+        mirror.sessions[0].source_hash,
+        sha256_hex(TRANSCRIPT.as_bytes())
+    );
+    assert_eq!(mirror.stats.bytes_transferred, wire_bytes);
+    assert!(cache.contains(&mirror.sessions[0].source_hash));
+}
+
+/// The decompression window is the one buffer in a download whose size the *artifact* gets to
+/// choose, and libzstd's default ceiling for it is 128 MiB per decoder — half a gigabyte across
+/// four mirror workers, demanded by nothing more than a frame header. This pins that the client
+/// caps it instead.
+///
+/// The frame here is entirely honest about its content: correct bytes, correct stored digest,
+/// correct sizes. The only thing wrong with it is how much memory it asks for.
+#[test]
+fn a_frame_demanding_an_oversized_window_is_refused() {
+    use std::io::Write;
+
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder
+        .set_parameter(zstd::zstd_safe::CParameter::WindowLog(25))
+        .unwrap();
+    encoder
+        .set_parameter(zstd::zstd_safe::CParameter::ContentSizeFlag(false))
+        .unwrap();
+    encoder.write_all(TRANSCRIPT.as_bytes()).unwrap();
+    let wide_window = encoder.finish().unwrap();
+    assert!(
+        zstd::decode_all(wide_window.as_slice()).is_ok(),
+        "the fixture must be a decodable frame, refused only for its window"
+    );
+
+    let mut session = ArchivedSession::claude(34, TRANSCRIPT, "zstd");
+    session.stored = wide_window;
+
+    let (base, requests) = spawn_archive(vec![session]);
+    let (directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert!(mirror.sessions.is_empty());
+    let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
+        panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
+    };
+    assert!(
+        detail.contains("could not be decompressed"),
+        "an oversized window is a decompression refusal, not a verification failure: {detail}"
+    );
+    assert_eq!(requests.lock().unwrap().content_requests(), 1);
+    assert_eq!(blob_count(directory.path()), 0);
+    assert_eq!(mirror.stats.bytes_transferred, 0);
 }
 
 /// A zstd artifact that decompresses past the size the archive declared for it. The stored side
