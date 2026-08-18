@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/qanungo"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+chrono = { version = "0.4.41", default-features = false, features = ["std", "clock"] }
+clap = { version = "4.5.41", features = ["derive", "env"] }
+# The read-time transcript interpreter (munshi ADR 0011). Pinned by revision, not by branch:
+# what a fold *means* is decided by this crate's version-pinned format knowledge, so a report
+# must not silently change its numbers because the dependency moved.
+munshi-transcript = { git = "ssh://git@github.com/surdy/munshi.git", rev = "b255f4ff728d716cf1302e80ef74f1d1cf330c9d" }
+# TLS for the Caddy-published Patwari endpoints (munshi ADR 0013): rustls on the `ring`
+# provider, verifying against the system trust store with no policy knobs.
+rustls = { version = "0.23.29", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-native-certs = "0.8.1"
+serde_json = "1.0.141"
+sha2 = "0.10.9"
+tempfile = "3.20.0"
+thiserror = "2.0.12"
+# Patwari stores artifacts zstd-compressed and serves the *stored* bytes; a read client
+# decodes them itself (munshi ADR 0009).
+zstd = "0.13.3"

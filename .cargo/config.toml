@@ -1,0 +1,5 @@
+# `munshi-transcript` is pulled from the private `surdy/munshi` repository. Cargo's built-in
+# git transport has no access to the developer's ssh agent or `~/.ssh/config`, so fetches go
+# through the system `git` binary, which does.
+[net]
+git-fetch-with-cli = true

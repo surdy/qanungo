@@ -48,4 +48,23 @@ Thin read-only clients that call qanungo's API or the recall funnel ship in `con
 
 ## Status
 
-Bootstrapping. Full research + rationale: `~/repos/research/ai-coach/`. See issues for the phased plan.
+The **P0 vertical slice** ([#7](https://github.com/surdy/qanungo/issues/7)) exists: a `qanungo` CLI
+that syncs a minimal content-addressed mirror of the recent archive, folds three metrics over
+`munshi-transcript`'s typed events, evaluates four hardcoded rules, and emits a Markdown coaching
+report — findings as Problem / Action / `source_hash` evidence, with an instrumentation footer on
+every run.
+
+```sh
+cargo run -- report --last 30d                       # the production archive on the LAN
+cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
+```
+
+`--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the transcript cache, which
+otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` /
+`0o600`. The report renders **aggregates, tool names, and content hashes only** — never transcript
+content. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, explicitly arbitrary
+until the footer's fold-cost and rule-firing data say otherwise.
+
+Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), scoring and trends (#4),
+the dashboard (#5), the narrator (#6). Full research + rationale: `~/repos/research/ai-coach/`. See
+issues for the phased plan.
