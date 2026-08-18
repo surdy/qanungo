@@ -211,8 +211,21 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
             transferred_bytes: 0,
         };
     }
-    let bytes = match client.download_transcript(transcript) {
-        Ok(bytes) => bytes,
+    // The transcript is streamed straight into a staged cache write: it is never held in memory,
+    // and it becomes a blob only once the download has verified every digest and size the archive
+    // declared. Dropping the staged write on any failure below unlinks the partial file, so an
+    // aborted transfer leaves the cache exactly as it found it.
+    let mut staged = match cache.stage(&mirrored.source_hash) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return skip(
+                &snapshot.source_agent,
+                SkipReason::Unreadable(format!("cache write failed: {error}")),
+            );
+        }
+    };
+    let receipt = match client.download_transcript(transcript, &mut staged) {
+        Ok(receipt) => receipt,
         Err(error) => {
             return skip(
                 &snapshot.source_agent,
@@ -220,9 +233,7 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
             );
         }
     };
-    // The download already proved these bytes hash to `source_hash` against the archive's own
-    // declaration, so the cache stores them without re-hashing.
-    if let Err(error) = cache.store(&mirrored.source_hash, &bytes) {
+    if let Err(error) = staged.commit() {
         return skip(
             &snapshot.source_agent,
             SkipReason::Unreadable(format!("cache write failed: {error}")),
@@ -231,9 +242,10 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
     Outcome::Mirrored {
         session: mirrored,
         lookup: crate::cache::Lookup::Miss,
-        // The stored size is what crossed the wire; the decompressed transcript this became is
-        // counted separately as bytes folded.
-        transferred_bytes: transcript.stored_size_bytes,
+        // What the receipt counted crossing the wire, not what the listing promised would: the
+        // two agree by the time a download succeeds, and counting the measurement keeps the
+        // footer a record of the transfer rather than a restatement of the plan.
+        transferred_bytes: receipt.stored_bytes,
     }
 }
 

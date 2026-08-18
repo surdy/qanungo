@@ -6,12 +6,13 @@
 //! headers — so these tests exercise the real client without needing a server, a network, or a
 //! populated archive. The live server is verified separately by running the binary against it.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use qanungo::cache::BlobCache;
-use qanungo::patwari::{ReadClient, sha256_hex};
+use qanungo::metrics;
+use qanungo::patwari::{MAX_DECLARED_TRANSCRIPT_BYTES, ReadClient, sha256_hex};
 use qanungo::sync::{self, SkipReason};
 
 // ---------------------------------------------------------------------------
@@ -36,12 +37,15 @@ enum Corruption {
     /// key and the hash a finding cites, so accepting these bytes would file evidence under a
     /// hash that does not describe them.
     ListingDigest,
+    /// *More* stored bytes than declared, framed as chunked so no `Content-Length` bounds the
+    /// read. Only the client's own declared-size bound can stop this one, and it has to stop it
+    /// mid-stream rather than after the fact.
+    ExtraStoredBytes,
 }
 
 /// The digest the [`Corruption::ListingDigest`] case advertises instead of the truth.
 const WRONG_DIGEST: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
 
-#[derive(Clone)]
 struct ArchivedSession {
     session_id: String,
     snapshot_id: String,
@@ -49,8 +53,17 @@ struct ArchivedSession {
     source_agent: String,
     artifact_set_version: u16,
     transcript: Vec<u8>,
+    /// The stored form, computed once at construction. Fixtures reach tens of megabytes, and
+    /// re-deriving this per request would make the stand-in, not the client, the thing under
+    /// test.
+    stored: Vec<u8>,
+    /// The honest digest of `transcript`, hashed once for the same reason.
+    original_sha256: String,
     /// `identity` or `zstd`, matching Patwari's own compression vocabulary.
     compression: &'static str,
+    /// The `original_size_bytes` the archive advertises, in both the listing and the content
+    /// headers, when that is deliberately not the truth. `None` means it is.
+    declared_original_bytes: Option<u64>,
     /// A summary-only capture has no `transcript.jsonl` artifact at all.
     has_transcript: bool,
     corruption: Corruption,
@@ -58,14 +71,25 @@ struct ArchivedSession {
 
 impl ArchivedSession {
     fn claude(index: u8, transcript: &str, compression: &'static str) -> Self {
+        Self::from_bytes(index, transcript.as_bytes().to_vec(), compression)
+    }
+
+    fn from_bytes(index: u8, transcript: Vec<u8>, compression: &'static str) -> Self {
+        let stored = match compression {
+            "zstd" => zstd::encode_all(transcript.as_slice(), 3).unwrap(),
+            _ => transcript.clone(),
+        };
         Self {
             session_id: format!("{index:02x}").repeat(16),
-            snapshot_id: format!("{:02x}", index + 100).repeat(16),
-            artifact_id: format!("{:02x}", index + 200).repeat(16),
+            snapshot_id: format!("{:02x}", index.wrapping_add(100)).repeat(16),
+            artifact_id: format!("{:02x}", index.wrapping_add(200)).repeat(16),
             source_agent: "claude-code".to_owned(),
             artifact_set_version: 2,
-            transcript: transcript.as_bytes().to_vec(),
+            original_sha256: sha256_hex(&transcript),
+            transcript,
+            stored,
             compression,
+            declared_original_bytes: None,
             has_transcript: true,
             corruption: Corruption::None,
         }
@@ -79,18 +103,21 @@ impl ArchivedSession {
     }
 
     /// The bytes the archive honestly holds, before any corruption is applied to the wire.
-    fn stored(&self) -> Vec<u8> {
-        match self.compression {
-            "zstd" => zstd::encode_all(self.transcript.as_slice(), 3).unwrap(),
-            _ => self.transcript.clone(),
-        }
+    fn stored(&self) -> &[u8] {
+        &self.stored
+    }
+
+    /// The `original_size_bytes` the archive advertises — the truth unless a fixture overrides it.
+    fn declared_original_bytes(&self) -> u64 {
+        self.declared_original_bytes
+            .unwrap_or(self.transcript.len() as u64)
     }
 
     /// The `original_sha256` the *listing* advertises.
-    fn listed_original_sha256(&self) -> String {
+    fn listed_original_sha256(&self) -> &str {
         match self.corruption {
-            Corruption::ListingDigest => WRONG_DIGEST.to_owned(),
-            _ => sha256_hex(&self.transcript),
+            Corruption::ListingDigest => WRONG_DIGEST,
+            _ => &self.original_sha256,
         }
     }
 }
@@ -110,15 +137,19 @@ impl Requests {
 }
 
 /// Serves `sessions` until the test process exits, and returns its base URL.
+///
+/// The fixtures are shared rather than cloned per connection: a multi-megabyte transcript is a
+/// deliberate case here, and a stand-in that copied one per request would measure the copy.
 fn spawn_archive(sessions: Vec<ArchivedSession>) -> (String, Arc<Mutex<Requests>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let base = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Requests::default()));
     let recorded = Arc::clone(&requests);
+    let sessions = Arc::new(sessions);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let sessions = sessions.clone();
+            let sessions = Arc::clone(&sessions);
             let recorded = Arc::clone(&recorded);
             std::thread::spawn(move || serve(stream, &sessions, &recorded));
         }
@@ -224,10 +255,10 @@ fn snapshot_document(session: &ArchivedSession) -> String {
                 "metadata_url":"/api/v1/artifacts/{}",
                 "content_url":"/api/v1/artifacts/{}/content"}}]"#,
             session.artifact_id,
-            session.transcript.len(),
+            session.declared_original_bytes(),
             session.listed_original_sha256(),
             stored.len(),
-            sha256_hex(&stored),
+            sha256_hex(stored),
             session.compression,
             session.artifact_id,
             session.artifact_id,
@@ -277,11 +308,11 @@ fn content_response(session: &ArchivedSession) -> Vec<u8> {
     // Everything the headers declare is computed from the honest bytes; the corruption is then
     // applied to what actually goes on the wire, exactly as a damaged blob or a lying peer would
     // present it.
-    let honest = session.stored();
-    let declared_stored_sha = sha256_hex(&honest);
-    let declared_stored_len = honest.len();
+    let declared_stored_sha = sha256_hex(session.stored());
+    let declared_stored_len = session.stored().len();
     let mut compression = session.compression;
-    let mut body = honest;
+    let mut body = session.stored().to_vec();
+    let mut chunked = false;
     match session.corruption {
         Corruption::StoredBytes => {
             // Same length, one flipped byte: the size check passes, the digest check must not.
@@ -293,22 +324,39 @@ fn content_response(session: &ArchivedSession) -> Vec<u8> {
             body.truncate(body.len() / 2);
         }
         Corruption::UnknownCompression => compression = "brotli",
+        Corruption::ExtraStoredBytes => {
+            // Chunked, so the client's read is not bounded by `Content-Length` and the declared
+            // stored size is the only thing left that can stop the overrun.
+            body.extend(std::iter::repeat_n(b'x', declared_stored_len + 4096));
+            chunked = true;
+        }
         Corruption::None | Corruption::ListingDigest => {}
     }
+    let framing = if chunked {
+        "Transfer-Encoding: chunked".to_owned()
+    } else {
+        format!("Content-Length: {declared_stored_len}")
+    };
     let mut response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/jsonl\r\n\
-         Content-Length: {declared_stored_len}\r\n\
+         {framing}\r\n\
          x-patwari-compression: {compression}\r\n\
          x-patwari-original-size-bytes: {}\r\n\
          x-patwari-original-sha256: sha256:{}\r\n\
          x-patwari-stored-size-bytes: {declared_stored_len}\r\n\
          x-patwari-stored-sha256: sha256:{declared_stored_sha}\r\n\r\n",
-        session.transcript.len(),
-        sha256_hex(&session.transcript),
+        session.declared_original_bytes(),
+        session.original_sha256,
     )
     .into_bytes();
-    response.extend_from_slice(&body);
+    if chunked {
+        response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        response.extend_from_slice(&body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+    } else {
+        response.extend_from_slice(&body);
+    }
     response
 }
 
@@ -500,6 +548,10 @@ fn corrupt_content_is_refused_at_every_stage_and_never_cached() {
             Corruption::ListingDigest,
             "does not match the listing's declared",
         ),
+        (
+            Corruption::ExtraStoredBytes,
+            "stored bytes ran past the declared",
+        ),
     ] {
         let (base, requests) = spawn_archive(vec![ArchivedSession::corrupt(20, corruption)]);
         let (directory, cache) = cache();
@@ -532,6 +584,143 @@ fn corrupt_content_is_refused_at_every_stage_and_never_cached() {
         assert_eq!(mirror.stats.cache_misses, 0);
         assert_eq!(mirror.stats.bytes_transferred, 0);
     }
+}
+
+/// A transcript comfortably past the 64 MiB ceiling the download path used to refuse outright.
+///
+/// Built from a few hundred large records rather than a million small ones, so the fold parses
+/// realistic line lengths at a realistic cost, and deliberately highly compressible: the wire form
+/// is a few kilobytes while the folded form is tens of megabytes, which is exactly the shape the
+/// old cap got wrong. It applied to the *original* size, so it skipped the long tool-heavy
+/// sessions the coaching rules care most about while their stored form would have transferred in
+/// a blink.
+fn oversized_transcript() -> Vec<u8> {
+    const PADDING_BYTES: usize = 128 * 1024;
+    const RECORDS: usize = 520;
+    let padding = "a".repeat(PADDING_BYTES);
+    let mut transcript = String::with_capacity(RECORDS * (PADDING_BYTES + 128) + TRANSCRIPT.len());
+    for index in 0..RECORDS {
+        transcript.push_str(&format!(
+            r#"{{"type":"user","uuid":"pad{index}","timestamp":"2026-08-10T09:00:00.000Z","message":{{"role":"user","content":"{padding}"}}}}"#
+        ));
+        transcript.push('\n');
+    }
+    // The tool-bearing tail, so the fold has something to count besides padding.
+    transcript.push_str(TRANSCRIPT);
+    transcript.into_bytes()
+}
+
+/// The regression this whole change exists for: a transcript larger than the removed cap must
+/// transfer, verify, cache, and fold — with the wire cost being the compressed form and the fold
+/// reading the full original off disk.
+#[test]
+fn a_transcript_past_the_old_cap_streams_verifies_caches_and_folds() {
+    const OLD_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+    let transcript = oversized_transcript();
+    assert!(
+        transcript.len() as u64 > OLD_CAP_BYTES,
+        "the fixture has to clear the cap it is here to prove is gone"
+    );
+    let digest = sha256_hex(&transcript);
+    let session = ArchivedSession::from_bytes(30, transcript.clone(), "zstd");
+    let wire_bytes = session.stored().len() as u64;
+    assert!(
+        wire_bytes < OLD_CAP_BYTES,
+        "the stored form must be the small one, or this proves nothing about the wire"
+    );
+
+    let (base, _requests) = spawn_archive(vec![session]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
+    assert_eq!(mirror.sessions.len(), 1);
+    let mirrored = &mirror.sessions[0];
+    assert_eq!(mirrored.source_hash, digest);
+    assert_eq!(mirrored.size_bytes, transcript.len() as u64);
+    // Wire cost is the stored form; fold cost is the original. The footer keeps them apart.
+    assert_eq!(mirror.stats.bytes_transferred, wire_bytes);
+    assert_eq!(mirror.stats.cache_misses, 1);
+
+    // The blob on disk is the whole decompressed transcript, byte for byte.
+    let mut cached = Vec::new();
+    cache
+        .open_blob(&digest)
+        .unwrap()
+        .read_to_end(&mut cached)
+        .unwrap();
+    assert_eq!(cached.len(), transcript.len());
+    assert_eq!(sha256_hex(&cached), digest);
+
+    // And it folds off disk, streaming, with the tool tail counted.
+    let source = metrics::source_for_agent(&mirrored.source_agent).unwrap();
+    let fold = metrics::fold_transcript(
+        source,
+        mirrored.artifact_set_version,
+        BufReader::new(cache.open_blob(&digest).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(fold.tools.by_tool["Bash"].attempts, 1);
+    assert_eq!(fold.tools.by_tool["Bash"].errors, 0);
+    assert_eq!(fold.summary.user_requests, 521);
+}
+
+/// A zstd artifact that decompresses past the size the archive declared for it. The stored side
+/// is entirely honest, so only the original-side bound can stop this, and it has to stop it while
+/// the frame is still being decoded rather than after the disk has taken the whole bomb.
+#[test]
+fn more_decompressed_bytes_than_declared_aborts_the_transfer() {
+    let bomb = vec![b'a'; 8 * 1024 * 1024];
+    let mut session = ArchivedSession::from_bytes(31, bomb, "zstd");
+    session.declared_original_bytes = Some(1024);
+
+    let (base, requests) = spawn_archive(vec![session]);
+    let (directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert!(mirror.sessions.is_empty());
+    let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
+        panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
+    };
+    assert!(
+        detail.contains("decompressed bytes ran past the declared 1024"),
+        "{detail}"
+    );
+    assert_eq!(requests.lock().unwrap().content_requests(), 1);
+    assert_eq!(
+        blob_count(directory.path()),
+        0,
+        "an aborted transfer must leave nothing behind, staged or otherwise"
+    );
+    assert_eq!(mirror.stats.bytes_transferred, 0);
+}
+
+/// The sanity ceiling is a disk-space guard on what the archive *claims*, so it has to fire
+/// before a byte of content is requested rather than partway through one.
+#[test]
+fn a_declared_size_past_the_ceiling_is_refused_before_any_transfer() {
+    let mut session = ArchivedSession::claude(32, TRANSCRIPT, "identity");
+    session.declared_original_bytes = Some(MAX_DECLARED_TRANSCRIPT_BYTES + 1);
+
+    let (base, requests) = spawn_archive(vec![session]);
+    let (directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert!(mirror.sessions.is_empty());
+    let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
+        panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
+    };
+    assert!(detail.contains("declared-size ceiling"), "{detail}");
+    assert_eq!(
+        requests.lock().unwrap().content_requests(),
+        0,
+        "an absurd declaration must not be dignified with a transfer"
+    );
+    assert_eq!(blob_count(directory.path()), 0);
 }
 
 /// Files anywhere under a cache root, temporary or not.

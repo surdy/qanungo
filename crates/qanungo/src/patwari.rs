@@ -20,36 +20,70 @@
 //!
 //! # The verified download
 //!
-//! [`ReadClient::download_transcript`] never returns a byte it has not verified: the
-//! transferred stored bytes must match the declared stored size and digest, the bytes are then
-//! decoded per the declared compression, and the recovered original must match both the
-//! declared original size/digest and the digest the listing already promised. The size gate
-//! runs *before* the request, on both the stored and the original size, so a highly
-//! compressible artifact cannot decompress into unbounded memory.
+//! [`ReadClient::download_transcript`] streams. The stored bytes are read off the socket a buffer
+//! at a time, hashed and counted as they arrive, decoded per the declared compression, and the
+//! recovered original bytes are hashed, counted, and written straight through to the caller's
+//! sink. Peak memory is the transfer buffer, whatever the transcript weighs — a 231 MB session
+//! and a 4 KB one cost the same RAM.
+//!
+//! Nothing is *accepted* until every declaration has checked out: the transferred stored bytes
+//! must match the declared stored size and digest, and the recovered original must match the
+//! declared original size/digest and the digest the listing already promised. Because the bytes
+//! are streamed to a sink rather than returned, the sink is responsible for the last step — the
+//! blob cache stages a write and renames it into place only after this returns `Ok`, so bytes
+//! that fail verification are unlinked rather than cached.
+//!
+//! # Bounding a transfer without capping a transcript
+//!
+//! There is no ceiling on how large a transcript may be. There are two bounds that are not that:
+//!
+//! - **The declared sizes bound the transfer.** The moment actual stored bytes exceed the
+//!   declared stored size, or actual decompressed bytes exceed the declared original size, the
+//!   transfer aborts — mid-stream, before the excess is written anywhere. A zstd bomb and a
+//!   server that lies about a length both stop at the first byte past the promise, so neither can
+//!   spend memory or disk that was not declared up front.
+//! - **[`MAX_DECLARED_TRANSCRIPT_BYTES`] bounds the declarations.** A listing that claims an
+//!   absurd size is refused before a byte moves, purely so a lying archive cannot fill the disk.
+//!
+//! The declarations are worth trusting as bounds because the archive verified them at ingest and
+//! re-derives them from the canonical manifest on every read.
 
+use std::io::{self, Read, Write};
 use std::time::Duration;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::http::{self, Endpoint, HttpError};
+use crate::http::{self, Endpoint, HttpError, StreamingResponse};
 
 /// The API base path every Patwari route is nested under.
 const API_BASE: &str = "/api/v1";
-/// Network timeout for a single request, matching the server's own request timeout.
+/// Socket timeout, matching the server's own request timeout.
+///
+/// This bounds `connect` and each individual socket read, not the request as a whole (see
+/// [`crate::http`]). On the JSON surfaces that amounts to the same thing, because a listing
+/// arrives in one read. On a streamed download it deliberately does not: the transfer may run
+/// well past 30s as long as bytes keep arriving, and it is the *archive's* whole-body deadline —
+/// `PATWARI_REQUEST_TIMEOUT`, armed when it constructs the download response — that decides how
+/// long a large transcript actually has. A download the server cuts short comes up short of its
+/// declared stored size and is refused as a verification failure.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Page size requested from a listing — Patwari's maximum, so a window costs the fewest pages.
 const LISTING_PAGE_SIZE: usize = 100;
 /// Guards the pagination loop against a peer that never stops returning cursors.
 const MAX_LISTING_PAGES: usize = 10_000;
-/// Upper bound on one transcript, in both its stored and its original form. A transcript past
-/// this is skipped and counted rather than folded; nothing in a coaching report is worth
-/// materializing a quarter-gigabyte of JSONL for.
-pub const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
-/// Read-bound headroom over the declared stored size, covering the status line, the response
-/// headers, and chunked-encoding framing so an artifact at the cap still transfers completely.
-const RESPONSE_FRAMING_ALLOWANCE_BYTES: usize = 64 * 1024;
+/// Sanity ceiling on the sizes an artifact *declares*, in either its stored or its original form.
+///
+/// This is a disk-space guard, not a memory bound. The download streams, so a transcript costs
+/// the transfer buffer and nothing more however large it is; what this stops is a lying listing
+/// talking the mirror into filling the cache filesystem before a single digest can disagree with
+/// it. It is deliberately far above any plausible transcript — a coaching report should never see
+/// this fire, and if it does, the archive is wrong rather than the session being long.
+pub const MAX_DECLARED_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Stored bytes read from the socket per pass. Sets the peak memory of a download, together with
+/// the decoder's own output buffer.
+const TRANSFER_BUFFER_BYTES: usize = 256 * 1024;
 
 /// The reserved logical path of the raw transcript inside a Munshi artifact set (Patwari ADR
 /// 0005: artifact roles are conveyed by logical path alone).
@@ -67,8 +101,10 @@ pub enum PatwariError {
     Verification(String),
     #[error("stored bytes could not be decompressed: {0}")]
     Decompression(String),
-    #[error("artifact declares {size_bytes} bytes, over the {cap}-byte download cap")]
-    TooLarge { size_bytes: u64, cap: u64 },
+    #[error("verified bytes could not be written locally: {0}")]
+    Sink(String),
+    #[error("artifact declares {size_bytes} bytes, over the {ceiling}-byte declared-size ceiling")]
+    DeclaredSizeRefused { size_bytes: u64, ceiling: u64 },
 }
 
 /// One session in the report window, with the context Patwari projects from its latest
@@ -212,31 +248,40 @@ impl ReadClient {
         })
     }
 
-    /// Downloads one transcript artifact and returns its verified original bytes.
+    /// Streams one transcript artifact into `sink`, verifying every declaration the archive made
+    /// about it, and reports what actually moved.
+    ///
+    /// `sink` receives the *original* (decompressed) bytes, and receives them before they have
+    /// been fully verified — the digests are only complete once the last byte is through. A
+    /// caller must therefore treat what it wrote as provisional until this returns `Ok`;
+    /// [`BlobCache::stage`](crate::cache::BlobCache::stage) exists precisely to make that
+    /// discipline the default.
     ///
     /// # Errors
     ///
-    /// Returns [`PatwariError::TooLarge`] before any transfer when either declared size is over
-    /// [`MAX_TRANSCRIPT_BYTES`], and a verification error when the transferred or recovered
-    /// bytes do not match what the archive declared.
-    pub fn download_transcript(&self, artifact: &ListedArtifact) -> Result<Vec<u8>, PatwariError> {
+    /// Returns [`PatwariError::DeclaredSizeRefused`] before any transfer when either declared
+    /// size is over [`MAX_DECLARED_TRANSCRIPT_BYTES`], and a [`PatwariError::Verification`] when
+    /// the transfer runs past a declared size or the transferred or recovered bytes do not hash
+    /// to what the archive declared.
+    pub fn download_transcript(
+        &self,
+        artifact: &ListedArtifact,
+        sink: &mut impl Write,
+    ) -> Result<DownloadReceipt, PatwariError> {
         for size_bytes in [artifact.stored_size_bytes, artifact.original_size_bytes] {
-            if size_bytes > MAX_TRANSCRIPT_BYTES {
-                return Err(PatwariError::TooLarge {
+            if size_bytes > MAX_DECLARED_TRANSCRIPT_BYTES {
+                return Err(PatwariError::DeclaredSizeRefused {
                     size_bytes,
-                    cap: MAX_TRANSCRIPT_BYTES,
+                    ceiling: MAX_DECLARED_TRANSCRIPT_BYTES,
                 });
             }
         }
-        let limit = usize::try_from(artifact.stored_size_bytes)
-            .unwrap_or(usize::MAX)
-            .saturating_add(RESPONSE_FRAMING_ALLOWANCE_BYTES);
-        let response =
-            http::get_with_limit(&self.endpoint, self.timeout, &artifact.content_url, limit)?;
+        let mut response =
+            http::get_streaming(&self.endpoint, self.timeout, &artifact.content_url)?;
         if response.status != 200 {
             return Err(PatwariError::Status {
                 status: response.status,
-                code: error_code(&response.body),
+                code: error_code(&response.error_body()),
             });
         }
 
@@ -251,43 +296,89 @@ impl ReadClient {
         let stored_size = header_u64(&response, "x-patwari-stored-size-bytes")?;
         let original_size = header_u64(&response, "x-patwari-original-size-bytes")?;
 
-        // 1. The transferred stored bytes must be exactly what the archive says it stores.
-        let stored_bytes = response.body;
-        if stored_bytes.len() as u64 != stored_size {
+        // The listing and the content headers are two renderings of the same manifest row, so
+        // they have to agree before either is trusted as the bound the transfer aborts against.
+        // Disagreement is not a size problem to resolve by picking the smaller one; it means the
+        // archive is contradicting itself about the artifact under this digest.
+        if stored_size != artifact.stored_size_bytes
+            || original_size != artifact.original_size_bytes
+        {
             return Err(PatwariError::Verification(format!(
-                "stored size mismatch: got {} bytes, expected {stored_size}",
-                stored_bytes.len()
+                "declared sizes disagree: the listing says {}/{} stored/original, the content \
+                 headers say {stored_size}/{original_size}",
+                artifact.stored_size_bytes, artifact.original_size_bytes
             )));
         }
-        if sha256_hex(&stored_bytes) != stored_sha {
+        if !matches!(compression.as_str(), "identity" | "zstd") {
+            return Err(PatwariError::Protocol(format!(
+                "unknown compression `{compression}`"
+            )));
+        }
+
+        // The transfer: stored bytes metered on the way in, original bytes metered on the way
+        // out, neither side ever holding more than a buffer.
+        let mut stored = Meter::new(stored_size);
+        let mut original = MeteredSink::new(sink, original_size);
+        let transferred = {
+            let mut decode = match compression.as_str() {
+                "zstd" => Decode::Zstd(Box::new(
+                    zstd::stream::write::Decoder::new(&mut original)
+                        .map_err(|error| PatwariError::Decompression(error.to_string()))?,
+                )),
+                _ => Decode::Identity(&mut original),
+            };
+            transfer(response.body(), &mut stored, &mut decode)
+        };
+
+        match transferred {
+            Ok(()) => {}
+            Err(TransferError::Transport(error)) => return Err(PatwariError::Http(error)),
+            Err(TransferError::StoredOverflow) => {
+                return Err(PatwariError::Verification(format!(
+                    "stored bytes ran past the declared {stored_size}, aborted after {} bytes",
+                    stored.count
+                )));
+            }
+            Err(TransferError::Decode(error)) => {
+                return Err(if original.overflowed {
+                    PatwariError::Verification(format!(
+                        "decompressed bytes ran past the declared {original_size}, aborted after \
+                         {} bytes",
+                        original.meter.count
+                    ))
+                } else if original.sink_failed {
+                    PatwariError::Sink(error.to_string())
+                } else {
+                    PatwariError::Decompression(error.to_string())
+                });
+            }
+        }
+
+        // 1. The transferred stored bytes must be exactly what the archive says it stores. A
+        //    short body — a dropped connection, or the server's own download deadline expiring
+        //    mid-response — lands here rather than being cached as a prefix.
+        if stored.count != stored_size {
+            return Err(PatwariError::Verification(format!(
+                "stored size mismatch: got {} bytes, expected {stored_size}",
+                stored.count
+            )));
+        }
+        if stored.digest() != stored_sha {
             return Err(PatwariError::Verification(
                 "stored content hash does not match the archive's declared stored hash".to_owned(),
             ));
         }
 
-        // 2. Decode per the declared compression. The pre-transfer gate already bounded what
-        //    this can expand to.
-        let original_bytes = match compression.as_str() {
-            "identity" => stored_bytes,
-            "zstd" => zstd::decode_all(stored_bytes.as_slice())
-                .map_err(|error| PatwariError::Decompression(error.to_string()))?,
-            other => {
-                return Err(PatwariError::Protocol(format!(
-                    "unknown compression `{other}`"
-                )));
-            }
-        };
-
-        // 3. The recovered original must match both the response headers and the digest the
+        // 2. The recovered original must match both the response headers and the digest the
         //    snapshot listing already promised — which is the cache key and the cited
         //    `source_hash`, so a mismatch would corrupt evidence, not just a download.
-        if original_bytes.len() as u64 != original_size {
+        if original.meter.count != original_size {
             return Err(PatwariError::Verification(format!(
                 "original size mismatch: got {} bytes, expected {original_size}",
-                original_bytes.len()
+                original.meter.count
             )));
         }
-        let digest = sha256_hex(&original_bytes);
+        let digest = original.meter.digest();
         if digest != original_sha {
             return Err(PatwariError::Verification(
                 "decompressed content hash does not match the archive's declared original hash"
@@ -301,7 +392,10 @@ impl ReadClient {
                 artifact.original_sha256
             )));
         }
-        Ok(original_bytes)
+        Ok(DownloadReceipt {
+            stored_bytes: stored.count,
+            original_bytes: original.meter.count,
+        })
     }
 
     fn get_json(&self, target: &str) -> Result<Value, PatwariError> {
@@ -315,6 +409,157 @@ impl ReadClient {
         serde_json::from_slice(&response.body)
             .map_err(|error| PatwariError::Protocol(error.to_string()))
     }
+}
+
+/// What one verified download actually moved. The two numbers are the footer's two numbers: the
+/// stored form crossed the wire, the original form is what a fold will read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadReceipt {
+    /// Stored (compressed) bytes transferred and verified.
+    pub stored_bytes: u64,
+    /// Original bytes recovered, verified, and written to the sink.
+    pub original_bytes: u64,
+}
+
+/// Counts and hashes bytes as they pass, against a declared total.
+struct Meter {
+    hasher: Sha256,
+    count: u64,
+    declared: u64,
+}
+
+impl Meter {
+    fn new(declared: u64) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            count: 0,
+            declared,
+        }
+    }
+
+    /// Records `bytes`, reporting whether the declared total has been overrun. The overrun is
+    /// checked *before* the bytes are counted as accepted, so the transfer stops at the first
+    /// byte past the promise rather than one buffer later.
+    fn observe(&mut self, bytes: &[u8]) -> bool {
+        if self.count + bytes.len() as u64 > self.declared {
+            return false;
+        }
+        self.count += bytes.len() as u64;
+        self.hasher.update(bytes);
+        true
+    }
+
+    fn digest(&self) -> String {
+        hex_digest(self.hasher.clone().finalize())
+    }
+}
+
+/// The original-byte side of a transfer: meters what the decoder produces and passes it straight
+/// through to the caller's sink, so decompressed bytes are never accumulated.
+///
+/// The two failure flags exist because a `Write` can only fail as an `io::Error`, and the three
+/// ways this fails are three different findings: an artifact that decompresses past its declared
+/// size is a *verification* failure, a sink that will not take bytes is a *local* failure, and
+/// anything else came out of the decoder.
+struct MeteredSink<'a, W: Write> {
+    sink: &'a mut W,
+    meter: Meter,
+    overflowed: bool,
+    sink_failed: bool,
+}
+
+impl<'a, W: Write> MeteredSink<'a, W> {
+    fn new(sink: &'a mut W, declared: u64) -> Self {
+        Self {
+            sink,
+            meter: Meter::new(declared),
+            overflowed: false,
+            sink_failed: false,
+        }
+    }
+}
+
+impl<W: Write> Write for MeteredSink<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.meter.observe(bytes) {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed output ran past the declared original size",
+            ));
+        }
+        self.sink.write_all(bytes).inspect_err(|_| {
+            self.sink_failed = true;
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush().inspect_err(|_| {
+            self.sink_failed = true;
+        })
+    }
+}
+
+/// Streaming decode of stored bytes into original bytes.
+///
+/// Push-shaped rather than pull-shaped on purpose: with the decoder as a `Write`, the transfer
+/// loop keeps ownership of the socket and of the stored-side meter, so the stored bound is
+/// enforced by the same loop that reads the socket rather than from inside a decoder's buffer.
+enum Decode<'a, W: Write> {
+    Identity(&'a mut W),
+    Zstd(Box<zstd::stream::write::Decoder<'static, &'a mut W>>),
+}
+
+impl<W: Write> Decode<'_, W> {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Identity(sink) => sink.write_all(bytes),
+            Self::Zstd(decoder) => decoder.write_all(bytes),
+        }
+    }
+
+    /// Flushes whatever the decoder is still holding. Zstandard decompression produces its output
+    /// as input arrives, so there is no frame to finalize here; a truncated frame simply yields
+    /// fewer original bytes than declared, which the size and digest checks then refuse.
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Identity(sink) => sink.flush(),
+            Self::Zstd(decoder) => decoder.flush(),
+        }
+    }
+}
+
+/// How a transfer stopped, kept separate from [`PatwariError`] so the classification happens once
+/// the borrows on the meters have ended and both sides' counters can be read.
+enum TransferError {
+    Transport(HttpError),
+    StoredOverflow,
+    Decode(io::Error),
+}
+
+/// Reads the body to its end, metering the stored bytes and pushing them through the decoder.
+fn transfer<W: Write>(
+    body: &mut impl Read,
+    stored: &mut Meter,
+    decode: &mut Decode<'_, W>,
+) -> Result<(), TransferError> {
+    let mut buffer = vec![0_u8; TRANSFER_BUFFER_BYTES];
+    loop {
+        let read = body
+            .read(&mut buffer)
+            .map_err(|error| TransferError::Transport(HttpError::Transport(error.to_string())))?;
+        if read == 0 {
+            break;
+        }
+        if !stored.observe(&buffer[..read]) {
+            return Err(TransferError::StoredOverflow);
+        }
+        decode
+            .write_all(&buffer[..read])
+            .map_err(TransferError::Decode)?;
+    }
+    decode.flush().map_err(TransferError::Decode)
 }
 
 fn listed_session(item: &Value) -> Result<ListedSession, PatwariError> {
@@ -381,24 +626,30 @@ fn error_code(body: &[u8]) -> Option<String> {
         .and_then(|value| nested_str(&value, &["error", "code"]))
 }
 
-fn header_digest(response: &http::Response, name: &str) -> Result<String, PatwariError> {
+fn header_digest(response: &StreamingResponse, name: &str) -> Result<String, PatwariError> {
     let value = response
         .header(name)
         .ok_or_else(|| PatwariError::Protocol(format!("artifact content missing {name}")))?;
     Ok(strip_digest(value))
 }
 
-fn header_u64(response: &http::Response, name: &str) -> Result<u64, PatwariError> {
+fn header_u64(response: &StreamingResponse, name: &str) -> Result<u64, PatwariError> {
     response
         .header(name)
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| PatwariError::Protocol(format!("artifact content missing {name}")))
 }
 
-/// Lowercase hexadecimal sha256 of `bytes`.
+/// Lowercase hexadecimal sha256 of `bytes`. One-shot: the download path hashes incrementally
+/// instead, because it never holds the bytes it is hashing.
 pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+/// Renders a digest as lowercase hexadecimal.
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
+    let digest = digest.as_ref();
     let mut value = String::with_capacity(digest.len() * 2);
     for byte in digest {
         value.push(char::from(HEX[usize::from(byte >> 4)]));
@@ -415,6 +666,33 @@ mod tests {
     fn strips_the_document_digest_prefix_idempotently() {
         assert_eq!(strip_digest("sha256:abc123"), "abc123");
         assert_eq!(strip_digest("abc123"), "abc123");
+    }
+
+    /// The bound has to admit an artifact that is exactly as large as it said it would be, and
+    /// refuse the very next byte. Off by one in either direction is either a rejected transcript
+    /// or an unbounded one.
+    #[test]
+    fn a_meter_admits_the_declared_size_exactly_and_refuses_the_next_byte() {
+        let mut meter = Meter::new(4);
+        assert!(meter.observe(b"ab"));
+        assert!(meter.observe(b"cd"));
+        assert_eq!(meter.count, 4);
+        assert_eq!(meter.digest(), sha256_hex(b"abcd"));
+
+        assert!(!meter.observe(b"e"), "one byte past the declaration");
+        assert_eq!(meter.count, 4, "a refused write must not be counted");
+        assert_eq!(
+            meter.digest(),
+            sha256_hex(b"abcd"),
+            "nor may it reach the hash"
+        );
+    }
+
+    #[test]
+    fn a_meter_refuses_a_write_that_straddles_the_declared_size() {
+        let mut meter = Meter::new(4);
+        assert!(!meter.observe(b"abcde"));
+        assert_eq!(meter.count, 0);
     }
 
     #[test]
