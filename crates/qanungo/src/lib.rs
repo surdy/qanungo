@@ -12,7 +12,7 @@
 //! ```
 //!
 //! sync ([`sync`], [`cache`], [`patwari`]) → fold ([`metrics`]) → evaluate ([`rules`]) → emit
-//! ([`report`]). Three metrics, five rules, Markdown on stdout, evidence cited by content hash,
+//! ([`report`]). Four metrics, six rules, Markdown on stdout, evidence cited by content hash,
 //! and an instrumentation footer on every run.
 //!
 //! Three things about this slice are deliberate and load-bearing:

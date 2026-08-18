@@ -1,4 +1,4 @@
-//! The five hardcoded coaching rules.
+//! The six hardcoded coaching rules.
 //!
 //! P0 deliberately skips the rule DSL (qanungo #3): a handful of rules in Rust are enough to find
 //! out whether folded metrics say anything worth acting on, and a DSL built before that answer is
@@ -25,6 +25,11 @@
 //! are still arbitrary in the sense above — nothing says the archive's p95 is where coaching
 //! should start — but they are now arbitrary at a *measured* point rather than at a guessed one,
 //! and the measurement is written down beside them.
+//!
+//! [`thresholds::RETRY_LOOP_REPEATS`] is a third case, and the weakest: the signal it reads does
+//! not appear in the archive at all yet, so it was set against a proxy measurement of a different
+//! field. What was measured, and how far that is from what the rule tests, is written down beside
+//! it too.
 
 use crate::format;
 use crate::metrics::{SessionMetrics, ToolTally};
@@ -41,6 +46,26 @@ pub mod thresholds {
     pub const TOOL_ERROR_RATE: f64 = 0.30;
     /// Calls one tool must have reported an outcome for before its rate means anything.
     pub const MIN_TOOL_ATTEMPTS: u64 = 5;
+
+    /// Times one *exact* command value must run inside a single session before the repetition
+    /// reads as a retry loop rather than as ordinary re-checking.
+    ///
+    /// **Measured, but at one remove — this is the weakest-founded constant here.** The rule
+    /// reads the `command` field, which in the pinned interpreter only Codex's `local_shell_call`
+    /// records, and the 2026-08-18 mirror holds *no* Codex transcripts at all (623 sessions:
+    /// claude-code 250, copilot-cli 373). There was therefore nothing in the archive to measure
+    /// the threshold against directly.
+    ///
+    /// It was set against a **proxy** instead: the same exact-match fold run offline over the
+    /// shell command nested inside claude-code's `tool_use.input` and copilot's
+    /// `tool.execution_start.arguments`, which the fold itself does not read. 415 of the 623
+    /// sessions carry one, and their busiest-command run counts are p50 1, p75 2, p90 4, p95 5,
+    /// p99 11, max 27; pooled, 5.1% of command-bearing calls are repeats. Six is just past that
+    /// p95 and selects 20 of 415 sessions (4.8%) — the same order as the marathon rule's 4.4%,
+    /// which is the only calibration claimed for it. Re-measure against real command fields when
+    /// a harness that emits them appears in the archive; until then this is a shape estimate from
+    /// a different signal, not a reading of the one the rule tests.
+    pub const RETRY_LOOP_REPEATS: u64 = 6;
 
     /// Gap between consecutive records past which the operator is taken to have walked away.
     ///
@@ -99,6 +124,7 @@ pub mod thresholds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuleId {
     HighToolErrorRate,
+    RetryLoop,
     MarathonSession,
     ResumedSession,
     Babysitting,
@@ -110,6 +136,7 @@ impl RuleId {
     pub const fn title(self) -> &'static str {
         match self {
             Self::HighToolErrorRate => "High tool error rate",
+            Self::RetryLoop => "Retry loop",
             Self::MarathonSession => "Marathon session",
             Self::ResumedSession => "Heavily resumed session",
             Self::Babysitting => "Babysitting pattern",
@@ -148,6 +175,7 @@ pub struct Finding {
 pub fn evaluate(sessions: &[SessionMetrics]) -> Vec<Finding> {
     [
         high_tool_error_rate(sessions),
+        retry_loop(sessions),
         marathon_session(sessions),
         resumed_session(sessions),
         babysitting(sessions),
@@ -219,6 +247,57 @@ fn over_rate(tally: &ToolTally, min_attempts: u64, threshold: f64) -> Option<Str
             tally.attempts,
             format::percent(rate)
         )
+    })
+}
+
+/// **Retry loop.** Fires when one exact command value ran [`thresholds::RETRY_LOOP_REPEATS`]
+/// times or more inside a single session.
+///
+/// One trigger, deliberately: the busiest command's run count, and nothing else. A share-based
+/// trigger ("repeats are over x% of command activity") was the alternative and it measures a
+/// different thing — a session that runs two commands twice each is 50% repeats and is not a
+/// retry loop — so mixing the two would produce a rule whose firing nobody could explain. The
+/// share rides along in the evidence line as context.
+///
+/// A session whose harness records no command field is skipped, not scored: no signal, no claim.
+/// See [`CommandChurn`](crate::metrics::CommandChurn).
+fn retry_loop(sessions: &[SessionMetrics]) -> Option<Finding> {
+    let evidence: Vec<_> = sessions
+        .iter()
+        .filter_map(|session| {
+            let churn = &session.commands;
+            let runs = churn.busiest_runs()?;
+            (runs >= thresholds::RETRY_LOOP_REPEATS).then(|| Evidence {
+                source_hash: session.source_hash.clone(),
+                detail: format!(
+                    "one command run {runs} times; {} of {} command-bearing calls were repeats \
+                     ({}), across {} repeated commands",
+                    churn.repeats,
+                    churn.command_events,
+                    churn
+                        .repeat_share()
+                        .map_or_else(|| "—".to_owned(), format::percent),
+                    churn.repeated_commands,
+                ),
+            })
+        })
+        .collect();
+    (!evidence.is_empty()).then(|| Finding {
+        rule: RuleId::RetryLoop,
+        problem: format!(
+            "{} of {} folded sessions ran one identical command {}+ times.",
+            evidence.len(),
+            sessions.len(),
+            thresholds::RETRY_LOOP_REPEATS,
+        ),
+        action: "Repetition is the cheapest signal that a loop is not closing: the same command, \
+                 the same disagreement, another turn. Fix what the command keeps arguing with — \
+                 the stale config, the missing dependency, the wrong working directory — and say \
+                 so where the agent reads it, rather than letting it rediscover the answer by \
+                 running the command again. Where the repeat is legitimate re-checking after each \
+                 edit, it is a watch mode or a single script waiting to be written."
+            .to_owned(),
+        evidence,
     })
 }
 
@@ -418,7 +497,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
-    use crate::metrics::{Activity, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -470,6 +549,7 @@ mod tests {
                 unattributed: 0,
             },
             activity,
+            commands: CommandChurn::default(),
             bytes_folded: 0,
         }
     }
@@ -569,6 +649,72 @@ mod tests {
         assert!(finding.evidence[0].detail.contains("Bash"));
         // The session-wide rate (15%) is under threshold, so only the tool is named.
         assert!(!finding.evidence[0].detail.contains("session-wide"));
+    }
+
+    /// The same quiet session, given a churn reading — the rule reads nothing else about it.
+    fn with_churn(hash: u8, churn: CommandChurn) -> SessionMetrics {
+        let mut session = quiet_session();
+        session.source_hash = format!("{hash:02x}").repeat(32);
+        session.commands = churn;
+        session
+    }
+
+    #[test]
+    fn retry_loop_fires_only_past_the_repeat_threshold() {
+        let looping = with_churn(
+            20,
+            CommandChurn {
+                command_events: 20,
+                repeats: 8,
+                distinct_commands: 12,
+                repeated_commands: 2,
+                busiest_command_runs: thresholds::RETRY_LOOP_REPEATS,
+                untracked_events: 0,
+            },
+        );
+        // One run short of the threshold, and busier overall: the rule tests one command's runs,
+        // not the session's total repetition.
+        let persistent = with_churn(
+            21,
+            CommandChurn {
+                command_events: 60,
+                repeats: 30,
+                distinct_commands: 30,
+                repeated_commands: 10,
+                busiest_command_runs: thresholds::RETRY_LOOP_REPEATS - 1,
+                untracked_events: 0,
+            },
+        );
+        let findings = evaluate(&[looping, persistent]);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule == RuleId::RetryLoop)
+            .expect("the retry-loop rule fires");
+        assert_eq!(finding.evidence.len(), 1);
+        assert_eq!(finding.evidence[0].source_hash, "14".repeat(32));
+        assert_eq!(
+            finding.evidence[0].detail,
+            format!(
+                "one command run {} times; 8 of 20 command-bearing calls were repeats (40%), \
+                 across 2 repeated commands",
+                thresholds::RETRY_LOOP_REPEATS,
+            )
+        );
+    }
+
+    /// No signal, no claim: a churn record with no command-bearing event is undefined, and the
+    /// rule must skip it rather than reading whatever the count fields happen to hold.
+    #[test]
+    fn a_session_that_recorded_no_command_never_fires_the_retry_rule() {
+        let blind = with_churn(
+            22,
+            CommandChurn {
+                command_events: 0,
+                busiest_command_runs: thresholds::RETRY_LOOP_REPEATS * 10,
+                ..CommandChurn::default()
+            },
+        );
+        assert!(evaluate(&[blind]).is_empty());
     }
 
     #[test]

@@ -13,6 +13,12 @@
 //! name (`Bash`, `local_shell`) is schema metadata — the harness's own vocabulary, not anything
 //! the operator or the model wrote — and is the single verbatim string a report may carry.
 //!
+//! Repeated-command churn is the first metric that has to *compare* transcript content to derive
+//! anything, and it does not weaken that: the command values live in the fold's own scratch map
+//! for the length of one transcript and are reduced to counts before it returns, so no type this
+//! module can see has ever held one. The report says a command ran six times; it never says which
+//! command, not truncated and not in evidence. Quoting verbatim is qanungo #8's problem.
+//!
 //! Evidence is therefore a content hash. Somebody who wants the detail this report refuses to
 //! print pulls the transcript from the archive and reads it in full, with the archive's own
 //! access story intact. The first qanungo surface that quotes verbatim lands behind its own
@@ -198,6 +204,7 @@ impl Report<'_> {
                 format::ratio(ratio),
             );
         }
+        self.render_churn(out, totals);
         if totals.malformed_records > 0 {
             let _ = writeln!(
                 out,
@@ -226,6 +233,45 @@ impl Report<'_> {
                 out,
                 "| {name} | {} | {} | {rate} |",
                 tally.attempts, tally.errors,
+            );
+        }
+    }
+
+    /// Repeated-command churn, in counts. Never a command — the busiest one is reported by how
+    /// many times it ran and by which session ran it, and a reader who wants to know *what* it
+    /// was fetches the transcript.
+    ///
+    /// A window whose harnesses record no command field says so outright rather than printing a
+    /// zero it did not measure.
+    fn render_churn(&self, out: &mut String, totals: &Totals) {
+        let churn = &totals.churn;
+        let Some(share) = churn.repeat_share() else {
+            out.push_str(
+                "- No tool call in this window recorded a command, so no repeated-command churn \
+                 is defined.\n",
+            );
+            return;
+        };
+        let _ = writeln!(
+            out,
+            "- {} of {} command-bearing tool calls re-ran a command the session had already run \
+             ({}).",
+            churn.repeats,
+            churn.command_events,
+            format::percent(share),
+        );
+        let _ = writeln!(
+            out,
+            "- {} of {} sessions with command activity re-ran one; the busiest ran a single \
+             command {} times.",
+            churn.sessions_with_repeats, churn.sessions_with_commands, churn.busiest_command_runs,
+        );
+        if churn.untracked_events > 0 {
+            let _ = writeln!(
+                out,
+                "- {} command-bearing calls exceeded a session's distinct-command cap and were \
+                 counted as activity but never as repeats, so the churn above is a floor.",
+                churn.untracked_events,
             );
         }
     }
@@ -312,7 +358,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
-    use crate::metrics::{Activity, ToolOutcomes, ToolTally};
+    use crate::metrics::{Activity, CommandChurn, ToolOutcomes, ToolTally};
     use crate::rules;
 
     fn instrumentation() -> Instrumentation {
@@ -379,6 +425,7 @@ mod tests {
                 .collect(),
                 unattributed: 0,
             },
+            commands: CommandChurn::default(),
             bytes_folded: 4096,
         }
     }
@@ -467,6 +514,48 @@ mod tests {
             markdown.contains(
                 "- 2h 30m of active time across 2 sittings, inside 6h 00m of \
                                session span."
+            ),
+            "{markdown}"
+        );
+    }
+
+    /// A window whose harnesses record no command says so, rather than printing a zero share it
+    /// never measured.
+    #[test]
+    fn churn_is_reported_as_undefined_when_nothing_recorded_a_command() {
+        let markdown = render(&[session()], &[]);
+        assert!(
+            markdown.contains(
+                "- No tool call in this window recorded a command, so no repeated-command churn \
+                 is defined."
+            ),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn churn_is_reported_in_counts_and_never_in_commands() {
+        let mut churned = session();
+        churned.commands = CommandChurn {
+            command_events: 40,
+            repeats: 10,
+            distinct_commands: 30,
+            repeated_commands: 3,
+            busiest_command_runs: 7,
+            untracked_events: 0,
+        };
+        let markdown = render(&[churned], &[]);
+        assert!(
+            markdown.contains(
+                "- 10 of 40 command-bearing tool calls re-ran a command the session had already \
+                 run (25%)."
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "- 1 of 1 sessions with command activity re-ran one; the busiest ran a single \
+                 command 7 times."
             ),
             "{markdown}"
         );

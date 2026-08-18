@@ -49,8 +49,8 @@ Thin read-only clients that call qanungo's API or the recall funnel ship in `con
 ## Status
 
 The **P0 vertical slice** ([#7](https://github.com/surdy/qanungo/issues/7)) exists: a `qanungo` CLI
-that syncs a minimal content-addressed mirror of the recent archive, folds three metrics over
-`munshi-transcript`'s typed events, evaluates four hardcoded rules, and emits a Markdown coaching
+that syncs a minimal content-addressed mirror of the recent archive, folds four metrics over
+`munshi-transcript`'s typed events, evaluates six hardcoded rules, and emits a Markdown coaching
 report — findings as Problem / Action / `source_hash` evidence, with an instrumentation footer on
 every run.
 

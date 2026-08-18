@@ -1,4 +1,4 @@
-//! Fixture-backed proof that each of the four rules fires — and that a report built from a
+//! Fixture-backed proof that each of the six rules fires — and that a report built from a
 //! transcript stuffed with canary strings contains none of them.
 
 use std::fs::File;
@@ -36,6 +36,7 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
         summary: folded.summary,
         tools: folded.tools,
         activity: folded.activity,
+        commands: folded.commands,
         bytes_folded: bytes.len() as u64,
     }
 }
@@ -169,6 +170,55 @@ fn fire_and_forget_fires_on_one_request_with_unattended_errors() {
     );
 }
 
+/// The one shape in the pinned interpreter that puts a `command` field on a tool event: a Codex
+/// rollout whose `local_shell_call` records run the same command six times, with two one-off
+/// commands interleaved so the fold has to group by value rather than count events.
+#[test]
+fn retry_loop_fires_on_one_command_re_run_within_a_session() {
+    let session = fold("rules/retry-loop.jsonl", "codex-cli");
+    let churn = &session.commands;
+    assert_eq!(churn.command_events, 8);
+    assert_eq!(churn.distinct_commands, 3);
+    assert_eq!(churn.repeats, 5);
+    assert_eq!(churn.repeated_commands, 1);
+    assert_eq!(churn.busiest_runs(), Some(6));
+    assert_eq!(churn.untracked_events, 0);
+
+    let findings = fires_only(&session, RuleId::RetryLoop);
+    let finding = finding(&findings, RuleId::RetryLoop);
+    assert_eq!(finding.evidence.len(), 1);
+    assert_eq!(finding.evidence[0].source_hash, session.source_hash);
+    assert_eq!(
+        finding.evidence[0].detail,
+        "one command run 6 times; 5 of 8 command-bearing calls were repeats (62%), across 1 \
+         repeated commands"
+    );
+}
+
+/// The claude-code and copilot fixtures run plenty of shell commands, but their harnesses keep
+/// the command inside `input` / `arguments` rather than in a `command` field, so the fold claims
+/// nothing about their churn — not zero churn.
+#[test]
+fn harnesses_that_record_no_command_field_get_no_churn_reading() {
+    for (relative, agent) in [
+        ("munshi/claude-code-2.1.44-normal.jsonl", "claude-code"),
+        ("munshi/copilot-1.0.76-tool-activity.jsonl", "copilot-cli"),
+        ("rules/high-tool-error-rate.jsonl", "claude-code"),
+    ] {
+        let session = fold(relative, agent);
+        assert!(
+            session.summary.tool_activities > 0,
+            "{relative} must have tool activity to make the point"
+        );
+        assert!(
+            !session.commands.measurable(),
+            "{relative} recorded no command field"
+        );
+        assert_eq!(session.commands.repeat_share(), None);
+        assert_eq!(session.commands.busiest_runs(), None);
+    }
+}
+
 #[test]
 fn munshi_own_fixtures_are_healthy_sessions_and_fire_nothing() {
     let sessions = vec![
@@ -218,6 +268,55 @@ fn a_rendered_report_contains_no_verbatim_transcript_content() {
     }
     // Tool names are schema metadata and are the one verbatim string a report may carry.
     assert!(markdown.contains("Bash"));
+}
+
+/// The same line, held against the metric that exists *because* commands repeat. The churn fold
+/// compares command strings in memory; a report built from it renders how many times a command
+/// ran and never which command it was, so the retry-loop fixture's canaries must not survive
+/// either — not in the aggregate lines, not in the evidence, not truncated.
+#[test]
+fn a_retry_loop_report_names_no_command_it_counted() {
+    let session = fold("rules/retry-loop.jsonl", "codex-cli");
+    let raw = std::fs::read_to_string(fixture("rules/retry-loop.jsonl")).unwrap();
+    assert!(
+        raw.contains("CANARY_RETRY_COMMAND"),
+        "the fixture carries it"
+    );
+
+    let findings = rules::evaluate(std::slice::from_ref(&session));
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.rule == RuleId::RetryLoop),
+        "the report under test must carry the churn finding"
+    );
+    let source_hash = session.source_hash.clone();
+    let markdown = render(&[session], &findings);
+
+    assert!(
+        !markdown.contains("CANARY"),
+        "a canary token reached the report:\n{markdown}"
+    );
+    for forbidden in [
+        "CANARY_RETRY_COMMAND",
+        "CANARY_ONE_OFF_A",
+        "cargo test",
+        "git status",
+        "bash",
+        "-lc",
+        "/work/fixture",
+    ] {
+        assert!(
+            !markdown.contains(forbidden),
+            "`{forbidden}` reached the report:\n{markdown}"
+        );
+    }
+    // What it does say: counts, and a hash to go and read the rest for yourself.
+    assert!(markdown.contains("one command run 6 times"), "{markdown}");
+    assert!(
+        markdown.contains(&format!("`sha256:{source_hash}`")),
+        "{markdown}"
+    );
 }
 
 fn render(sessions: &[SessionMetrics], findings: &[Finding]) -> String {

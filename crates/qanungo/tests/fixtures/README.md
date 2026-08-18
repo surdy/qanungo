@@ -15,9 +15,10 @@ deliberately fire **no** rule.
 
 ## `rules/`
 
-Synthesized here, in the Claude Code 2.1.205 envelope, one per rule — Munshi's fixtures are
-short, healthy sessions and none of them crosses a coaching threshold, which is exactly what a
-rule test cannot use. Each file is the smallest transcript that trips one rule and no other.
+Synthesized here, in the Claude Code 2.1.205 envelope unless stated otherwise, one per rule —
+Munshi's fixtures are short, healthy sessions and none of them crosses a coaching threshold, which
+is exactly what a rule test cannot use. Each file is the smallest transcript that trips one rule
+and no other.
 
 Three of them exist to pin the gap-aware duration metric (qanungo #14), where what matters is not
 how many records a transcript holds but *how far apart their timestamps are*:
@@ -32,6 +33,16 @@ The last is the boundary pin for both comparisons at once: a gap of exactly the 
 stays inside its sitting (`≤`), and a sitting of exactly the marathon threshold has not crossed it
 (`>`). Moving either constant without revisiting that fixture will be noticed.
 
-`high-tool-error-rate.jsonl` additionally carries `CANARY_*` tokens in every free-text field
-(user text, assistant text, tool command input, tool error output). The redaction test folds it,
-renders a full report, and asserts that not one of those tokens survives into the Markdown.
+`retry-loop.jsonl` is the exception to the envelope note: it is a **Codex rollout**, because
+Codex's `local_shell_call` is the only record in the pinned interpreter that puts a `command`
+field on a tool event, and repeated-command churn is folded from that field alone. Eight
+`local_shell_call` records run three distinct commands, one of them six times — enough to cross
+`RETRY_LOOP_REPEATS` — with the one-offs interleaved so that grouping by value, rather than
+counting events, is what makes the test pass.
+
+`high-tool-error-rate.jsonl` and `retry-loop.jsonl` additionally carry `CANARY_*` tokens in every
+free-text field (user text, assistant text, tool command input, tool error output, and in the
+retry fixture the repeated command itself). Two redaction tests fold them, render a full report,
+and assert that not one of those tokens survives into the Markdown — the second exists because the
+churn fold is the first metric that compares transcript *content*, and the report must still be
+able to say a command ran six times without saying which command it was.
