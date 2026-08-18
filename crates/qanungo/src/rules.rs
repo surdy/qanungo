@@ -1,7 +1,7 @@
-//! The four hardcoded coaching rules.
+//! The five hardcoded coaching rules.
 //!
-//! P0 deliberately skips the rule DSL (qanungo #3): four rules in Rust are enough to find out
-//! whether folded metrics say anything worth acting on, and a DSL built before that answer is
+//! P0 deliberately skips the rule DSL (qanungo #3): a handful of rules in Rust are enough to find
+//! out whether folded metrics say anything worth acting on, and a DSL built before that answer is
 //! known would encode guesses as syntax. Each rule reads the folded [`SessionMetrics`] and, when
 //! it fires, states a **Problem**, an **Action**, and **evidence** — one line per session,
 //! carrying only aggregates, tool names, and the session's `source_hash`.
@@ -14,6 +14,11 @@
 //! that a later pass can replace these numbers with observed distributions from the real
 //! archive. Until then, a rule that fires constantly is evidence its threshold is wrong, not
 //! evidence the habit is everywhere.
+//!
+//! The duration constants are the first to have had that pass run over them (qanungo #14): they
+//! are still arbitrary in the sense above — nothing says the archive's p95 is where coaching
+//! should start — but they are now arbitrary at a *measured* point rather than at a guessed one,
+//! and the measurement is written down beside them.
 
 use crate::format;
 use crate::metrics::{SessionMetrics, ToolTally};
@@ -31,8 +36,45 @@ pub mod thresholds {
     /// Calls one tool must have reported an outcome for before its rate means anything.
     pub const MIN_TOOL_ATTEMPTS: u64 = 5;
 
-    /// Wall-clock span past which a session is a marathon.
-    pub const MARATHON_SPAN: TimeDelta = TimeDelta::hours(4);
+    /// Gap between consecutive records past which the operator is taken to have walked away.
+    ///
+    /// **Read this together with [`MARATHON_SITTING_ACTIVE`]: they are one two-part setting, not
+    /// two independent knobs.** Moving this alone rescales every sitting in the archive and
+    /// changes the marathon fire rate by four to five times.
+    ///
+    /// Measured over the 2026-08-18 corpus (564 transcripts, 606k records): the pooled gap
+    /// distribution has **no valley** — it decays monotonically from ~4s out to days (p50 0.01s,
+    /// p99 2m, p99.9 1h51m), so no idle threshold falls out of the data and one has to be chosen
+    /// behaviourally. The only real structure in it is a ~6× spike at *exactly* 180s across 206
+    /// sessions — a harness-side 3-minute timeout, not a human pausing — plus smaller spikes at
+    /// 30/60/120s. 15m is comfortably above every one of those artifacts and below any break a
+    /// person would describe as still being in the session.
+    pub const IDLE_GAP: TimeDelta = TimeDelta::minutes(15);
+
+    /// Length of one continuous sitting past which a session is a marathon.
+    ///
+    /// The other half of the pair. At `IDLE_GAP` = 15m this is the archive's p95 of
+    /// longest-sitting (1h55m) and fires on **25 of 564 sessions (4.4%)**; the equivalent cut at
+    /// other idle thresholds is ≈3h at 30m and ≈5h at 60m, which is why neither constant means
+    /// anything without the other. The rule it feeds tests the longest *sitting*, never the
+    /// session's total active time: a 154h project with 35h of work across 53 sittings is a
+    /// long-running piece of work, not a marathon.
+    ///
+    /// The span-based predecessor (`span > 4h`) fired on 41% of the archive — it was measuring
+    /// calendar time.
+    pub const MARATHON_SITTING_ACTIVE: TimeDelta = TimeDelta::hours(2);
+
+    /// Ratio of wall-clock span to active time above which a transcript is mostly gaps.
+    ///
+    /// Deliberately far out in the tail: **59.6% of archived sessions are multi-sitting at
+    /// `IDLE_GAP` = 15m**, so "was resumed" is the archive's normal shape and cannot be the bar.
+    /// Ten times is roughly twice the archive's median dilution (4.9×).
+    pub const RESUMED_SPAN_TO_ACTIVE: f64 = 10.0;
+
+    /// Sittings a transcript must have been picked up in before its dilution reads as a habit
+    /// rather than as one interrupted afternoon. Paired with [`RESUMED_SPAN_TO_ACTIVE`] so that
+    /// neither a long single break nor five brisk sittings fires on its own.
+    pub const RESUMED_MIN_SITTINGS: usize = 5;
 
     /// Tool activities per user request *below* which the agent is being led by the hand.
     pub const BABYSITTING_TOOLS_PER_REQUEST: f64 = 2.0;
@@ -52,6 +94,7 @@ pub mod thresholds {
 pub enum RuleId {
     HighToolErrorRate,
     MarathonSession,
+    ResumedSession,
     Babysitting,
     FireAndForget,
 }
@@ -62,6 +105,7 @@ impl RuleId {
         match self {
             Self::HighToolErrorRate => "High tool error rate",
             Self::MarathonSession => "Marathon session",
+            Self::ResumedSession => "Heavily resumed session",
             Self::Babysitting => "Babysitting pattern",
             Self::FireAndForget => "Fire-and-forget extreme",
         }
@@ -93,12 +137,13 @@ pub struct Finding {
     pub evidence: Vec<Evidence>,
 }
 
-/// Runs all four rules over the folded window, in report order. A rule that matched nothing
-/// produces no finding.
+/// Runs every rule over the folded window, in report order. A rule that matched nothing produces
+/// no finding.
 pub fn evaluate(sessions: &[SessionMetrics]) -> Vec<Finding> {
     [
         high_tool_error_rate(sessions),
         marathon_session(sessions),
+        resumed_session(sessions),
         babysitting(sessions),
         fire_and_forget(sessions),
     ]
@@ -171,19 +216,30 @@ fn over_rate(tally: &ToolTally, min_attempts: u64, threshold: f64) -> Option<Str
     })
 }
 
-/// **Marathon session.** Fires on wall-clock span alone. A long session is not itself a mistake,
-/// but a context window that has been accumulating for hours is measurably worse at the end than
-/// at the start, and the fix is cheap.
+/// **Marathon session.** Fires on the longest continuous *sitting*, not on wall-clock span and
+/// not on total active time. A long session is not itself a mistake, but a context window that
+/// has been accumulating without a break is measurably worse at the end than at the start, and
+/// the fix is cheap.
+///
+/// Span was the P0 reading of this and it was wrong: 41% of the archive cleared `span > 4h`,
+/// almost all of it transcripts resumed over days. Total active time would be wrong in the other
+/// direction — it would call a month-long project with fifty short sittings a marathon. What
+/// coaching is about here is one unbroken push, so that is what the rule measures. The span and
+/// the sitting count ride along as evidence, because "2h04m inside a 330h transcript" is the
+/// sentence that makes the finding legible.
 fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
         .filter_map(|session| {
-            let span = session.span()?;
-            (span > thresholds::MARATHON_SPAN).then(|| Evidence {
+            let longest = session.longest_sitting()?;
+            (longest > thresholds::MARATHON_SITTING_ACTIVE).then(|| Evidence {
                 source_hash: session.source_hash.clone(),
                 detail: format!(
-                    "span {}, {} user requests, {} tool activities",
-                    format::span(span),
+                    "longest sitting {} within a {} span across {} sittings, {} user requests, \
+                     {} tool activities",
+                    format::span(longest),
+                    session.span().map_or_else(|| "—".to_owned(), format::span),
+                    session.sittings().unwrap_or_default(),
                     session.summary.user_requests,
                     session.summary.tool_activities,
                 ),
@@ -193,10 +249,11 @@ fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::MarathonSession,
         problem: format!(
-            "{} of {} folded sessions ran longer than {}.",
+            "{} of {} folded sessions worked for more than {} without a break longer than {}.",
             evidence.len(),
             sessions.len(),
-            format::span(thresholds::MARATHON_SPAN),
+            format::span(thresholds::MARATHON_SITTING_ACTIVE),
+            format::span(thresholds::IDLE_GAP),
         ),
         action: "Split the work at the next natural boundary and start the follow-on in a fresh \
                  session. Write the handoff down first — what is done, what is next, which files \
@@ -205,6 +262,68 @@ fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
             .to_owned(),
         evidence,
     })
+}
+
+/// **Heavily resumed session.** One transcript, picked up again and again over days, with very
+/// little of its calendar footprint spent working.
+///
+/// This is the archive's dominant shape (59.6% of sessions are multi-sitting), which is exactly
+/// why it gets its own rule instead of being folded into Marathon: the two say opposite things
+/// about the same span, and a rule that fired on both would be reporting "this session exists".
+/// The threshold pair therefore sits well out in the tail — ten times more calendar than work,
+/// across at least five sittings — so that ordinary "picked it up after lunch" never appears.
+///
+/// The coaching point is not that resuming is bad. It is that a transcript resumed a dozen times
+/// carries a dozen work items' worth of accumulated context into each of them, and that
+/// everything session-scoped — this report's own metrics included — gets less meaningful the
+/// longer one transcript stands in for many separate pieces of work.
+fn resumed_session(sessions: &[SessionMetrics]) -> Option<Finding> {
+    let evidence: Vec<_> = sessions
+        .iter()
+        .filter_map(|session| {
+            let (active, span) = session.active_time().zip(session.span())?;
+            let sittings = session.sittings()?;
+            let dilution = session.span_to_active()?;
+            (dilution >= thresholds::RESUMED_SPAN_TO_ACTIVE
+                && sittings >= thresholds::RESUMED_MIN_SITTINGS)
+                .then(|| Evidence {
+                    source_hash: session.source_hash.clone(),
+                    detail: format!(
+                        "active {} across {sittings} sittings, span {} ({})",
+                        format::span(active),
+                        format::span(span),
+                        dilution_multiple(dilution),
+                    ),
+                })
+        })
+        .collect();
+    (!evidence.is_empty()).then(|| Finding {
+        rule: RuleId::ResumedSession,
+        problem: format!(
+            "{} of {} folded sessions were resumed {}+ times and spent at least {}x as long \
+             idle as working.",
+            evidence.len(),
+            sessions.len(),
+            thresholds::RESUMED_MIN_SITTINGS,
+            format::ratio(thresholds::RESUMED_SPAN_TO_ACTIVE),
+        ),
+        action: "Start a fresh session per work item rather than returning to a standing one. \
+                 The archive keeps the old transcript, so nothing is lost by leaving it closed — \
+                 and a session that maps onto one piece of work is the unit every summary, \
+                 metric, and coaching finding here is actually about."
+            .to_owned(),
+        evidence,
+    })
+}
+
+/// How much larger a session's span is than the work in it, rendered — or the plain statement
+/// that a session with no time inside any sitting has no finite multiple to render.
+fn dilution_multiple(dilution: f64) -> String {
+    if dilution.is_finite() {
+        format!("{}x", format::ratio(dilution))
+    } else {
+        "no gap short enough to count as work".to_owned()
+    }
 }
 
 /// **Babysitting pattern.** Many user requests, each producing almost no tool work: the operator
@@ -293,7 +412,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
-    use crate::metrics::ToolOutcomes;
+    use crate::metrics::{Activity, ToolOutcomes};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -301,15 +420,31 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// A session whose records are `gaps_minutes` apart, in file order — which is what decides
+    /// its span, its active time, and its sittings all at once, exactly as a real fold does.
+    fn worked(gaps_minutes: &[i64]) -> (TimeDelta, Activity) {
+        let mut at = timestamp("2026-08-01T09:00:00Z");
+        let mut timestamps = vec![at];
+        for gap in gaps_minutes {
+            at += TimeDelta::minutes(*gap);
+            timestamps.push(at);
+        }
+        (
+            at - timestamps[0],
+            Activity::over(timestamps.iter().copied()),
+        )
+    }
+
     fn session(
         hash: u8,
         user_requests: usize,
         tool_activities: usize,
-        span: TimeDelta,
+        gaps_minutes: &[i64],
         total: ToolTally,
         by_tool: &[(&str, ToolTally)],
     ) -> SessionMetrics {
         let first = timestamp("2026-08-01T09:00:00Z");
+        let (span, activity) = worked(gaps_minutes);
         SessionMetrics {
             source_hash: format!("{hash:02x}").repeat(32),
             source_agent: "claude-code".to_owned(),
@@ -328,8 +463,19 @@ mod tests {
                     .collect::<BTreeMap<_, _>>(),
                 unattributed: 0,
             },
+            activity,
             bytes_folded: 0,
         }
+    }
+
+    /// Minutes of continuous work, as a run of gaps the fold will keep inside one sitting.
+    fn continuous(minutes: i64) -> Vec<i64> {
+        let step = thresholds::IDLE_GAP.num_minutes();
+        let mut gaps = vec![step; usize::try_from(minutes / step).unwrap_or_default()];
+        if minutes % step != 0 {
+            gaps.push(minutes % step);
+        }
+        gaps
     }
 
     fn quiet_session() -> SessionMetrics {
@@ -337,7 +483,7 @@ mod tests {
             0,
             4,
             12,
-            TimeDelta::minutes(25),
+            &continuous(25),
             ToolTally {
                 attempts: 6,
                 errors: 0,
@@ -364,7 +510,7 @@ mod tests {
             1,
             3,
             6,
-            TimeDelta::minutes(10),
+            &continuous(10),
             ToolTally {
                 attempts: 3,
                 errors: 3,
@@ -386,7 +532,7 @@ mod tests {
             2,
             8,
             40,
-            TimeDelta::minutes(50),
+            &continuous(50),
             ToolTally {
                 attempts: 20,
                 errors: 3,
@@ -420,12 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn marathon_fires_only_past_the_span_threshold() {
+    fn marathon_fires_only_past_the_sitting_threshold() {
+        let marathon = thresholds::MARATHON_SITTING_ACTIVE.num_minutes();
         let long = session(
             3,
             6,
             120,
-            thresholds::MARATHON_SPAN + TimeDelta::minutes(1),
+            &continuous(marathon + 1),
             ToolTally::default(),
             &[],
         );
@@ -433,7 +580,7 @@ mod tests {
             4,
             6,
             120,
-            thresholds::MARATHON_SPAN - TimeDelta::minutes(1),
+            &continuous(marathon - 1),
             ToolTally::default(),
             &[],
         );
@@ -444,6 +591,67 @@ mod tests {
             .expect("the marathon rule fires");
         assert_eq!(finding.evidence.len(), 1);
         assert_eq!(finding.evidence[0].source_hash, "03".repeat(32));
+        assert!(
+            finding.evidence[0].detail.starts_with("longest sitting 2h"),
+            "{}",
+            finding.evidence[0].detail
+        );
+    }
+
+    /// The regression the whole change exists for (qanungo #14): a transcript resumed over days
+    /// used to be the report's loudest "marathon", and its longest continuous push was under an
+    /// hour. It must now fire the resumed rule and only the resumed rule.
+    #[test]
+    fn a_resumed_session_is_not_a_marathon_however_long_its_span() {
+        // Six sittings of half an hour each, a day apart: 3h of work inside a 5-day span.
+        let mut gaps = Vec::new();
+        for sitting in 0..6 {
+            if sitting > 0 {
+                gaps.push(24 * 60 - 30);
+            }
+            gaps.extend(continuous(30));
+        }
+        let resumed = session(11, 30, 400, &gaps, ToolTally::default(), &[]);
+        assert_eq!(resumed.sittings(), Some(6));
+        assert_eq!(resumed.active_time(), Some(TimeDelta::hours(3)));
+
+        let rules: Vec<_> = evaluate(&[resumed])
+            .into_iter()
+            .map(|finding| finding.rule)
+            .collect();
+        assert_eq!(rules, vec![RuleId::ResumedSession]);
+    }
+
+    /// Both halves of the resumed rule have to hold: the archive is full of sessions that were
+    /// merely picked up again, and a rule that fired on those would be reporting the weather.
+    #[test]
+    fn the_resumed_rule_needs_both_dilution_and_repetition() {
+        // Diluted 24x, but only two sittings: one long interruption, not a habit.
+        let mut interrupted = continuous(30);
+        interrupted.push(23 * 60);
+        interrupted.extend(continuous(30));
+        let interrupted = session(12, 8, 40, &interrupted, ToolTally::default(), &[]);
+        assert_eq!(interrupted.sittings(), Some(2));
+
+        // Six sittings, but back-to-back-ish: barely diluted at all.
+        let mut brisk = Vec::new();
+        for sitting in 0..6 {
+            if sitting > 0 {
+                brisk.push(20);
+            }
+            brisk.extend(continuous(60));
+        }
+        let brisk = session(13, 8, 40, &brisk, ToolTally::default(), &[]);
+        assert_eq!(brisk.sittings(), Some(6));
+        assert!(brisk.span_to_active().unwrap() < thresholds::RESUMED_SPAN_TO_ACTIVE);
+
+        let findings = evaluate(&[interrupted, brisk]);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule == RuleId::ResumedSession),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -452,12 +660,12 @@ mod tests {
             5,
             thresholds::BABYSITTING_MIN_USER_REQUESTS,
             10,
-            TimeDelta::minutes(90),
+            &continuous(90),
             ToolTally::default(),
             &[],
         );
         // Same low ratio, but a short conversation: not a pattern.
-        let brief = session(6, 3, 2, TimeDelta::minutes(10), ToolTally::default(), &[]);
+        let brief = session(6, 3, 2, &continuous(10), ToolTally::default(), &[]);
         let findings = evaluate(&[babysat, brief]);
         let finding = findings
             .iter()
@@ -473,7 +681,7 @@ mod tests {
             7,
             1,
             200,
-            TimeDelta::minutes(120),
+            &continuous(119),
             ToolTally {
                 attempts: 100,
                 errors: 4,
@@ -491,7 +699,7 @@ mod tests {
             8,
             1,
             200,
-            TimeDelta::minutes(120),
+            &continuous(119),
             ToolTally {
                 attempts: 100,
                 errors: 0,
@@ -519,7 +727,7 @@ mod tests {
             9,
             1,
             200,
-            thresholds::MARATHON_SPAN + TimeDelta::hours(1),
+            &continuous(thresholds::MARATHON_SITTING_ACTIVE.num_minutes() + 60),
             ToolTally {
                 attempts: 100,
                 errors: 60,

@@ -12,7 +12,7 @@
 //! ```
 //!
 //! sync ([`sync`], [`cache`], [`patwari`]) → fold ([`metrics`]) → evaluate ([`rules`]) → emit
-//! ([`report`]). Three metrics, four rules, Markdown on stdout, evidence cited by content hash,
+//! ([`report`]). Three metrics, five rules, Markdown on stdout, evidence cited by content hash,
 //! and an instrumentation footer on every run.
 //!
 //! Three things about this slice are deliberate and load-bearing:
@@ -21,7 +21,9 @@
 //!   protocol, no eviction, no event store. Folding a window from cached blobs is cheap enough
 //!   that persistence has to earn its way in — and the footer is what will decide that.
 //! - **The rules are hardcoded and their thresholds are guesses.** Named constants marked
-//!   arbitrary-until-measured, not a DSL and not a decision.
+//!   arbitrary-until-measured, not a DSL and not a decision. The duration ones have since had
+//!   that measurement run over them (qanungo #14) and are now pinned to the archive's own
+//!   distribution, with the corpus and the fire rate written down beside them.
 //! - **The report renders no transcript content.** Aggregates, tool names, and `source_hash`
 //!   references only. See [`report`] for why that is a construction property rather than a
 //!   filter.

@@ -114,6 +114,7 @@ fn fold_one(cache: &BlobCache, mirrored: &MirroredSession) -> Result<SessionMetr
         source_agent: mirrored.source_agent.clone(),
         summary: fold.summary,
         tools: fold.tools,
+        activity: fold.activity,
         // The archive's declared original size, already verified against the transferred bytes,
         // so the footer's "bytes folded" needs no second pass over the file to count.
         bytes_folded: mirrored.size_bytes,

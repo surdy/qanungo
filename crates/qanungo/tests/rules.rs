@@ -6,7 +6,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::Parser;
 use qanungo::cli::{Cli, Command, Window};
 use qanungo::metrics::{self, SessionMetrics};
@@ -35,6 +35,7 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
         source_agent: source_agent.to_owned(),
         summary: folded.summary,
         tools: folded.tools,
+        activity: folded.activity,
         bytes_folded: bytes.len() as u64,
     }
 }
@@ -78,13 +79,63 @@ fn high_tool_error_rate_fires_and_names_the_tool() {
     );
 }
 
+/// The marathon fixture is a genuinely continuous push: 27 records five minutes apart, never a
+/// break long enough to end the sitting.
 #[test]
-fn marathon_session_fires_on_span_alone() {
+fn marathon_session_fires_on_one_continuous_sitting() {
     let session = claude("rules/marathon-session.jsonl");
+    assert_eq!(session.sittings(), Some(1));
+    assert_eq!(session.active_time(), Some(TimeDelta::minutes(130)));
+    assert_eq!(session.active_time(), session.span());
+
     let findings = fires_only(&session, RuleId::MarathonSession);
     let finding = finding(&findings, RuleId::MarathonSession);
     assert_eq!(finding.evidence[0].source_hash, session.source_hash);
-    assert!(finding.evidence[0].detail.starts_with("span 6h 30m"));
+    assert!(
+        finding.evidence[0]
+            .detail
+            .starts_with("longest sitting 2h 10m within a 2h 10m span across 1 sittings"),
+        "{}",
+        finding.evidence[0].detail
+    );
+}
+
+/// The shape the old span-based rule got wrong (qanungo #14): six short sittings spread over five
+/// days. Its span is 55 times the old marathon threshold and it is not a marathon — its longest
+/// continuous stretch of work is a quarter of an hour.
+#[test]
+fn a_resumed_session_fires_the_resumed_rule_and_not_the_marathon_one() {
+    let session = claude("rules/resumed-session.jsonl");
+    assert_eq!(session.sittings(), Some(6));
+    assert_eq!(session.active_time(), Some(TimeDelta::minutes(90)));
+    assert_eq!(session.longest_sitting(), Some(TimeDelta::minutes(15)));
+    assert_eq!(session.span(), Some(TimeDelta::minutes(5 * 24 * 60 + 15)));
+
+    let findings = fires_only(&session, RuleId::ResumedSession);
+    let finding = finding(&findings, RuleId::ResumedSession);
+    assert_eq!(finding.evidence[0].source_hash, session.source_hash);
+    assert_eq!(
+        finding.evidence[0].detail,
+        "active 1h 30m across 6 sittings, span 120h 15m (80.2x)"
+    );
+}
+
+/// The idle threshold is a `≤`, and the marathon threshold is a `>`. This fixture sits on both
+/// lines at once: nine records exactly `IDLE_GAP` apart make one unbroken sitting of exactly
+/// `MARATHON_SITTING_ACTIVE`, which is therefore *not* over it.
+#[test]
+fn gaps_exactly_at_the_idle_threshold_stay_in_one_sitting_and_fire_nothing() {
+    let session = claude("rules/idle-gap-boundary.jsonl");
+    assert_eq!(session.sittings(), Some(1));
+    assert_eq!(
+        session.active_time(),
+        Some(rules::thresholds::MARATHON_SITTING_ACTIVE)
+    );
+    assert_eq!(session.longest_sitting(), session.active_time());
+    assert!(
+        rules::evaluate(std::slice::from_ref(&session)).is_empty(),
+        "a sitting exactly at the threshold has not crossed it"
+    );
 }
 
 #[test]

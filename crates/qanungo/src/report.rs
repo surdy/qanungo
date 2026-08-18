@@ -133,12 +133,32 @@ impl Report<'_> {
             self.sessions.len(),
             cadence.active_days(),
         );
+        // Duration is reported as *active* time — gaps over the idle threshold excluded — with
+        // raw span kept beside it as context. Across the real archive the two differ by about a
+        // factor of twenty, and only the first of them is time somebody spent working.
+        if let (Some(median), Some(longest)) = (cadence.median_active(), cadence.longest_active()) {
+            let _ = writeln!(
+                out,
+                "- Median session active {}; longest {}.",
+                format::span(median),
+                format::span(longest),
+            );
+        }
         if let (Some(median), Some(longest)) = (cadence.median_span(), cadence.longest_span()) {
             let _ = writeln!(
                 out,
-                "- Median session span {}; longest {}.",
+                "- Raw spans, for context: median {}; longest {}.",
                 format::span(median),
                 format::span(longest),
+            );
+        }
+        if cadence.total_sittings > 0 {
+            let _ = writeln!(
+                out,
+                "- {} of active time across {} sittings, inside {} of session span.",
+                format::span(cadence.total_active),
+                cadence.total_sittings,
+                format::span(cadence.total_span),
             );
         }
         if let Some((busiest, count)) = cadence.per_day.iter().max_by_key(|(_, count)| **count) {
@@ -292,7 +312,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
-    use crate::metrics::{ToolOutcomes, ToolTally};
+    use crate::metrics::{Activity, ToolOutcomes, ToolTally};
     use crate::rules;
 
     fn instrumentation() -> Instrumentation {
@@ -320,10 +340,17 @@ mod tests {
         args.last
     }
 
+    /// A six-hour session with a two-and-a-half-hour push inside it: enough to fire the marathon
+    /// rule on the sitting rather than on the span, which is the distinction the report now
+    /// renders.
     fn session() -> SessionMetrics {
         let first = DateTime::parse_from_rfc3339("2026-08-10T09:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
+        let mut timestamps: Vec<_> = (0..=10)
+            .map(|step| first + TimeDelta::minutes(step * 15))
+            .collect();
+        timestamps.push(first + TimeDelta::hours(6));
         SessionMetrics {
             source_hash: "ab".repeat(32),
             source_agent: "claude-code".to_owned(),
@@ -335,6 +362,7 @@ mod tests {
                 last_timestamp: Some(first + TimeDelta::hours(6)),
                 ..SessionSummary::default()
             },
+            activity: Activity::over(timestamps),
             tools: ToolOutcomes {
                 total: ToolTally {
                     attempts: 20,
@@ -420,6 +448,28 @@ mod tests {
         );
         assert!(markdown.contains("## Gaps"));
         assert!(markdown.contains("- 2 — no transcript artifact"));
+    }
+
+    /// Duration is reported as work done, not as calendar time occupied — with the span kept
+    /// visible so a reader can see the difference the idle threshold made.
+    #[test]
+    fn cadence_leads_with_active_time_and_keeps_the_span_as_context() {
+        let markdown = render(&[session()], &[]);
+        assert!(
+            markdown.contains("- Median session active 2h 30m; longest 2h 30m."),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- Raw spans, for context: median 6h 00m; longest 6h 00m."),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "- 2h 30m of active time across 2 sittings, inside 6h 00m of \
+                               session span."
+            ),
+            "{markdown}"
+        );
     }
 
     #[test]
