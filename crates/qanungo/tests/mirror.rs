@@ -79,6 +79,10 @@ struct ArchivedSession {
     /// with `false` is an older snapshot of some other fixture's session: reachable through
     /// `/api/v1/sessions/{id}/snapshots` and by its own id, but never the projection.
     listed: bool,
+    /// Server-side completion time, which is what the real archive *orders* a session's
+    /// snapshots by. Distinct per snapshot so the ordering is a fact about the data rather than
+    /// about the order the fixtures happen to be declared in.
+    completed_at: String,
     corruption: Corruption,
 }
 
@@ -106,14 +110,22 @@ impl ArchivedSession {
             wire_chunks: None,
             has_transcript: true,
             listed: true,
+            completed_at: "2026-08-10T10:00:00.000Z".to_owned(),
             corruption: Corruption::None,
         }
     }
 
-    /// Makes this fixture an older, unprojected snapshot of `session`'s session.
-    fn older_snapshot_of(mut self, session: &Self) -> Self {
+    /// Makes this fixture an older, unprojected snapshot of `session`'s session, completed at
+    /// `completed_at` — which must be earlier than `session`'s, because that is what makes the
+    /// other one the *latest* snapshot the archive would project.
+    fn older_snapshot_of(mut self, session: &Self, completed_at: &str) -> Self {
+        assert!(
+            completed_at < session.completed_at.as_str(),
+            "an older snapshot has to be older"
+        );
         self.session_id = session.session_id.clone();
         self.listed = false;
+        self.completed_at = completed_at.to_owned();
         self
     }
 
@@ -164,6 +176,17 @@ impl Requests {
         self.targets
             .iter()
             .filter(|target| target.contains("/content"))
+            .count()
+    }
+
+    /// Requests for one snapshot's own document — what a fallback *probe* costs, one per sibling
+    /// looked at. Excludes the listing and the content route.
+    fn snapshot_detail_requests(&self) -> usize {
+        self.targets
+            .iter()
+            .filter(|target| {
+                target.starts_with("/api/v1/snapshots/") && !target.contains("/content")
+            })
             .count()
     }
 
@@ -255,18 +278,24 @@ fn serve(mut stream: TcpStream, sessions: &[ArchivedSession], recorded: &Mutex<R
     let _ = stream.flush();
 }
 
-/// One session's own snapshots, newest first — the archive's ordering, which is what the
-/// fallback relies on to take the *newest* sibling that carries a transcript. Unpaginated: the
-/// client reads one page of it and no more.
+/// One session's own snapshots, newest first — the archive's ordering (`ORDER BY
+/// completed_at_seq DESC`), which is what the fallback relies on to take the *newest* sibling
+/// that carries a transcript. Sorted here rather than served in declaration order, so a client
+/// that quietly depended on insertion order would fail a test instead of passing one.
+/// Unpaginated: the client reads one page of it and no more.
 fn session_snapshots(sessions: &[ArchivedSession], session_id: &str) -> String {
-    let items: Vec<String> = sessions
+    let mut snapshots: Vec<&ArchivedSession> = sessions
         .iter()
         .filter(|session| session.session_id == session_id)
+        .collect();
+    snapshots.sort_by(|left, right| right.completed_at.cmp(&left.completed_at));
+    let items: Vec<String> = snapshots
+        .iter()
         .map(|session| {
             format!(
                 r#"{{"snapshot_id":"{}","session_id":"{}","snapshot_fingerprint":"sha256:{}",
                     "manifest_id":"{}","manifest_sha256":"sha256:{}",
-                    "completed_at":"2026-08-10T10:00:00.000Z","artifact_count":1,
+                    "completed_at":"{}","artifact_count":1,
                     "total_original_bytes":{},"total_stored_bytes":{},"capture_count":1,
                     "snapshot_url":"/api/v1/snapshots/{}",
                     "captures_url":"/api/v1/snapshots/{}/captures",
@@ -276,6 +305,7 @@ fn session_snapshots(sessions: &[ArchivedSession], session_id: &str) -> String {
                 "0".repeat(64),
                 session.snapshot_id,
                 "1".repeat(64),
+                session.completed_at,
                 session.transcript.len(),
                 session.stored().len(),
                 session.snapshot_id,
@@ -309,7 +339,7 @@ fn session_page(sessions: &[ArchivedSession], query: &str) -> String {
             format!(
                 r#"{{"session_id":"{}","source_agent":"{}","source_session_id":"harness-{}",
                     "created_at":"2026-08-10T09:00:00.000Z","updated_at":"2026-08-10T10:00:00.000Z",
-                    "latest_snapshot":{{"snapshot_id":"{}","completed_at":"2026-08-10T10:00:00.000Z",
+                    "latest_snapshot":{{"snapshot_id":"{}","completed_at":"{}",
                     "project":null,"repository":null,"branch":null,"source_agent_version":null,
                     "artifact_set_version":{},"snapshot_url":"/api/v1/snapshots/{}",
                     "manifest_url":"/api/v1/snapshots/{}/manifest"}},
@@ -319,6 +349,7 @@ fn session_page(sessions: &[ArchivedSession], query: &str) -> String {
                 session.source_agent,
                 session.session_id,
                 session.snapshot_id,
+                session.completed_at,
                 session.artifact_set_version,
                 session.snapshot_id,
                 session.snapshot_id,
@@ -358,7 +389,7 @@ fn snapshot_document(session: &ArchivedSession) -> String {
     format!(
         r#"{{"snapshot_id":"{}","session_id":"{}","snapshot_fingerprint":"sha256:{}",
             "manifest_id":"{}","manifest_sha256":"sha256:{}",
-            "completed_at":"2026-08-10T10:00:00.000Z","artifact_count":1,
+            "completed_at":"{}","artifact_count":1,
             "total_original_bytes":{},"total_stored_bytes":{},"capture_count":1,
             "captures_url":"/api/v1/snapshots/{}/captures","manifest_url":"/api/v1/manifests/{}",
             "manifest":{{"schema_version":1,
@@ -374,6 +405,7 @@ fn snapshot_document(session: &ArchivedSession) -> String {
         "0".repeat(64),
         session.snapshot_id,
         "1".repeat(64),
+        session.completed_at,
         session.transcript.len(),
         stored.len(),
         session.snapshot_id,
@@ -608,7 +640,8 @@ fn a_summary_only_snapshot_is_a_recorded_gap_not_a_failure() {
 fn a_summary_only_latest_snapshot_falls_back_to_the_sibling_that_has_the_transcript() {
     let mut shadowed = ArchivedSession::claude(40, TRANSCRIPT, "identity");
     shadowed.has_transcript = false;
-    let complete = ArchivedSession::claude(41, TRANSCRIPT, "zstd").older_snapshot_of(&shadowed);
+    let complete = ArchivedSession::claude(41, TRANSCRIPT, "zstd")
+        .older_snapshot_of(&shadowed, "2026-08-09T10:00:00.000Z");
     let (base, requests) = spawn_archive(vec![shadowed, complete]);
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
@@ -634,7 +667,8 @@ fn a_summary_only_latest_snapshot_falls_back_to_the_sibling_that_has_the_transcr
 fn a_session_with_no_transcript_in_any_snapshot_is_still_a_recorded_gap() {
     let mut latest = ArchivedSession::claude(42, TRANSCRIPT, "identity");
     latest.has_transcript = false;
-    let mut older = ArchivedSession::claude(43, TRANSCRIPT, "identity").older_snapshot_of(&latest);
+    let mut older = ArchivedSession::claude(43, TRANSCRIPT, "identity")
+        .older_snapshot_of(&latest, "2026-08-09T10:00:00.000Z");
     older.has_transcript = false;
     let (base, requests) = spawn_archive(vec![latest, older]);
     let (_directory, cache) = cache();
@@ -649,6 +683,123 @@ fn a_session_with_no_transcript_in_any_snapshot_is_still_a_recorded_gap() {
         requests.lock().unwrap().content_requests(),
         0,
         "there was nothing to download"
+    );
+}
+
+/// "Newest sibling that carries a transcript" has to mean the archive's ordering, not the order
+/// the fixtures were declared in. The complete siblings here are declared oldest-first while the
+/// archive serves them newest-first, so a client reading the listing in the order it arrives gets
+/// a different transcript from one that does not.
+#[test]
+fn the_fallback_takes_the_newest_sibling_that_carries_a_transcript() {
+    let mut shadowed = ArchivedSession::claude(45, TRANSCRIPT, "identity");
+    shadowed.has_transcript = false;
+    let stale = ArchivedSession::claude(46, OTHER_TRANSCRIPT, "identity")
+        .older_snapshot_of(&shadowed, "2026-08-01T10:00:00.000Z");
+    let newest = ArchivedSession::claude(47, TRANSCRIPT, "identity")
+        .older_snapshot_of(&shadowed, "2026-08-09T10:00:00.000Z");
+    // Declared stale-first on purpose: only the `completed_at` ordering can pick the right one.
+    let (base, _requests) = spawn_archive(vec![shadowed, stale, newest]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(
+        mirror.sessions[0].source_hash,
+        sha256_hex(TRANSCRIPT.as_bytes()),
+        "the older sibling's transcript was folded instead of the newest one's"
+    );
+}
+
+/// The probe bound is what keeps one pathological session from costing hundreds of requests, so
+/// it has to actually stop: here the only complete snapshot is the *tenth* sibling back, past the
+/// bound, and the session is reported as a gap rather than chased.
+#[test]
+fn the_fallback_stops_probing_at_the_bound() {
+    const PROBE_BOUND: usize = 8;
+
+    let mut shadowed = ArchivedSession::claude(50, TRANSCRIPT, "identity");
+    shadowed.has_transcript = false;
+    let mut archive = Vec::new();
+    for step in 0..9_u8 {
+        let mut degenerate = ArchivedSession::claude(51 + step, TRANSCRIPT, "identity")
+            .older_snapshot_of(&shadowed, &format!("2026-08-09T{:02}:00:00.000Z", 9 - step));
+        degenerate.has_transcript = false;
+        archive.push(degenerate);
+    }
+    // Complete, but ten siblings back — past the bound, so never looked at.
+    archive.push(
+        ArchivedSession::claude(61, TRANSCRIPT, "identity")
+            .older_snapshot_of(&shadowed, "2026-08-01T10:00:00.000Z"),
+    );
+    archive.push(shadowed);
+
+    let (base, requests) = spawn_archive(archive);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert!(mirror.sessions.is_empty());
+    assert_eq!(mirror.skipped[0].reason, SkipReason::NoTranscript);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.snapshot_listing_requests(), 1);
+    assert_eq!(
+        requests.snapshot_detail_requests(),
+        1 + PROBE_BOUND,
+        "the projected snapshot, then no more than the bound's worth of siblings"
+    );
+    assert_eq!(requests.content_requests(), 0);
+}
+
+/// The converse of the #78 shape, and the reason the harness check cannot short-circuit the
+/// fallback: the *degenerate* snapshot is the one with the odd manifest, so believing its
+/// `source_agent` over a complete sibling's would re-create exactly the blindness this fallback
+/// exists to remove.
+#[test]
+fn a_latest_snapshot_naming_an_unreadable_harness_still_falls_back() {
+    let mut shadowed = ArchivedSession::claude(62, TRANSCRIPT, "identity");
+    shadowed.has_transcript = false;
+    shadowed.source_agent = "future-harness".to_owned();
+    let complete = ArchivedSession::claude(63, TRANSCRIPT, "identity")
+        .older_snapshot_of(&shadowed, "2026-08-09T10:00:00.000Z");
+    let (base, _requests) = spawn_archive(vec![shadowed, complete]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(
+        mirror.sessions[0].source_agent, "claude-code",
+        "provenance comes from the snapshot that carries the transcript"
+    );
+}
+
+/// And when the transcript that does exist is one this build cannot read, the gap says so rather
+/// than claiming there was no transcript at all.
+#[test]
+fn a_transcript_only_in_an_unreadable_harness_is_an_unknown_agent_gap() {
+    let mut shadowed = ArchivedSession::claude(64, TRANSCRIPT, "identity");
+    shadowed.has_transcript = false;
+    let mut complete = ArchivedSession::claude(65, TRANSCRIPT, "identity")
+        .older_snapshot_of(&shadowed, "2026-08-09T10:00:00.000Z");
+    complete.source_agent = "future-harness".to_owned();
+    let (base, requests) = spawn_archive(vec![shadowed, complete]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert!(mirror.sessions.is_empty());
+    assert_eq!(
+        mirror.skipped[0].reason,
+        SkipReason::UnknownAgent("future-harness".to_owned())
+    );
+    assert_eq!(
+        requests.lock().unwrap().content_requests(),
+        0,
+        "an uninterpretable transcript must not be transferred"
     );
 }
 

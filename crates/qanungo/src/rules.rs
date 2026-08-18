@@ -6,6 +6,12 @@
 //! it fires, states a **Problem**, an **Action**, and **evidence** — one line per session,
 //! carrying only aggregates, tool names, and the session's `source_hash`.
 //!
+//! The rules are **not** mutually exclusive, and no pair of them is. One session can be both a
+//! marathon and heavily resumed — a month-long transcript with one all-night push inside it is
+//! exactly that — and it should then appear under both headings, because the two findings ask
+//! for different things. Where a fixture asserts that it trips one rule only, that is a
+//! statement about the fixture, not a property of the rule set.
+//!
 //! # On the thresholds
 //!
 //! Every constant in [`thresholds`] is **arbitrary until measured**. They are first guesses at
@@ -300,8 +306,8 @@ fn resumed_session(sessions: &[SessionMetrics]) -> Option<Finding> {
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::ResumedSession,
         problem: format!(
-            "{} of {} folded sessions were resumed {}+ times and spent at least {}x as long \
-             idle as working.",
+            "{} of {} folded sessions were worked in {}+ separate sittings, with a calendar \
+             footprint at least {}x their active time.",
             evidence.len(),
             sessions.len(),
             thresholds::RESUMED_MIN_SITTINGS,
@@ -620,6 +626,33 @@ mod tests {
             .map(|finding| finding.rule)
             .collect();
         assert_eq!(rules, vec![RuleId::ResumedSession]);
+    }
+
+    /// The two duration rules are not alternatives, and a session that is genuinely both must
+    /// appear under both headings: a long-lived transcript with one all-night push inside it has
+    /// a marathon sitting *and* a diluted, heavily resumed shape, and the coaching for the two is
+    /// different — break the push up, and stop reusing the transcript.
+    #[test]
+    fn a_marathon_inside_a_heavily_resumed_transcript_fires_both_rules() {
+        let mut gaps = continuous(thresholds::MARATHON_SITTING_ACTIVE.num_minutes() + 30);
+        for _ in 0..5 {
+            gaps.push(3 * 24 * 60);
+            gaps.extend(continuous(10));
+        }
+        let both = session(14, 20, 300, &gaps, ToolTally::default(), &[]);
+        assert_eq!(both.sittings(), Some(6));
+        assert!(both.longest_sitting().unwrap() > thresholds::MARATHON_SITTING_ACTIVE);
+        assert!(both.span_to_active().unwrap() >= thresholds::RESUMED_SPAN_TO_ACTIVE);
+
+        let rules: Vec<_> = evaluate(&[both])
+            .into_iter()
+            .map(|finding| finding.rule)
+            .collect();
+        assert_eq!(
+            rules,
+            vec![RuleId::MarathonSession, RuleId::ResumedSession],
+            "the rule set is not a partition of sessions"
+        );
     }
 
     /// Both halves of the resumed rule have to hold: the archive is full of sessions that were

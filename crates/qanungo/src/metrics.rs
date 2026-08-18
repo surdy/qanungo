@@ -120,7 +120,13 @@ pub struct ToolOutcomes {
 /// fold clamps and stays streaming.
 ///
 /// A run's span is accumulated as the sum of its own internal gaps rather than as last − first,
-/// which is the same number for ordered records and cannot go negative for inverted ones.
+/// which is the same number for ordered records and cannot go negative for inverted ones. The
+/// price of the clamp is on the other side: an inverted pair re-traverses an interval the fold
+/// has already counted, so on an out-of-order transcript the summed gaps can *exceed* last −
+/// first, and `active_time` or `longest_sitting` can come out larger than
+/// [`SessionMetrics::span`]. That is the accepted trade for staying streaming — the affected
+/// adjacencies are 0.52% of the archive and almost all sub-second — but it means the two
+/// quantities are not guaranteed to order, and nothing here should assume they do.
 ///
 /// Every reading is `None` for a session with fewer than two dated records: with no adjacency
 /// there is no gap, and a lone record's activity is undefined rather than zero — the same
@@ -250,9 +256,12 @@ impl SessionMetrics {
     /// exactly what the resumed-session rule is looking for. A session whose span is also zero
     /// (every record on the same instant) yields `NaN`, which compares false against every
     /// threshold and so fires nothing.
+    /// Taken in milliseconds rather than seconds: a session whose entire activity is under a
+    /// second is a real shape (a burst of records, then nothing), and truncating it to zero would
+    /// report it as having no work at all rather than as having very little.
     pub fn span_to_active(&self) -> Option<f64> {
         let (span, active) = self.span().zip(self.active_time())?;
-        Some(span.num_seconds() as f64 / active.num_seconds() as f64)
+        Some(span.num_milliseconds() as f64 / active.num_milliseconds() as f64)
     }
 
     /// Tool activities per user request, or `None` when the session recorded no user request.
@@ -367,10 +376,15 @@ pub struct Cadence {
     pub per_day: BTreeMap<NaiveDate, usize>,
     /// Sessions whose records carried no parseable timestamp at all.
     pub undated: usize,
-    /// Every measurable session's wall-clock span, ascending. Context for the actives below.
+    /// Every *dated* session's wall-clock span, ascending. Context for the actives below.
+    ///
+    /// The two series do not cover the same sessions, and the difference is not an oversight: a
+    /// session with a single dated record has a span (of zero — first and last are the same
+    /// record) but no measurable activity, so it appears here and not in `actives`. Comparing
+    /// their lengths, or pairing them off by index, would be wrong.
     pub spans: Vec<TimeDelta>,
-    /// Every measurable session's active time, ascending — the duration distribution a report
-    /// reasons about.
+    /// Every *measurable* session's active time, ascending — the duration distribution a report
+    /// reasons about. Sessions with fewer than two dated records are absent, per [`Activity`].
     pub actives: Vec<TimeDelta>,
     /// Active time summed over the window.
     pub total_active: TimeDelta,
@@ -798,6 +812,38 @@ mod tests {
         ]);
         assert_eq!(inverted.active_time(), Some(TimeDelta::minutes(13)));
         assert_eq!(inverted.sittings(), Some(1));
+        // And the cost of clamping rather than sorting, pinned rather than left to be discovered:
+        // the fold re-traverses the minute it walked back over, so the summed gaps come out one
+        // minute *longer* than the 12m between the earliest and latest record.
+        assert!(inverted.active_time().unwrap() > TimeDelta::minutes(12));
+    }
+
+    /// Sub-second work is real — a burst of records and then nothing — and the span-to-active
+    /// ratio has to stay finite for it, or a rule reads "no work at all" off a session that had
+    /// some.
+    #[test]
+    fn a_sub_second_active_time_still_divides_into_a_finite_ratio() {
+        let start = at("2026-08-01T09:00:00Z");
+        let session = SessionMetrics {
+            source_hash: "0".repeat(64),
+            source_agent: "claude-code".to_owned(),
+            summary: SessionSummary {
+                first_timestamp: Some(start),
+                last_timestamp: Some(start + TimeDelta::hours(9)),
+                ..SessionSummary::default()
+            },
+            tools: ToolOutcomes::default(),
+            activity: Activity::over([start, start + TimeDelta::milliseconds(900)]),
+            bytes_folded: 0,
+        };
+        assert_eq!(
+            session.active_time(),
+            Some(TimeDelta::milliseconds(900)),
+            "the fold itself keeps sub-second gaps"
+        );
+        let ratio = session.span_to_active().expect("both are measurable");
+        assert!(ratio.is_finite(), "{ratio}");
+        assert!((ratio - 36_000.0).abs() < 1.0, "{ratio}");
     }
 
     /// One record has no adjacency, so it has no gap: activity is undefined rather than zero,

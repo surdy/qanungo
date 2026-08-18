@@ -6,9 +6,9 @@
 //! naive re-sync is affordable precisely because the expensive part — transferring transcript
 //! bytes — is skipped by content hash, and the cheap part is one small JSON request per session.
 //!
-//! The one place that budget stretches is a session whose projected latest snapshot carries no
-//! transcript: the mirror then asks for that session's own snapshot listing and folds the newest
-//! sibling that does. See [`complete_sibling`].
+//! The one place that budget stretches is a session whose projected latest snapshot cannot be
+//! folded: the mirror then asks for that session's own snapshot listing and folds the newest
+//! sibling that can be. See [`foldable_snapshot`].
 //!
 //! # Being a polite client
 //!
@@ -54,7 +54,7 @@ pub struct MirroredSession {
 }
 
 /// Snapshots of one session this client will look through when its `latest_snapshot` turns out
-/// to carry no transcript.
+/// not to be foldable.
 ///
 /// The failure mode this bounds is a session with hundreds of captures, none of them complete:
 /// without a bound, one such session would cost hundreds of requests to conclude nothing. Eight
@@ -202,25 +202,13 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
             );
         }
     };
-    if crate::metrics::source_for_agent(&snapshot.source_agent).is_none() {
-        // Checked before the fallback below, so an uninterpretable session never costs the
-        // archive the extra requests that finding its transcript would.
-        return skip(
-            &snapshot.source_agent,
-            SkipReason::UnknownAgent(snapshot.source_agent.clone()),
-        );
-    }
     let source_agent = snapshot.source_agent.clone();
-    let snapshot = if snapshot.transcript().is_some() {
-        snapshot
-    } else {
-        match complete_sibling(client, session) {
-            Ok(Some(sibling)) => sibling,
-            Ok(None) => return skip(&source_agent, SkipReason::NoTranscript),
-            // The listing itself failed, so whether a transcript exists is unknown. Saying
-            // "no transcript artifact" here would be reporting a fact this run never learned.
-            Err(error) => return skip(&source_agent, SkipReason::Unreadable(error.to_string())),
-        }
+    let snapshot = match foldable_snapshot(client, session, snapshot) {
+        Ok(Resolution::Foldable(snapshot)) => snapshot,
+        Ok(Resolution::Unfoldable(reason)) => return skip(&source_agent, reason),
+        // The listing itself failed, so what this session holds is unknown. Saying "no
+        // transcript artifact" here would be reporting a fact this run never learned.
+        Err(error) => return skip(&source_agent, SkipReason::Unreadable(error.to_string())),
     };
     let Some(transcript) = snapshot.transcript() else {
         return skip(&source_agent, SkipReason::NoTranscript);
@@ -279,8 +267,24 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
     }
 }
 
-/// Looks for the newest snapshot of this session that does carry a transcript, when the one the
-/// archive projected as `latest_snapshot` does not.
+/// What looking through a session's snapshots concluded.
+enum Resolution {
+    /// A snapshot that carries a transcript this build can interpret.
+    Foldable(SnapshotDetail),
+    /// None does, and this is why — stated from what was actually seen.
+    Unfoldable(SkipReason),
+}
+
+/// Whether a snapshot can be folded at all: it has to carry a transcript *and* name a harness
+/// this build has an interpreter for. Either half missing makes the snapshot useless on its own,
+/// which is precisely when it is worth looking at its siblings.
+fn foldable(snapshot: &SnapshotDetail) -> bool {
+    snapshot.transcript().is_some()
+        && crate::metrics::source_for_agent(&snapshot.source_agent).is_some()
+}
+
+/// Picks the snapshot of this session to fold: the archive's projected one when it is usable,
+/// otherwise the newest sibling that is.
 ///
 /// # Why this exists (munshi #78)
 ///
@@ -292,15 +296,38 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
 ///
 /// The fix belongs upstream — tombstoning those snapshots re-elects the complete ones — and this
 /// is defense in depth, not a substitute for it: a read-side client that can see a transcript
-/// should fold it. It costs one listing request plus at most [`MAX_FALLBACK_PROBES`] snapshot
-/// reads, and only for the affected minority; a session whose latest snapshot is complete never
-/// reaches this function.
+/// should fold it.
 ///
-/// Returns `Ok(None)` when this session genuinely has no archived transcript.
-fn complete_sibling(
+/// # Why an unreadable harness is not a short-circuit
+///
+/// It is tempting to skip a snapshot whose `source_agent` has no interpreter before spending the
+/// listing request, and an earlier draft of this did. That re-creates the very blindness the
+/// function exists to remove: the *degenerate* snapshot is the one carrying the odd manifest, and
+/// believing its provenance over a complete sibling's is exactly the mistake of trusting a
+/// projection. A snapshot is therefore looked past when it has no transcript **or** no
+/// interpreter, and the cost is bounded the same way in both cases — one listing plus at most
+/// [`MAX_FALLBACK_PROBES`] snapshot reads, and nothing at all for a session whose projection is
+/// already foldable.
+///
+/// The reason returned when nothing is foldable is taken from what was seen rather than from
+/// which check ran last: a transcript that exists but cannot be interpreted is
+/// [`SkipReason::UnknownAgent`], and only a session where no snapshot carries a transcript at all
+/// is [`SkipReason::NoTranscript`].
+fn foldable_snapshot(
     client: &ReadClient,
     session: &ListedSession,
-) -> Result<Option<SnapshotDetail>, PatwariError> {
+    projected: SnapshotDetail,
+) -> Result<Resolution, PatwariError> {
+    if foldable(&projected) {
+        return Ok(Resolution::Foldable(projected));
+    }
+    // Remembered across the probes so the eventual gap describes the whole session rather than
+    // whichever snapshot happened to be examined last.
+    let mut uninterpretable = projected
+        .transcript()
+        .is_some()
+        .then(|| projected.source_agent.clone());
+
     let siblings = client.session_snapshots(&session.session_id)?;
     for sibling in siblings
         .iter()
@@ -310,13 +337,17 @@ fn complete_sibling(
         .take(MAX_FALLBACK_PROBES)
     {
         let detail = client.snapshot(&sibling.snapshot_id)?;
-        if detail.transcript().is_some()
-            && crate::metrics::source_for_agent(&detail.source_agent).is_some()
-        {
-            return Ok(Some(detail));
+        if foldable(&detail) {
+            return Ok(Resolution::Foldable(detail));
+        }
+        if detail.transcript().is_some() {
+            uninterpretable.get_or_insert(detail.source_agent.clone());
         }
     }
-    Ok(None)
+    Ok(Resolution::Unfoldable(match uninterpretable {
+        Some(agent) => SkipReason::UnknownAgent(agent),
+        None => SkipReason::NoTranscript,
+    }))
 }
 
 /// A poisoned worker mutex means another worker panicked; the remaining work is still valid, so
