@@ -6,6 +6,10 @@
 //! naive re-sync is affordable precisely because the expensive part — transferring transcript
 //! bytes — is skipped by content hash, and the cheap part is one small JSON request per session.
 //!
+//! The one place that budget stretches is a session whose projected latest snapshot carries no
+//! transcript: the mirror then asks for that session's own snapshot listing and folds the newest
+//! sibling that does. See [`complete_sibling`].
+//!
 //! # Being a polite client
 //!
 //! Patwari is a LAN server that serves about eight concurrent requests behind a 30s timeout.
@@ -18,7 +22,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::cache::BlobCache;
-use crate::patwari::{ListedSession, PatwariError, ReadClient};
+use crate::patwari::{ListedSession, PatwariError, ReadClient, SnapshotDetail};
 
 /// Worker threads used against the archive. Comfortably under Patwari's concurrency limit, so a
 /// report never crowds out the archive's other clients.
@@ -49,11 +53,21 @@ pub struct MirroredSession {
     pub size_bytes: u64,
 }
 
+/// Snapshots of one session this client will look through when its `latest_snapshot` turns out
+/// to carry no transcript.
+///
+/// The failure mode this bounds is a session with hundreds of captures, none of them complete:
+/// without a bound, one such session would cost hundreds of requests to conclude nothing. Eight
+/// is far past the real shape of the problem (munshi #78: every affected session has exactly one
+/// degenerate snapshot shadowing a complete one) and still cheap.
+const MAX_FALLBACK_PROBES: usize = 8;
+
 /// Why one session contributed nothing to the fold. Recorded rather than swallowed: a report
 /// that quietly dropped a third of the window would be worse than one that says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The snapshot has no `transcript.jsonl` artifact — a summary-only capture.
+    /// No snapshot of this session carries a `transcript.jsonl` artifact — a summary-only
+    /// capture, with no complete sibling to fall back to.
     NoTranscript,
     /// The manifest names a harness this build has no interpreter for.
     UnknownAgent(String),
@@ -189,16 +203,32 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
         }
     };
     if crate::metrics::source_for_agent(&snapshot.source_agent).is_none() {
+        // Checked before the fallback below, so an uninterpretable session never costs the
+        // archive the extra requests that finding its transcript would.
         return skip(
             &snapshot.source_agent,
             SkipReason::UnknownAgent(snapshot.source_agent.clone()),
         );
     }
+    let source_agent = snapshot.source_agent.clone();
+    let snapshot = if snapshot.transcript().is_some() {
+        snapshot
+    } else {
+        match complete_sibling(client, session) {
+            Ok(Some(sibling)) => sibling,
+            Ok(None) => return skip(&source_agent, SkipReason::NoTranscript),
+            // The listing itself failed, so whether a transcript exists is unknown. Saying
+            // "no transcript artifact" here would be reporting a fact this run never learned.
+            Err(error) => return skip(&source_agent, SkipReason::Unreadable(error.to_string())),
+        }
+    };
     let Some(transcript) = snapshot.transcript() else {
-        return skip(&snapshot.source_agent, SkipReason::NoTranscript);
+        return skip(&source_agent, SkipReason::NoTranscript);
     };
     let mirrored = MirroredSession {
         source_hash: transcript.original_sha256.clone(),
+        // Both taken from whichever snapshot actually carries the transcript: a fallback sibling
+        // states its own provenance, and a degenerate snapshot's is not evidence about it.
         source_agent: snapshot.source_agent.clone(),
         artifact_set_version: snapshot.artifact_set_version,
         size_bytes: transcript.original_size_bytes,
@@ -247,6 +277,46 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
         // footer a record of the transfer rather than a restatement of the plan.
         transferred_bytes: receipt.stored_bytes,
     }
+}
+
+/// Looks for the newest snapshot of this session that does carry a transcript, when the one the
+/// archive projected as `latest_snapshot` does not.
+///
+/// # Why this exists (munshi #78)
+///
+/// `latest_snapshot` is strictly newest-by-completion, and a *degenerate* capture can be the
+/// newest one: 56 sessions in the real archive carry a summary-only snapshot, all written by a
+/// single 2026-07-28 backfill run, each shadowing a complete sibling whose transcript was already
+/// archived. Keying on the projection alone made ~10% of the archive invisible to every metric
+/// here while the bytes sat in it the whole time.
+///
+/// The fix belongs upstream — tombstoning those snapshots re-elects the complete ones — and this
+/// is defense in depth, not a substitute for it: a read-side client that can see a transcript
+/// should fold it. It costs one listing request plus at most [`MAX_FALLBACK_PROBES`] snapshot
+/// reads, and only for the affected minority; a session whose latest snapshot is complete never
+/// reaches this function.
+///
+/// Returns `Ok(None)` when this session genuinely has no archived transcript.
+fn complete_sibling(
+    client: &ReadClient,
+    session: &ListedSession,
+) -> Result<Option<SnapshotDetail>, PatwariError> {
+    let siblings = client.session_snapshots(&session.session_id)?;
+    for sibling in siblings
+        .iter()
+        // The projected one is where we started; re-reading it would cost a request to learn
+        // what this run already knows.
+        .filter(|sibling| sibling.snapshot_id != session.snapshot_id)
+        .take(MAX_FALLBACK_PROBES)
+    {
+        let detail = client.snapshot(&sibling.snapshot_id)?;
+        if detail.transcript().is_some()
+            && crate::metrics::source_for_agent(&detail.source_agent).is_some()
+        {
+            return Ok(Some(detail));
+        }
+    }
+    Ok(None)
 }
 
 /// A poisoned worker mutex means another worker panicked; the remaining work is still valid, so

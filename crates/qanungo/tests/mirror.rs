@@ -1,10 +1,11 @@
 //! The mirror/sync path, end to end against a stand-in archive.
 //!
 //! The stand-in speaks the shapes the real `patwari-server` returns — the session listing with
-//! its `latest_snapshot` projection and `next_cursor`, the snapshot document with its canonical
-//! manifest and artifact list, and the artifact-content route with its `x-patwari-*` metadata
-//! headers — so these tests exercise the real client without needing a server, a network, or a
-//! populated archive. The live server is verified separately by running the binary against it.
+//! its `latest_snapshot` projection and `next_cursor`, a session's own newest-first snapshot
+//! listing, the snapshot document with its canonical manifest and artifact list, and the
+//! artifact-content route with its `x-patwari-*` metadata headers — so these tests exercise the
+//! real client without needing a server, a network, or a populated archive. The live server is
+//! verified separately by running the binary against it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -74,6 +75,10 @@ struct ArchivedSession {
     wire_chunks: Option<usize>,
     /// A summary-only capture has no `transcript.jsonl` artifact at all.
     has_transcript: bool,
+    /// Whether the session listing projects *this* snapshot as the session's latest. A fixture
+    /// with `false` is an older snapshot of some other fixture's session: reachable through
+    /// `/api/v1/sessions/{id}/snapshots` and by its own id, but never the projection.
+    listed: bool,
     corruption: Corruption,
 }
 
@@ -100,8 +105,16 @@ impl ArchivedSession {
             declared_original_bytes: None,
             wire_chunks: None,
             has_transcript: true,
+            listed: true,
             corruption: Corruption::None,
         }
+    }
+
+    /// Makes this fixture an older, unprojected snapshot of `session`'s session.
+    fn older_snapshot_of(mut self, session: &Self) -> Self {
+        self.session_id = session.session_id.clone();
+        self.listed = false;
+        self
     }
 
     fn corrupt(index: u8, corruption: Corruption) -> Self {
@@ -153,6 +166,21 @@ impl Requests {
             .filter(|target| target.contains("/content"))
             .count()
     }
+
+    /// Requests for a *session's* snapshot listing — the one extra request the transcript
+    /// fallback costs. Not to be confused with `/api/v1/snapshots/{id}`, which every session
+    /// costs anyway.
+    fn snapshot_listing_requests(&self) -> usize {
+        self.targets
+            .iter()
+            .filter(|target| {
+                let path = target
+                    .split_once('?')
+                    .map_or(target.as_str(), |(path, _)| path);
+                path.starts_with("/api/v1/sessions/") && path.ends_with("/snapshots")
+            })
+            .count()
+    }
 }
 
 /// Serves `sessions` until the test process exits, and returns its base URL.
@@ -202,6 +230,11 @@ fn serve(mut stream: TcpStream, sessions: &[ArchivedSession], recorded: &Mutex<R
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     let response = if path == "/api/v1/sessions" {
         json_response(&session_page(sessions, query))
+    } else if let Some(id) = path
+        .strip_prefix("/api/v1/sessions/")
+        .and_then(|rest| rest.strip_suffix("/snapshots"))
+    {
+        json_response(&session_snapshots(sessions, id))
     } else if let Some(id) = path.strip_prefix("/api/v1/snapshots/") {
         match sessions.iter().find(|session| session.snapshot_id == id) {
             Some(session) => json_response(&snapshot_document(session)),
@@ -222,16 +255,53 @@ fn serve(mut stream: TcpStream, sessions: &[ArchivedSession], recorded: &Mutex<R
     let _ = stream.flush();
 }
 
-/// Two pages when there is more than one session, so the client's cursor discipline is exercised
-/// rather than assumed.
+/// One session's own snapshots, newest first — the archive's ordering, which is what the
+/// fallback relies on to take the *newest* sibling that carries a transcript. Unpaginated: the
+/// client reads one page of it and no more.
+fn session_snapshots(sessions: &[ArchivedSession], session_id: &str) -> String {
+    let items: Vec<String> = sessions
+        .iter()
+        .filter(|session| session.session_id == session_id)
+        .map(|session| {
+            format!(
+                r#"{{"snapshot_id":"{}","session_id":"{}","snapshot_fingerprint":"sha256:{}",
+                    "manifest_id":"{}","manifest_sha256":"sha256:{}",
+                    "completed_at":"2026-08-10T10:00:00.000Z","artifact_count":1,
+                    "total_original_bytes":{},"total_stored_bytes":{},"capture_count":1,
+                    "snapshot_url":"/api/v1/snapshots/{}",
+                    "captures_url":"/api/v1/snapshots/{}/captures",
+                    "manifest_url":"/api/v1/manifests/{}"}}"#,
+                session.snapshot_id,
+                session.session_id,
+                "0".repeat(64),
+                session.snapshot_id,
+                "1".repeat(64),
+                session.transcript.len(),
+                session.stored().len(),
+                session.snapshot_id,
+                session.snapshot_id,
+                session.snapshot_id,
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"items":[{}],"next_cursor":null,"high_watermark":null}}"#,
+        items.join(",")
+    )
+}
+
+/// Two pages when there is more than one projected session, so the client's cursor discipline is
+/// exercised rather than assumed.
 fn session_page(sessions: &[ArchivedSession], query: &str) -> String {
+    let sessions: Vec<&ArchivedSession> =
+        sessions.iter().filter(|session| session.listed).collect();
     let second_page = query.contains("cursor=page-two");
     let (page, next_cursor) = if sessions.len() > 1 && !second_page {
         (&sessions[..1], "\"page-two\"")
     } else if second_page {
         (&sessions[1..], "null")
     } else {
-        (sessions, "null")
+        (&sessions[..], "null")
     };
     let items: Vec<String> = page
         .iter()
@@ -528,6 +598,70 @@ fn a_summary_only_snapshot_is_a_recorded_gap_not_a_failure() {
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(mirror.skipped.len(), 1);
     assert_eq!(mirror.skipped[0].reason, SkipReason::NoTranscript);
+}
+
+/// munshi #78: a degenerate summary-only snapshot can be the *newest* one and so become the
+/// session's projected `latest_snapshot`, shadowing a complete sibling whose transcript is
+/// already archived. That made ~10% of the real archive invisible to every metric here while the
+/// bytes sat in it, so the mirror looks past the projection before recording a gap.
+#[test]
+fn a_summary_only_latest_snapshot_falls_back_to_the_sibling_that_has_the_transcript() {
+    let mut shadowed = ArchivedSession::claude(40, TRANSCRIPT, "identity");
+    shadowed.has_transcript = false;
+    let complete = ArchivedSession::claude(41, TRANSCRIPT, "zstd").older_snapshot_of(&shadowed);
+    let (base, requests) = spawn_archive(vec![shadowed, complete]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(
+        mirror.sessions[0].source_hash,
+        sha256_hex(TRANSCRIPT.as_bytes())
+    );
+    assert!(cache.contains(&mirror.sessions[0].source_hash));
+    assert_eq!(
+        requests.lock().unwrap().snapshot_listing_requests(),
+        1,
+        "the fallback costs exactly one extra request, and only for the affected session"
+    );
+}
+
+/// The other half of the same behaviour: when no snapshot of the session carries a transcript,
+/// the Gap is exactly the one that was always reported. The fallback adds a look, not a claim.
+#[test]
+fn a_session_with_no_transcript_in_any_snapshot_is_still_a_recorded_gap() {
+    let mut latest = ArchivedSession::claude(42, TRANSCRIPT, "identity");
+    latest.has_transcript = false;
+    let mut older = ArchivedSession::claude(43, TRANSCRIPT, "identity").older_snapshot_of(&latest);
+    older.has_transcript = false;
+    let (base, requests) = spawn_archive(vec![latest, older]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert!(mirror.sessions.is_empty());
+    assert_eq!(mirror.skipped.len(), 1);
+    assert_eq!(mirror.skipped[0].reason, SkipReason::NoTranscript);
+    assert_eq!(requests.lock().unwrap().snapshot_listing_requests(), 1);
+    assert_eq!(
+        requests.lock().unwrap().content_requests(),
+        0,
+        "there was nothing to download"
+    );
+}
+
+/// A session whose projection is complete must never pay for the fallback.
+#[test]
+fn a_complete_latest_snapshot_costs_no_snapshot_listing() {
+    let (base, requests) = spawn_archive(vec![ArchivedSession::claude(44, TRANSCRIPT, "identity")]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(requests.lock().unwrap().snapshot_listing_requests(), 0);
 }
 
 #[test]

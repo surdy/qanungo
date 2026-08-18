@@ -18,6 +18,11 @@
 //! 3. `GET /api/v1/artifacts/{id}/content` — the stored bytes, with the artifact's declared
 //!    sizes, digests, and compression in `x-patwari-*` headers.
 //!
+//! There is a fourth, requested only for the sessions that need it:
+//! `GET /api/v1/sessions/{id}/snapshots` — that session's snapshots, newest first. A projected
+//! `latest_snapshot` can be a degenerate capture that shadows a complete sibling (munshi #78),
+//! and this is how the mirror finds the sibling.
+//!
 //! # The verified download
 //!
 //! [`ReadClient::download_transcript`] streams. The stored bytes are read off the socket a buffer
@@ -133,6 +138,10 @@ pub enum PatwariError {
     DeclaredSizeRefused { size_bytes: u64, ceiling: u64 },
 }
 
+/// Page size requested from a session's own snapshot listing. One page is enough: the listing is
+/// newest-first, and the sibling that carries a transcript is by construction close to the top.
+const SNAPSHOT_LISTING_PAGE_SIZE: usize = 50;
+
 /// One session in the report window, with the context Patwari projects from its latest
 /// completed snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +154,15 @@ pub struct ListedSession {
     pub snapshot_id: String,
     /// Server-side completion time of the latest snapshot. This is *archive* time, not
     /// transcript time: it selects the window, while the metrics use record timestamps.
+    pub completed_at: String,
+}
+
+/// One entry in a session's snapshot listing: enough to ask for the snapshot itself, and the
+/// completion time the archive ordered it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRef {
+    pub snapshot_id: String,
+    /// Server-side completion time. Archive time, not transcript time.
     pub completed_at: String,
 }
 
@@ -237,6 +255,36 @@ impl ReadClient {
         Err(PatwariError::Protocol(
             "session listing never stopped returning cursors".to_owned(),
         ))
+    }
+
+    /// Lists one session's own snapshots, newest first, as the archive orders them.
+    ///
+    /// Only the first page is read (at most [`SNAPSHOT_LISTING_PAGE_SIZE`] snapshots): this
+    /// exists to find a complete sibling of a degenerate `latest_snapshot`, and a sibling further
+    /// back than fifty captures is not one this client will chase across pages of a LAN archive
+    /// it is trying to be polite to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listing cannot be fetched or does not carry the documented
+    /// fields.
+    pub fn session_snapshots(&self, session_id: &str) -> Result<Vec<SnapshotRef>, PatwariError> {
+        let target = format!(
+            "{API_BASE}/sessions/{}/snapshots?limit={SNAPSHOT_LISTING_PAGE_SIZE}",
+            http::encode_value(session_id)
+        );
+        let page = self.get_json(&target)?;
+        page.get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PatwariError::Protocol("snapshot listing missing items".to_owned()))?
+            .iter()
+            .map(|item| {
+                Ok(SnapshotRef {
+                    snapshot_id: required_str(item, "snapshot_id")?,
+                    completed_at: required_str(item, "completed_at")?,
+                })
+            })
+            .collect()
     }
 
     /// Reads one snapshot's provenance and complete artifact list.
