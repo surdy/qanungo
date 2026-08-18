@@ -720,11 +720,14 @@ fn change(now: Option<f64>, before: Option<f64>, render: fn(f64) -> String) -> S
         return "—".to_owned();
     };
     let delta = now - before;
-    if delta == 0.0 {
+    // A move too small for the renderer to distinguish from zero is flat: an arrow beside
+    // a rendered zero reads as a contradiction.
+    let magnitude = render(delta.abs());
+    if magnitude == render(0.0) {
         return "=".to_owned();
     }
     let direction = if delta > 0.0 { "▲" } else { "▼" };
-    format!("{direction} {}", render(delta.abs()))
+    format!("{direction} {magnitude}")
 }
 
 /// A whole count.
@@ -736,7 +739,8 @@ fn count(value: f64) -> String {
 /// [`Report::render_headline_metrics`].
 ///
 /// Carried to one decimal where the values themselves are whole percentages, because a real move
-/// smaller than a point is common here and `▼ 0pp` beside a `▼` arrow reads as a contradiction.
+/// smaller than a point is common here. A move smaller than the decimal can show is rendered
+/// flat by [`change`], never as an arrow beside a zero.
 fn percentage_points(value: f64) -> String {
     format!("{:.1}pp", value * 100.0)
 }
@@ -749,7 +753,7 @@ fn seconds(span: TimeDelta) -> f64 {
 
 /// The inverse, for rendering.
 fn span_of_seconds(value: f64) -> String {
-    format::span(TimeDelta::try_seconds(value as i64).unwrap_or_else(TimeDelta::zero))
+    format::span(TimeDelta::try_seconds(value.round() as i64).unwrap_or_else(TimeDelta::zero))
 }
 
 fn display_path(path: &Path) -> String {
@@ -1057,7 +1061,7 @@ mod tests {
     #[test]
     fn a_lane_measured_in_both_windows_carries_an_arrow() {
         let improved = render_against(&hygiene_window(20, 2), &hygiene_window(20, 5), &[]);
-        // 80 this window against 50 last: a twenty-point improvement.
+        // 80 this window against 50 last: a thirty-point improvement.
         assert!(
             improved.contains("| Session Hygiene | 80 ▲ 30 | 80 ▲ 30 |"),
             "{improved}"

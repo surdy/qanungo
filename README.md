@@ -73,7 +73,8 @@ cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
 `--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the transcript cache, which
 otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` /
 `0o600`. The report renders **aggregates, tool names, and content hashes only** — never transcript
-content. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, explicitly arbitrary
+content. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
+constants in `crates/qanungo/src/scoring.rs` are the same kind of knob — all explicitly arbitrary
 until the footer's fold-cost and rule-firing data say otherwise.
 
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the dashboard (#5), the

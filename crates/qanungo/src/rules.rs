@@ -221,7 +221,10 @@ impl RuleId {
         }
     }
 
-    /// The sessions this rule could read at all, out of a window.
+    /// The sessions this rule could read at all, out of a window. Production code counts
+    /// eligibility inline while it counts firings ([`crate::scoring`]); this exists for tests
+    /// that assert the eligibility boundary on its own.
+    #[cfg(test)]
     pub fn eligible(self, sessions: &[SessionMetrics]) -> usize {
         sessions
             .iter()
