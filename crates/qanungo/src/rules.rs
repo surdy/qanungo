@@ -6,6 +6,12 @@
 //! it fires, states a **Problem**, an **Action**, and **evidence** — one line per session,
 //! carrying only aggregates, tool names, and the session's `source_hash`.
 //!
+//! Each rule's trigger lives in exactly one place, [`RuleId::verdict`], which answers three ways:
+//! it fired, it did not fire, or *this session carries no signal this rule can read*. [`evaluate`]
+//! filters on the first, and [`crate::scoring`] divides by the first two — so the rule that fires
+//! and the fire rate that scores it cannot drift apart, which is the same argument munshi ADR
+//! 0011 makes for one parser rather than two.
+//!
 //! The rules are **not** mutually exclusive, and no pair of them is. One session can be both a
 //! marathon and heavily resumed — a month-long transcript with one all-night push inside it is
 //! exactly that — and it should then appear under both headings, because the two findings ask
@@ -125,6 +131,17 @@ pub enum RuleId {
 }
 
 impl RuleId {
+    /// Every rule, in the order [`evaluate`] runs them — which is also report order, and the
+    /// order the rule-pack stamp hashes them in.
+    pub const ALL: [Self; 6] = [
+        Self::HighToolErrorRate,
+        Self::RetryLoop,
+        Self::MarathonSession,
+        Self::ResumedSession,
+        Self::Babysitting,
+        Self::FireAndForget,
+    ];
+
     /// The finding's heading in the report.
     pub const fn title(self) -> &'static str {
         match self {
@@ -136,6 +153,86 @@ impl RuleId {
             Self::FireAndForget => "Fire-and-forget extreme",
         }
     }
+
+    /// A stable machine name, for the rule-pack stamp. Distinct from [`RuleId::title`] on
+    /// purpose: a heading is prose and may be reworded, while this is an identity and may not.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::HighToolErrorRate => "high-tool-error-rate",
+            Self::RetryLoop => "retry-loop",
+            Self::MarathonSession => "marathon-session",
+            Self::ResumedSession => "resumed-session",
+            Self::Babysitting => "babysitting",
+            Self::FireAndForget => "fire-and-forget",
+        }
+    }
+
+    /// Whether this rule's trigger held for one session — or `None` when the session carries no
+    /// signal this rule can read.
+    ///
+    /// The three-valued answer is the whole point, and it is why this lives on the rule rather
+    /// than being re-derived by each caller. `Some(false)` is "this rule looked and found
+    /// nothing"; `None` is "this rule could not look". A fire rate that confused the two would
+    /// dilute its own numerator with sessions whose harness cannot express the signal at all —
+    /// [`crate::scoring`] divides by exactly the sessions this returns `Some` for.
+    ///
+    /// [`evaluate`] filters on `Some(true)` from the same function, so the rule that fires and
+    /// the rate that counts it can never drift apart.
+    pub fn verdict(self, session: &SessionMetrics) -> Option<bool> {
+        match self {
+            // Eligible once enough calls reported an outcome for *either* trigger to be able to
+            // fire: below the lower of the two minimums, no rate in the session means anything.
+            Self::HighToolErrorRate => {
+                let minimum =
+                    thresholds::MIN_TOOL_ATTEMPTS.min(thresholds::MIN_SESSION_TOOL_ATTEMPTS);
+                (session.tools.total.attempts >= minimum)
+                    .then(|| !error_rate_reasons(session).is_empty())
+            }
+            Self::RetryLoop => session
+                .commands
+                .busiest_runs()
+                .map(|runs| runs >= thresholds::RETRY_LOOP_REPEATS),
+            Self::MarathonSession => session
+                .longest_sitting()
+                .map(|longest| longest > thresholds::MARATHON_SITTING_ACTIVE),
+            Self::ResumedSession => {
+                let dilution = session.span_to_active()?;
+                let sittings = session.sittings()?;
+                // A session whose span and active time are both zero yields NaN — no dilution was
+                // measured, rather than a dilution of none.
+                (!dilution.is_nan()).then_some(
+                    dilution >= thresholds::RESUMED_SPAN_TO_ACTIVE
+                        && sittings >= thresholds::RESUMED_MIN_SITTINGS,
+                )
+            }
+            Self::Babysitting => {
+                let ratio = session.tools_per_request()?;
+                (session.summary.user_requests >= thresholds::BABYSITTING_MIN_USER_REQUESTS)
+                    .then_some(ratio < thresholds::BABYSITTING_TOOLS_PER_REQUEST)
+            }
+            Self::FireAndForget => {
+                let ratio = session.tools_per_request()?;
+                (session.summary.user_requests == thresholds::FIRE_AND_FORGET_USER_REQUESTS)
+                    .then_some(
+                        ratio >= thresholds::FIRE_AND_FORGET_TOOLS_PER_REQUEST
+                            && session.tools.total.errors > 0,
+                    )
+            }
+        }
+    }
+
+    /// The sessions this rule could read at all, out of a window.
+    pub fn eligible(self, sessions: &[SessionMetrics]) -> usize {
+        sessions
+            .iter()
+            .filter(|session| self.verdict(session).is_some())
+            .count()
+    }
+}
+
+/// Whether one session tripped a rule, as a predicate over a window.
+fn fired(rule: RuleId) -> impl Fn(&&SessionMetrics) -> bool {
+    move |session| rule.verdict(session) == Some(true)
 }
 
 /// One evidence line: a session, named only by the content hash of its transcript, and the
@@ -184,32 +281,14 @@ pub fn evaluate(sessions: &[SessionMetrics]) -> Vec<Finding> {
 /// different things: a session-wide rate is a bad-context problem, while one tool failing
 /// repeatedly is usually a wrong-tool or wrong-invocation problem.
 fn high_tool_error_rate(sessions: &[SessionMetrics]) -> Option<Finding> {
-    let mut evidence = Vec::new();
-    for session in sessions {
-        let mut reasons = Vec::new();
-        if let Some(detail) = over_rate(
-            &session.tools.total,
-            thresholds::MIN_SESSION_TOOL_ATTEMPTS,
-            thresholds::SESSION_TOOL_ERROR_RATE,
-        ) {
-            reasons.push(format!("session-wide {detail}"));
-        }
-        for (name, tally) in &session.tools.by_tool {
-            if let Some(detail) = over_rate(
-                tally,
-                thresholds::MIN_TOOL_ATTEMPTS,
-                thresholds::TOOL_ERROR_RATE,
-            ) {
-                reasons.push(format!("{name} {detail}"));
-            }
-        }
-        if !reasons.is_empty() {
-            evidence.push(Evidence {
-                source_hash: session.source_hash.clone(),
-                detail: reasons.join("; "),
-            });
-        }
-    }
+    let evidence: Vec<_> = sessions
+        .iter()
+        .filter(fired(RuleId::HighToolErrorRate))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            detail: error_rate_reasons(session).join("; "),
+        })
+        .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::HighToolErrorRate,
         problem: format!(
@@ -227,6 +306,29 @@ fn high_tool_error_rate(sessions: &[SessionMetrics]) -> Option<Finding> {
             .to_owned(),
         evidence,
     })
+}
+
+/// Every reason this session's tool outcomes are over threshold — session-wide first, then one
+/// per tool named. Empty when nothing is: the rule's trigger and its evidence are the same list.
+fn error_rate_reasons(session: &SessionMetrics) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if let Some(detail) = over_rate(
+        &session.tools.total,
+        thresholds::MIN_SESSION_TOOL_ATTEMPTS,
+        thresholds::SESSION_TOOL_ERROR_RATE,
+    ) {
+        reasons.push(format!("session-wide {detail}"));
+    }
+    for (name, tally) in &session.tools.by_tool {
+        if let Some(detail) = over_rate(
+            tally,
+            thresholds::MIN_TOOL_ATTEMPTS,
+            thresholds::TOOL_ERROR_RATE,
+        ) {
+            reasons.push(format!("{name} {detail}"));
+        }
+    }
+    reasons
 }
 
 /// Formats a tally that is over threshold, or `None` when it is not — including when too few
@@ -257,14 +359,15 @@ fn over_rate(tally: &ToolTally, min_attempts: u64, threshold: f64) -> Option<Str
 fn retry_loop(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
-        .filter_map(|session| {
+        .filter(fired(RuleId::RetryLoop))
+        .map(|session| {
             let churn = &session.commands;
-            let runs = churn.busiest_runs()?;
-            (runs >= thresholds::RETRY_LOOP_REPEATS).then(|| Evidence {
+            Evidence {
                 source_hash: session.source_hash.clone(),
                 detail: format!(
-                    "one command run {runs} times; {} of {} command-bearing calls were repeats \
+                    "one command run {} times; {} of {} command-bearing calls were repeats \
                      ({}), across {} repeated commands",
+                    churn.busiest_command_runs,
                     churn.repeats,
                     churn.command_events,
                     churn
@@ -272,7 +375,7 @@ fn retry_loop(sessions: &[SessionMetrics]) -> Option<Finding> {
                         .map_or_else(|| "—".to_owned(), format::percent),
                     churn.repeated_commands,
                 ),
-            })
+            }
         })
         .collect();
     (!evidence.is_empty()).then(|| Finding {
@@ -308,20 +411,20 @@ fn retry_loop(sessions: &[SessionMetrics]) -> Option<Finding> {
 fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
-        .filter_map(|session| {
-            let longest = session.longest_sitting()?;
-            (longest > thresholds::MARATHON_SITTING_ACTIVE).then(|| Evidence {
-                source_hash: session.source_hash.clone(),
-                detail: format!(
-                    "longest sitting {} within a {} span across {} sittings, {} user requests, \
-                     {} tool activities",
-                    format::span(longest),
-                    session.span().map_or_else(|| "—".to_owned(), format::span),
-                    session.sittings().unwrap_or_default(),
-                    session.summary.user_requests,
-                    session.summary.tool_activities,
-                ),
-            })
+        .filter(fired(RuleId::MarathonSession))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            detail: format!(
+                "longest sitting {} within a {} span across {} sittings, {} user requests, \
+                 {} tool activities",
+                session
+                    .longest_sitting()
+                    .map_or_else(|| "—".to_owned(), format::span),
+                session.span().map_or_else(|| "—".to_owned(), format::span),
+                session.sittings().unwrap_or_default(),
+                session.summary.user_requests,
+                session.summary.tool_activities,
+            ),
         })
         .collect();
     (!evidence.is_empty()).then(|| Finding {
@@ -358,21 +461,20 @@ fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
 fn resumed_session(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
-        .filter_map(|session| {
-            let (active, span) = session.active_time().zip(session.span())?;
-            let sittings = session.sittings()?;
-            let dilution = session.span_to_active()?;
-            (dilution >= thresholds::RESUMED_SPAN_TO_ACTIVE
-                && sittings >= thresholds::RESUMED_MIN_SITTINGS)
-                .then(|| Evidence {
-                    source_hash: session.source_hash.clone(),
-                    detail: format!(
-                        "active {} across {sittings} sittings, span {} ({})",
-                        format::span(active),
-                        format::span(span),
-                        dilution_multiple(dilution),
-                    ),
-                })
+        .filter(fired(RuleId::ResumedSession))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            detail: format!(
+                "active {} across {} sittings, span {} ({})",
+                session
+                    .active_time()
+                    .map_or_else(|| "—".to_owned(), format::span),
+                session.sittings().unwrap_or_default(),
+                session.span().map_or_else(|| "—".to_owned(), format::span),
+                session
+                    .span_to_active()
+                    .map_or_else(|| "—".to_owned(), dilution_multiple),
+            ),
         })
         .collect();
     (!evidence.is_empty()).then(|| Finding {
@@ -409,19 +511,17 @@ fn dilution_multiple(dilution: f64) -> String {
 fn babysitting(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
-        .filter_map(|session| {
-            let ratio = session.tools_per_request()?;
-            (ratio < thresholds::BABYSITTING_TOOLS_PER_REQUEST
-                && session.summary.user_requests >= thresholds::BABYSITTING_MIN_USER_REQUESTS)
-                .then(|| Evidence {
-                    source_hash: session.source_hash.clone(),
-                    detail: format!(
-                        "{} user requests, {} tool activities ({} per request)",
-                        session.summary.user_requests,
-                        session.summary.tool_activities,
-                        format::ratio(ratio),
-                    ),
-                })
+        .filter(fired(RuleId::Babysitting))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            detail: format!(
+                "{} user requests, {} tool activities ({} per request)",
+                session.summary.user_requests,
+                session.summary.tool_activities,
+                session
+                    .tools_per_request()
+                    .map_or_else(|| "—".to_owned(), format::ratio),
+            ),
         })
         .collect();
     (!evidence.is_empty()).then(|| Finding {
@@ -447,22 +547,18 @@ fn babysitting(sessions: &[SessionMetrics]) -> Option<Finding> {
 fn fire_and_forget(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
-        .filter_map(|session| {
-            let ratio = session.tools_per_request()?;
-            (ratio >= thresholds::FIRE_AND_FORGET_TOOLS_PER_REQUEST
-                && session.summary.user_requests == thresholds::FIRE_AND_FORGET_USER_REQUESTS
-                && session.tools.total.errors > 0)
-                .then(|| Evidence {
-                    source_hash: session.source_hash.clone(),
-                    detail: format!(
-                        "1 user request, {} tool activities ({} per request), {} of {} calls \
-                         failed",
-                        session.summary.tool_activities,
-                        format::ratio(ratio),
-                        session.tools.total.errors,
-                        session.tools.total.attempts,
-                    ),
-                })
+        .filter(fired(RuleId::FireAndForget))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            detail: format!(
+                "1 user request, {} tool activities ({} per request), {} of {} calls failed",
+                session.summary.tool_activities,
+                session
+                    .tools_per_request()
+                    .map_or_else(|| "—".to_owned(), format::ratio),
+                session.tools.total.errors,
+                session.tools.total.attempts,
+            ),
         })
         .collect();
     (!evidence.is_empty()).then(|| Finding {
@@ -891,6 +987,71 @@ mod tests {
             .expect("the fire-and-forget rule fires");
         assert_eq!(finding.evidence.len(), 1);
         assert_eq!(finding.evidence[0].source_hash, "07".repeat(32));
+    }
+
+    /// The distinction every fire rate divides by: a rule that looked and found nothing is not a
+    /// rule that could not look. A quiet session answers `Some(false)` to the rules whose signal
+    /// it carries and `None` to the ones it does not.
+    #[test]
+    fn a_verdict_separates_not_firing_from_having_no_signal() {
+        let quiet = quiet_session();
+        assert_eq!(RuleId::MarathonSession.verdict(&quiet), Some(false));
+        assert_eq!(RuleId::ResumedSession.verdict(&quiet), Some(false));
+        assert_eq!(RuleId::FireAndForget.verdict(&quiet), None, "4 requests");
+        assert_eq!(
+            RuleId::Babysitting.verdict(&quiet),
+            None,
+            "too few requests"
+        );
+        assert_eq!(
+            RuleId::RetryLoop.verdict(&quiet),
+            None,
+            "the session recorded no command, so the rule cannot look"
+        );
+
+        // The same session with a churn reading: now the rule can look, and finds nothing.
+        let measured = with_churn(
+            30,
+            CommandChurn {
+                command_events: 4,
+                distinct_commands: 4,
+                busiest_command_runs: 1,
+                ..CommandChurn::default()
+            },
+        );
+        assert_eq!(RuleId::RetryLoop.verdict(&measured), Some(false));
+        assert_eq!(RuleId::RetryLoop.eligible(&[quiet, measured]), 1);
+    }
+
+    /// A session with too few outcome-bearing calls for either error-rate trigger to fire is one
+    /// the rule *could not look at*, not one it cleared.
+    #[test]
+    fn the_error_rate_rule_cannot_look_below_its_own_minimum() {
+        let sparse = session(
+            40,
+            3,
+            6,
+            &continuous(10),
+            ToolTally {
+                attempts: thresholds::MIN_TOOL_ATTEMPTS - 1,
+                errors: thresholds::MIN_TOOL_ATTEMPTS - 1,
+            },
+            &[],
+        );
+        assert_eq!(RuleId::HighToolErrorRate.verdict(&sparse), None);
+
+        let enough = session(
+            41,
+            3,
+            6,
+            &continuous(10),
+            ToolTally {
+                attempts: thresholds::MIN_SESSION_TOOL_ATTEMPTS,
+                errors: 0,
+            },
+            &[],
+        );
+        assert_eq!(RuleId::HighToolErrorRate.verdict(&enough), Some(false));
     }
 
     #[test]

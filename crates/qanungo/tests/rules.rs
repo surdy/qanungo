@@ -13,6 +13,7 @@ use qanungo::metrics::{self, SessionMetrics};
 use qanungo::patwari::sha256_hex;
 use qanungo::report::{Instrumentation, Report};
 use qanungo::rules::{self, Finding, RuleId};
+use qanungo::scoring::RulePack;
 use qanungo::sync::SyncStats;
 
 fn fixture(relative: &str) -> PathBuf {
@@ -338,7 +339,9 @@ fn render(sessions: &[SessionMetrics], findings: &[Finding]) -> String {
         sync: SyncStats::default(),
         fold_elapsed: Duration::from_millis(3),
         sessions_folded: sessions.len(),
+        comparison_sessions_folded: sessions.len(),
         bytes_folded: sessions.iter().map(|session| session.bytes_folded).sum(),
+        rule_pack: RulePack::current(),
         patwari_url: "http://127.0.0.1:8080".to_owned(),
         cache_root: PathBuf::from("/tmp/qanungo"),
     };
@@ -348,6 +351,11 @@ fn render(sessions: &[SessionMetrics], findings: &[Finding]) -> String {
             .unwrap()
             .with_timezone(&Utc),
         sessions,
+        // The canary tests render the same sessions into both windows on purpose: the scoring and
+        // trend paths are then exercised by the redaction check too, so a component that started
+        // rendering a command string could not slip past it.
+        previous: sessions,
+        compared: true,
         findings,
         skipped: &[],
         instrumentation: &instrumentation,

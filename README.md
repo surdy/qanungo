@@ -54,6 +54,17 @@ that syncs a minimal content-addressed mirror of the recent archive, folds four 
 report — findings as Problem / Action / `source_hash` evidence, with an instrumentation footer on
 every run.
 
+**Scores and trends** ([#4](https://github.com/surdy/qanungo/issues/4)) sit on top of it: the five
+practice lanes, scored 0–100 **per harness** from the window's own readings, with window-over-window
+arrows against the equal-length window immediately before it. Three lanes are fed by signals the
+fold types today (Prompt Quality, Session Hygiene, Tool Mastery); Code Review and Context Management
+render as *not scored* rather than taking a default — no signal, no claim. Every run recomputes all
+of it with the current rule pack
+([ADR 0001](docs/adr/0001-recompute-all-history-with-the-current-rule-pack.md)) and stamps the pack's
+digest into the footer, so two reports compare only when that stamp matches. Every timestamp is UTC:
+nothing in munshi types the capture machine's local offset yet, so the report says UTC rather than
+guessing one.
+
 ```sh
 cargo run -- report --last 30d                       # the production archive on the LAN
 cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
@@ -65,6 +76,6 @@ otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`
 content. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, explicitly arbitrary
 until the footer's fold-cost and rule-firing data say otherwise.
 
-Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), scoring and trends (#4),
-the dashboard (#5), the narrator (#6). Full research + rationale: `~/repos/research/ai-coach/`. See
+Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the dashboard (#5), the
+narrator (#6). Full research + rationale: `~/repos/research/ai-coach/`. See
 issues for the phased plan.

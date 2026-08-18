@@ -7,7 +7,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand};
 
 /// The production archive's published front door (Caddy on 443; raw :8787 is firewalled to the
@@ -65,6 +65,22 @@ impl Window {
     /// How far back the window reaches.
     pub const fn delta(&self) -> TimeDelta {
         self.delta
+    }
+
+    /// The instant the reported window opens.
+    pub fn opens_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now - self.delta
+    }
+
+    /// The instant the *comparison* window opens: one further window back, so the two are equal
+    /// in length and adjacent. `None` when doubling the window would overflow — a report can then
+    /// still be written, it simply carries no trend arrows.
+    ///
+    /// This lives here rather than in the report or the command because three places need the
+    /// same boundary and they must agree exactly: the mirror lists from it, the fold partitions
+    /// on it, and the report labels the two windows with it.
+    pub fn comparison_opens_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        Some(now - self.delta.checked_mul(2)?)
     }
 }
 
@@ -130,6 +146,21 @@ mod tests {
         assert_eq!(parse_window("30d").unwrap().delta(), TimeDelta::days(30));
         assert_eq!(parse_window("2w").unwrap().delta(), TimeDelta::weeks(2));
         assert_eq!(parse_window("30d").unwrap().to_string(), "30d");
+    }
+
+    /// The comparison window is the equal-length one immediately before the reported one: two
+    /// adjacent halves of twice the window, with no gap and no overlap between them.
+    #[test]
+    fn the_comparison_window_is_adjacent_and_equal_in_length() {
+        let now = DateTime::parse_from_rfc3339("2026-08-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = parse_window("30d").unwrap();
+        let opens = window.opens_at(now);
+        let compares = window.comparison_opens_at(now).unwrap();
+        assert_eq!(opens, now - TimeDelta::days(30));
+        assert_eq!(compares, now - TimeDelta::days(60));
+        assert_eq!(opens - compares, now - opens);
     }
 
     #[test]

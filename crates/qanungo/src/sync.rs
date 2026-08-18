@@ -21,6 +21,8 @@
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use crate::cache::BlobCache;
 use crate::patwari::{ListedSession, PatwariError, ReadClient, SnapshotDetail};
 
@@ -51,6 +53,15 @@ pub struct MirroredSession {
     /// The transcript's size in bytes once decompressed — what the fold reads, and what the
     /// footer counts as "folded". Distinct from the stored size that crosses the wire.
     pub size_bytes: u64,
+    /// When the archive finished the snapshot this session was listed by — **archive time, not
+    /// transcript time**.
+    ///
+    /// This is the clock `activity_from` selects on, so it is also the clock a report partitions
+    /// its window and its comparison window on: the two decisions have to be made on the same
+    /// timestamp or a session could satisfy the listing and belong to neither half. `None` when
+    /// the archive stated a time this build cannot parse, which places the session nowhere and is
+    /// reported as a gap rather than guessed into a window.
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 /// Snapshots of one session this client will look through when its `latest_snapshot` turns out
@@ -220,6 +231,10 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
         source_agent: snapshot.source_agent.clone(),
         artifact_set_version: snapshot.artifact_set_version,
         size_bytes: transcript.original_size_bytes,
+        // Taken from the *listing*, which is the row `activity_from` filtered, so the window a
+        // session is placed in is decided by the same timestamp that put it in the listing at all.
+        // A fallback sibling's own completion time would be a different clock reading.
+        archived_at: parse_archive_time(&session.completed_at),
     };
 
     if cache.contains(&mirrored.source_hash) {
@@ -350,6 +365,16 @@ fn foldable_snapshot(
     }))
 }
 
+/// Parses an archive completion time, or reports that it could not be parsed.
+///
+/// Patwari states these as RFC 3339 in UTC. A value that is not one is not repaired, defaulted, or
+/// assumed to be "now": the session simply cannot be placed in a window, and the report says so.
+fn parse_archive_time(completed_at: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(completed_at)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
+}
+
 /// A poisoned worker mutex means another worker panicked; the remaining work is still valid, so
 /// the lock is taken anyway rather than cascading the panic across the pool.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -375,6 +400,23 @@ mod tests {
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(stats.cache_misses, 0);
         assert_eq!(stats.bytes_transferred, 0);
+    }
+
+    /// An archive time this build cannot read places the session nowhere rather than somewhere
+    /// convenient — a trend arrow computed over a guessed window would be a lie about behaviour.
+    #[test]
+    fn an_unparseable_archive_time_places_a_session_nowhere() {
+        assert_eq!(
+            parse_archive_time("2026-08-10T10:00:00.000Z"),
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-10T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+        );
+        for unreadable in ["", "yesterday", "2026-08-10", "1786000000"] {
+            assert_eq!(parse_archive_time(unreadable), None, "`{unreadable}`");
+        }
     }
 
     #[test]

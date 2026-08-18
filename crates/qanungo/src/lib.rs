@@ -11,9 +11,10 @@
 //! qanungo report --last 30d
 //! ```
 //!
-//! sync ([`sync`], [`cache`], [`patwari`]) → fold ([`metrics`]) → evaluate ([`rules`]) → emit
-//! ([`report`]). Four metrics, six rules, Markdown on stdout, evidence cited by content hash,
-//! and an instrumentation footer on every run.
+//! sync ([`sync`], [`cache`], [`patwari`]) → fold ([`metrics`]) → evaluate ([`rules`]) → score
+//! ([`scoring`]) → emit ([`report`]). Four metrics, six rules, five practice lanes of which three
+//! are fed by anything typed today, Markdown on stdout, evidence cited by content hash, and an
+//! instrumentation footer on every run.
 //!
 //! Three things about this slice are deliberate and load-bearing:
 //!
@@ -27,6 +28,11 @@
 //! - **The report renders no transcript content.** Aggregates, tool names, and `source_hash`
 //!   references only. See [`report`] for why that is a construction property rather than a
 //!   filter.
+//!
+//! Scores and trends (qanungo #4) sit on top of the same slice: every run recomputes all of
+//! history with the *current* rule pack rather than reading frozen scores back (qanungo ADR 0001),
+//! and stamps the pack's digest into the footer so two reports can tell whether they are
+//! comparable at all. A lane no typed signal feeds is never scored — see [`scoring`].
 
 pub mod cache;
 pub mod cli;
@@ -37,4 +43,5 @@ pub mod metrics;
 pub mod patwari;
 pub mod report;
 pub mod rules;
+pub mod scoring;
 pub mod sync;
