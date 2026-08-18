@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use chrono::TimeDelta;
 use clap::{Args, Parser, Subcommand};
 
-/// The production archive on the LAN. Overridable for a tunnel, a laptop-local server, or a
-/// second archive.
-pub const DEFAULT_PATWARI_URL: &str = "http://192.168.16.169:8787";
+/// The production archive's published front door (Caddy on 443; raw :8787 is firewalled to the
+/// archive's own subnet). Same name session-recall uses. Overridable for a tunnel, a
+/// laptop-local server, or a second archive.
+pub const DEFAULT_PATWARI_URL: &str = "https://patwari.clusterfault.com";
 
 #[derive(Debug, Parser)]
 #[command(
