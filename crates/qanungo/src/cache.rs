@@ -15,6 +15,7 @@
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -99,6 +100,12 @@ impl BlobCache {
     /// download path does exactly that before handing bytes here, so a cache write never
     /// re-hashes content that was already checked against the archive's declaration.
     ///
+    /// Storing the same digest twice concurrently is safe and is a real case: two sessions in
+    /// one window can carry byte-identical transcripts, and their mirror workers then race on
+    /// one blob path. Each write therefore lands in a temporary file unique to *this write*, not
+    /// merely to this process — a shared `tmp-<pid>` name would have both writers open the same
+    /// file and leave the loser's rename failing on a path the winner already moved away.
+    ///
     /// # Errors
     ///
     /// Returns an error when the digest is malformed or the blob cannot be written.
@@ -107,15 +114,21 @@ impl BlobCache {
         if let Some(parent) = path.parent() {
             create_private_dir(parent)?;
         }
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let temporary = path.with_extension(temporary_suffix());
         {
             let mut file = private_file(&temporary)?;
             io::Write::write_all(&mut file, bytes)?;
             file.sync_all()?;
         }
         // Rename is atomic within the directory, so a concurrent reader sees either no blob or
-        // the complete one, never a prefix.
-        fs::rename(&temporary, &path)
+        // the complete one, never a prefix — and two writers of identical content both succeed,
+        // the second simply replacing an identical file.
+        let renamed = fs::rename(&temporary, &path);
+        if renamed.is_err() {
+            // Never leave a temporary behind on a failed rename; the cache has no sweeper.
+            let _ = fs::remove_file(&temporary);
+        }
+        renamed
     }
 
     /// Rejects anything that is not a bare lowercase sha256 hex digest before it can reach the
@@ -157,6 +170,17 @@ fn is_sha256_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A file-extension suffix unique to one `store` call: the process, plus a process-wide counter
+/// so two workers racing on the same digest never share a temporary path.
+fn temporary_suffix() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
@@ -208,6 +232,39 @@ mod tests {
         cache.store(DIGEST, b"bytes").unwrap();
         cache.store(DIGEST, b"bytes").unwrap();
         assert!(cache.contains(DIGEST));
+    }
+
+    /// Two mirror workers can race on one digest whenever two sessions in a window carry
+    /// byte-identical transcripts. Every writer must succeed, and no temporary file may survive.
+    #[test]
+    fn concurrent_stores_of_one_digest_all_succeed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(temporary.path().join("qanungo")).unwrap();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| cache.store(DIGEST, b"transcript bytes")))
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("no worker panics")
+                    .expect("every store succeeds");
+            }
+        });
+
+        assert!(cache.contains(DIGEST));
+        let shard = cache.root.join(BLOB_DIR).join(&DIGEST[..2]);
+        let leftovers: Vec<_> = fs::read_dir(&shard)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != DIGEST)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files left behind: {leftovers:?}"
+        );
     }
 
     #[cfg(unix)]

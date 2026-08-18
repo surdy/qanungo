@@ -24,6 +24,16 @@ use crate::patwari::{ListedSession, PatwariError, ReadClient};
 /// report never crowds out the archive's other clients.
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
+/// Hard ceiling on worker threads, whatever the operator asks for. Patwari serves roughly eight
+/// concurrent requests: a client that opens more does not go faster, it just occupies every slot
+/// the archive has and starves its other readers. The politeness is a property of this client,
+/// not a suggestion to the person running it.
+pub const MAX_CONCURRENCY: usize = 8;
+
+/// The default must sit inside the ceiling it is defaulted against — checked at compile time so
+/// raising one of the two constants without the other cannot build.
+const _: () = assert!(DEFAULT_CONCURRENCY >= 1 && DEFAULT_CONCURRENCY <= MAX_CONCURRENCY);
+
 /// One session's transcript, present in the cache and ready to fold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirroredSession {
@@ -34,7 +44,8 @@ pub struct MirroredSession {
     /// The artifact contract the transcript was captured under; decides which interpreter reads
     /// it.
     pub artifact_set_version: u16,
-    /// The transcript's size in bytes, as the archive declares it.
+    /// The transcript's size in bytes once decompressed — what the fold reads, and what the
+    /// footer counts as "folded". Distinct from the stored size that crosses the wire.
     pub size_bytes: u64,
 }
 
@@ -65,8 +76,11 @@ pub struct SyncStats {
     pub cache_hits: u64,
     /// Transcripts fetched and verified this run.
     pub cache_misses: u64,
-    /// Bytes of transcript transferred (after decompression) on the misses.
-    pub bytes_fetched: u64,
+    /// Bytes that actually crossed the wire on the misses: the *stored* (compressed) size the
+    /// archive serves, not the larger transcript it decompresses into. The two differ by a lot
+    /// for zstd artifacts, and a footer that conflated them would misreport what a re-sync costs
+    /// the network.
+    pub bytes_transferred: u64,
     pub elapsed: Duration,
 }
 
@@ -82,6 +96,9 @@ pub struct Mirror {
 ///
 /// Sessions come back in the archive's own newest-first listing order, so the report is stable
 /// across runs even though the workers finish out of order.
+///
+/// `concurrency` is clamped to `1..=`[`MAX_CONCURRENCY`] here as well as at the command line, so
+/// no caller of this function can crowd the archive by passing a large number.
 ///
 /// # Errors
 ///
@@ -106,7 +123,7 @@ pub fn sync(
     let queue = Mutex::new(listed.into_iter().enumerate());
     let outcomes: Mutex<Vec<(usize, Outcome)>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
-        for _ in 0..concurrency.max(1) {
+        for _ in 0..concurrency.clamp(1, MAX_CONCURRENCY) {
             scope.spawn(|| {
                 loop {
                     let Some((index, session)) = lock(&queue).next() else {
@@ -125,14 +142,16 @@ pub fn sync(
     outcomes.sort_by_key(|(index, _)| *index);
     for (_, outcome) in outcomes {
         match outcome {
-            Outcome::Mirrored { session, lookup } => {
+            Outcome::Mirrored {
+                session,
+                lookup,
+                transferred_bytes,
+            } => {
                 match lookup {
                     crate::cache::Lookup::Hit => mirror.stats.cache_hits += 1,
-                    crate::cache::Lookup::Miss => {
-                        mirror.stats.cache_misses += 1;
-                        mirror.stats.bytes_fetched += session.size_bytes;
-                    }
+                    crate::cache::Lookup::Miss => mirror.stats.cache_misses += 1,
                 }
+                mirror.stats.bytes_transferred += transferred_bytes;
                 mirror.sessions.push(session);
             }
             Outcome::Skipped(skip) => mirror.skipped.push(skip),
@@ -146,6 +165,8 @@ enum Outcome {
     Mirrored {
         session: MirroredSession,
         lookup: crate::cache::Lookup,
+        /// Stored bytes actually pulled over the wire: zero on a cache hit.
+        transferred_bytes: u64,
     },
     Skipped(Skip),
 }
@@ -187,6 +208,7 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
         return Outcome::Mirrored {
             session: mirrored,
             lookup: crate::cache::Lookup::Hit,
+            transferred_bytes: 0,
         };
     }
     let bytes = match client.download_transcript(transcript) {
@@ -209,6 +231,9 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
     Outcome::Mirrored {
         session: mirrored,
         lookup: crate::cache::Lookup::Miss,
+        // The stored size is what crossed the wire; the decompressed transcript this became is
+        // counted separately as bytes folded.
+        transferred_bytes: transcript.stored_size_bytes,
     }
 }
 
@@ -236,6 +261,16 @@ mod tests {
         let stats = SyncStats::default();
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(stats.cache_misses, 0);
-        assert_eq!(stats.bytes_fetched, 0);
+        assert_eq!(stats.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn concurrency_is_clamped_to_the_archives_capacity() {
+        assert_eq!(0_usize.clamp(1, MAX_CONCURRENCY), 1);
+        assert_eq!(64_usize.clamp(1, MAX_CONCURRENCY), MAX_CONCURRENCY);
+        assert_eq!(
+            DEFAULT_CONCURRENCY.clamp(1, MAX_CONCURRENCY),
+            DEFAULT_CONCURRENCY
+        );
     }
 }

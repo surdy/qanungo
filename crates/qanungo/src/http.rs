@@ -20,8 +20,10 @@ use std::time::Duration;
 use rustls::pki_types::ServerName;
 use thiserror::Error;
 
-/// Default ceiling on one response body. Listings are small JSON documents; artifact downloads
-/// raise this deliberately to the size the listing already declared.
+/// Default ceiling on one response — status line, headers, and body together, since the bound is
+/// applied to the socket read rather than to the parsed document. Listings are small JSON
+/// documents; artifact downloads raise it deliberately to the stored size the listing already
+/// declared, plus framing headroom.
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Error)]
@@ -96,6 +98,11 @@ pub fn encode_value(value: &str) -> String {
 /// One response: the status, the body, and the header names lowercased. The artifact-content
 /// route conveys an artifact's declared sizes, digests, and compression in `x-patwari-*`
 /// headers, so headers are not optional detail here.
+///
+/// There is deliberately no "body as text" accessor. The only thing this client ever lifts out
+/// of a response body it did not ask to parse is Patwari's stable machine-readable `error.code`;
+/// rendering a server's free text would put an unbounded upstream string on a path that ends in
+/// a report sworn to carry none.
 pub struct Response {
     pub status: u16,
     pub body: Vec<u8>,
@@ -109,14 +116,6 @@ impl Response {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
-    }
-
-    /// A bounded, lossy text view of the body for safe diagnostics.
-    pub fn body_text(&self) -> String {
-        String::from_utf8_lossy(&self.body)
-            .chars()
-            .take(256)
-            .collect()
     }
 }
 

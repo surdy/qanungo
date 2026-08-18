@@ -18,6 +18,29 @@ use qanungo::sync::{self, SkipReason};
 // The stand-in archive
 // ---------------------------------------------------------------------------
 
+/// A way for the archive to serve something other than what it promised. Each variant defeats a
+/// different stage of the client's three-stage verified download, so the stage that catches it is
+/// exercised rather than assumed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Corruption {
+    None,
+    /// Same length, different bytes: the declared stored size still matches, so only the stored
+    /// digest can catch it.
+    StoredBytes,
+    /// Fewer bytes than the declared stored size — a body cut short in transit.
+    TruncatedBody,
+    /// A compression this build does not implement.
+    UnknownCompression,
+    /// Content and headers agree with each other, but the *listing* promised a different
+    /// `original_sha256`. This is the one that matters most: the listing's digest is the cache
+    /// key and the hash a finding cites, so accepting these bytes would file evidence under a
+    /// hash that does not describe them.
+    ListingDigest,
+}
+
+/// The digest the [`Corruption::ListingDigest`] case advertises instead of the truth.
+const WRONG_DIGEST: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+
 #[derive(Clone)]
 struct ArchivedSession {
     session_id: String,
@@ -30,6 +53,7 @@ struct ArchivedSession {
     compression: &'static str,
     /// A summary-only capture has no `transcript.jsonl` artifact at all.
     has_transcript: bool,
+    corruption: Corruption,
 }
 
 impl ArchivedSession {
@@ -43,13 +67,30 @@ impl ArchivedSession {
             transcript: transcript.as_bytes().to_vec(),
             compression,
             has_transcript: true,
+            corruption: Corruption::None,
         }
     }
 
+    fn corrupt(index: u8, corruption: Corruption) -> Self {
+        Self {
+            corruption,
+            ..Self::claude(index, TRANSCRIPT, "identity")
+        }
+    }
+
+    /// The bytes the archive honestly holds, before any corruption is applied to the wire.
     fn stored(&self) -> Vec<u8> {
         match self.compression {
             "zstd" => zstd::encode_all(self.transcript.as_slice(), 3).unwrap(),
             _ => self.transcript.clone(),
+        }
+    }
+
+    /// The `original_sha256` the *listing* advertises.
+    fn listed_original_sha256(&self) -> String {
+        match self.corruption {
+            Corruption::ListingDigest => WRONG_DIGEST.to_owned(),
+            _ => sha256_hex(&self.transcript),
         }
     }
 }
@@ -184,7 +225,7 @@ fn snapshot_document(session: &ArchivedSession) -> String {
                 "content_url":"/api/v1/artifacts/{}/content"}}]"#,
             session.artifact_id,
             session.transcript.len(),
-            sha256_hex(&session.transcript),
+            session.listed_original_sha256(),
             stored.len(),
             sha256_hex(&stored),
             session.compression,
@@ -233,25 +274,41 @@ fn json_response(body: &str) -> Vec<u8> {
 }
 
 fn content_response(session: &ArchivedSession) -> Vec<u8> {
-    let stored = session.stored();
+    // Everything the headers declare is computed from the honest bytes; the corruption is then
+    // applied to what actually goes on the wire, exactly as a damaged blob or a lying peer would
+    // present it.
+    let honest = session.stored();
+    let declared_stored_sha = sha256_hex(&honest);
+    let declared_stored_len = honest.len();
+    let mut compression = session.compression;
+    let mut body = honest;
+    match session.corruption {
+        Corruption::StoredBytes => {
+            // Same length, one flipped byte: the size check passes, the digest check must not.
+            if let Some(last) = body.last_mut() {
+                *last ^= 0xff;
+            }
+        }
+        Corruption::TruncatedBody => {
+            body.truncate(body.len() / 2);
+        }
+        Corruption::UnknownCompression => compression = "brotli",
+        Corruption::None | Corruption::ListingDigest => {}
+    }
     let mut response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/jsonl\r\n\
-         Content-Length: {}\r\n\
-         x-patwari-compression: {}\r\n\
+         Content-Length: {declared_stored_len}\r\n\
+         x-patwari-compression: {compression}\r\n\
          x-patwari-original-size-bytes: {}\r\n\
          x-patwari-original-sha256: sha256:{}\r\n\
-         x-patwari-stored-size-bytes: {}\r\n\
-         x-patwari-stored-sha256: sha256:{}\r\n\r\n",
-        stored.len(),
-        session.compression,
+         x-patwari-stored-size-bytes: {declared_stored_len}\r\n\
+         x-patwari-stored-sha256: sha256:{declared_stored_sha}\r\n\r\n",
         session.transcript.len(),
         sha256_hex(&session.transcript),
-        stored.len(),
-        sha256_hex(&stored),
     )
     .into_bytes();
-    response.extend_from_slice(&stored);
+    response.extend_from_slice(&body);
     response
 }
 
@@ -307,10 +364,21 @@ fn an_empty_archive_mirrors_cleanly() {
 
 #[test]
 fn a_first_sync_fetches_every_transcript_and_a_second_serves_them_from_cache() {
-    let (base, requests) = spawn_archive(vec![
+    let sessions = vec![
         ArchivedSession::claude(1, TRANSCRIPT, "identity"),
         ArchivedSession::claude(2, OTHER_TRANSCRIPT, "zstd"),
-    ]);
+    ];
+    // What actually crosses the wire is the *stored* form: the zstd artifact transfers far fewer
+    // bytes than it folds, which is exactly the distinction the footer must not blur.
+    let wire_bytes: u64 = sessions
+        .iter()
+        .map(|session| session.stored().len() as u64)
+        .sum();
+    assert!(
+        wire_bytes < (TRANSCRIPT.len() + OTHER_TRANSCRIPT.len()) as u64,
+        "the zstd fixture must actually compress, or this asserts nothing"
+    );
+    let (base, requests) = spawn_archive(sessions);
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
@@ -319,17 +387,14 @@ fn a_first_sync_fetches_every_transcript_and_a_second_serves_them_from_cache() {
     assert_eq!(first.sessions.len(), 2);
     assert_eq!(first.stats.cache_misses, 2);
     assert_eq!(first.stats.cache_hits, 0);
-    assert_eq!(
-        first.stats.bytes_fetched,
-        (TRANSCRIPT.len() + OTHER_TRANSCRIPT.len()) as u64
-    );
+    assert_eq!(first.stats.bytes_transferred, wire_bytes);
     assert_eq!(requests.lock().unwrap().content_requests(), 2);
 
     // The cache is keyed by content hash, so the naive re-list costs listings only.
     let second = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 4).unwrap();
     assert_eq!(second.stats.cache_hits, 2);
     assert_eq!(second.stats.cache_misses, 0);
-    assert_eq!(second.stats.bytes_fetched, 0);
+    assert_eq!(second.stats.bytes_transferred, 0);
     assert_eq!(
         requests.lock().unwrap().content_requests(),
         2,
@@ -413,6 +478,79 @@ fn a_harness_without_an_interpreter_is_a_recorded_gap() {
         0,
         "an uninterpretable transcript must not be transferred"
     );
+}
+
+/// The three-stage verified download exists so that nothing unverified ever reaches the cache —
+/// and therefore so that a cited `source_hash` always describes the bytes filed under it. Each
+/// corruption defeats a different stage; every one of them must end as a recorded gap with an
+/// empty cache, never as a folded session.
+#[test]
+fn corrupt_content_is_refused_at_every_stage_and_never_cached() {
+    for (corruption, expected) in [
+        (
+            Corruption::StoredBytes,
+            "stored content hash does not match",
+        ),
+        (Corruption::TruncatedBody, "stored size mismatch"),
+        (
+            Corruption::UnknownCompression,
+            "unknown compression `brotli`",
+        ),
+        (
+            Corruption::ListingDigest,
+            "does not match the listing's declared",
+        ),
+    ] {
+        let (base, requests) = spawn_archive(vec![ArchivedSession::corrupt(20, corruption)]);
+        let (directory, cache) = cache();
+        let client = ReadClient::connect(&base).unwrap();
+
+        let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+        assert!(
+            mirror.sessions.is_empty(),
+            "corrupt content must not be folded"
+        );
+        assert_eq!(mirror.skipped.len(), 1);
+        let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
+            panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
+        };
+        assert!(
+            detail.contains(expected),
+            "expected `{expected}` in: {detail}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().content_requests(),
+            1,
+            "the download is attempted exactly once — no retry storm"
+        );
+        assert_eq!(
+            blob_count(directory.path()),
+            0,
+            "unverified bytes must never reach the cache"
+        );
+        // A refused download is not a transfer the footer should claim credit for.
+        assert_eq!(mirror.stats.cache_misses, 0);
+        assert_eq!(mirror.stats.bytes_transferred, 0);
+    }
+}
+
+/// Files anywhere under a cache root, temporary or not.
+fn blob_count(root: &std::path::Path) -> usize {
+    fn walk(path: &std::path::Path, count: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().is_dir() {
+                walk(&entry.path(), count);
+            } else {
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0;
+    walk(root, &mut count);
+    count
 }
 
 #[test]

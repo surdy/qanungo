@@ -54,6 +54,10 @@ pub struct Instrumentation {
     /// Wall-time of the fold alone — the number the event-store decision turns on.
     pub fold_elapsed: Duration,
     pub sessions_folded: usize,
+    /// Decompressed transcript bytes the fold actually read. Deliberately a different quantity
+    /// from [`SyncStats::bytes_transferred`], which is what crossed the wire: fold cost scales
+    /// with the former, network cost with the latter, and the footer reports both so neither
+    /// decision is argued from the wrong number.
     pub bytes_folded: u64,
     pub patwari_url: String,
     pub cache_root: PathBuf,
@@ -125,7 +129,7 @@ impl Report<'_> {
             .map_or_else(|| "—".to_owned(), format::ratio);
         let _ = writeln!(
             out,
-            "- {} sessions across {} active days ({per_active_day} per active day).",
+            "- {} sessions across {} active days, UTC ({per_active_day} per active day).",
             self.sessions.len(),
             cadence.active_days(),
         );
@@ -138,7 +142,7 @@ impl Report<'_> {
             );
         }
         if let Some((busiest, count)) = cadence.per_day.iter().max_by_key(|(_, count)| **count) {
-            let _ = writeln!(out, "- Busiest day {busiest}: {count} sessions.");
+            let _ = writeln!(out, "- Busiest day {busiest} (UTC): {count} sessions.");
         }
         if cadence.undated > 0 {
             let _ = writeln!(
@@ -259,14 +263,14 @@ impl Report<'_> {
         let _ = writeln!(
             out,
             "_Instrumentation — sync {} · fold {} · {} sessions · {} folded · cache {} hits / {} \
-             misses ({} fetched) · archive {} · cache {}_",
+             misses ({} transferred) · archive {} · cache {}_",
             format::elapsed(instrumentation.sync.elapsed),
             format::elapsed(instrumentation.fold_elapsed),
             instrumentation.sessions_folded,
             format::bytes(instrumentation.bytes_folded),
             instrumentation.sync.cache_hits,
             instrumentation.sync.cache_misses,
-            format::bytes(instrumentation.sync.bytes_fetched),
+            format::bytes(instrumentation.sync.bytes_transferred),
             instrumentation.patwari_url,
             display_path(&instrumentation.cache_root),
         );
@@ -297,7 +301,7 @@ mod tests {
                 sessions_listed: 1,
                 cache_hits: 1,
                 cache_misses: 0,
-                bytes_fetched: 0,
+                bytes_transferred: 0,
                 elapsed: Duration::from_millis(120),
             },
             fold_elapsed: Duration::from_millis(7),

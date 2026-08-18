@@ -206,6 +206,13 @@ pub fn source_for_agent(source_agent: &str) -> Option<Source> {
 }
 
 /// Sessions per day across the reported window, and the span distribution behind it.
+///
+/// **Days are UTC calendar days**, not the operator's local days, because that is the only
+/// boundary the transcripts themselves define — record timestamps are RFC 3339 and normalized to
+/// UTC by `munshi-transcript`, and no capture records the harness's local zone. A late-evening
+/// session west of Greenwich therefore lands on the following UTC day, so "active days" and
+/// "busiest day" can disagree with a local-time intuition by one. The report says UTC where it
+/// prints them; correcting for a real local zone is a later question, not a silent guess here.
 #[derive(Debug, Clone, Default)]
 pub struct Cadence {
     /// Sessions per UTC calendar day, by the day each session's first record landed on.
@@ -387,6 +394,52 @@ mod tests {
             }
         );
         assert_eq!(fold.tools.unattributed, 0);
+    }
+
+    /// Claude Code omits `is_error` entirely on a successful tool result — the classifier only
+    /// ever inserts the field when it is `true`. An absent field must therefore read as success,
+    /// not as "no outcome", or every clean session would report an undefined error rate.
+    #[test]
+    fn a_tool_result_without_an_is_error_field_counts_as_a_success() {
+        let transcript = concat!(
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"r1","timestamp":"2026-08-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}]}}"#,
+        );
+        let fold = fold_claude(transcript);
+        assert_eq!(
+            fold.tools.total,
+            ToolTally {
+                attempts: 1,
+                errors: 0
+            }
+        );
+        assert_eq!(fold.tools.total.error_rate(), Some(0.0));
+        assert_eq!(
+            fold.tools.by_tool["Read"],
+            ToolTally {
+                attempts: 1,
+                errors: 0
+            }
+        );
+    }
+
+    /// The inverse of the above, so the pair pins both readings of the same absent field.
+    #[test]
+    fn a_tool_result_with_is_error_true_counts_as_a_failure() {
+        let transcript = concat!(
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"r1","timestamp":"2026-08-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"no such file","is_error":true}]}}"#,
+        );
+        let fold = fold_claude(transcript);
+        assert_eq!(
+            fold.tools.total,
+            ToolTally {
+                attempts: 1,
+                errors: 1
+            }
+        );
     }
 
     #[test]

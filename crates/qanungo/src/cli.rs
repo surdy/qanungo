@@ -46,9 +46,10 @@ pub struct ReportArgs {
     #[arg(long = "cache-dir")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Concurrent requests against the archive. Kept small on purpose: Patwari is a LAN server
-    /// with a modest concurrency limit.
-    #[arg(long, default_value_t = crate::sync::DEFAULT_CONCURRENCY)]
+    /// Concurrent requests against the archive, 1 to 8. Kept small on purpose: Patwari is a LAN
+    /// server with a modest concurrency limit, and occupying every slot it has does not make a
+    /// report faster — it starves the archive's other readers.
+    #[arg(long, default_value_t = crate::sync::DEFAULT_CONCURRENCY, value_parser = parse_concurrency)]
     pub concurrency: usize,
 }
 
@@ -70,6 +71,22 @@ impl fmt::Display for Window {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.text)
     }
+}
+
+/// Refuses a worker count outside `1..=`[`crate::sync::MAX_CONCURRENCY`] rather than silently
+/// clamping it: somebody who typed `--concurrency 64` has a belief about what the tool will do,
+/// and the honest answer is that this client will not do it.
+fn parse_concurrency(value: &str) -> Result<usize, String> {
+    let count: usize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a worker count"))?;
+    if !(1..=crate::sync::MAX_CONCURRENCY).contains(&count) {
+        return Err(format!(
+            "must be between 1 and {} — Patwari is a LAN archive with a modest concurrency limit",
+            crate::sync::MAX_CONCURRENCY,
+        ));
+    }
+    Ok(count)
 }
 
 /// Parses `30d`, `12h`, `2w`. Deliberately not a general duration grammar: a coaching window is
@@ -124,6 +141,19 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn concurrency_past_the_archives_capacity_is_refused_not_clamped() {
+        assert_eq!(parse_concurrency("1").unwrap(), 1);
+        assert_eq!(
+            parse_concurrency("8").unwrap(),
+            crate::sync::MAX_CONCURRENCY
+        );
+        for bad in ["0", "9", "64", "-1", "many"] {
+            assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
+        }
+        assert!(Cli::try_parse_from(["qanungo", "report", "--concurrency", "64"]).is_err());
     }
 
     #[test]
