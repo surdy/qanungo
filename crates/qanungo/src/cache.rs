@@ -167,6 +167,37 @@ impl BlobCache {
         self.checked_path(digest).and_then(File::open)
     }
 
+    /// Every digest the cache currently holds, in no particular order.
+    ///
+    /// The mirror never needs this — it asks about the digests a listing named and nothing else —
+    /// but a check that has to sweep *what is already on this disk* does, and the alternative is a
+    /// caller reconstructing the shard layout from outside the type. Staged writes and anything
+    /// else that is not a bare sha256 filename are skipped, so what comes back is exactly the set
+    /// [`open_blob`](Self::open_blob) will serve.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the blob directory cannot be read at all. An unreadable *shard* is
+    /// skipped rather than failing the walk: a partial inventory of a cache is still an inventory.
+    pub fn digests(&self) -> io::Result<Vec<String>> {
+        let mut digests = Vec::new();
+        for shard in fs::read_dir(self.root.join(BLOB_DIR))?.filter_map(Result::ok) {
+            let Ok(entries) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if is_sha256_hex(name) {
+                    digests.push(name.to_owned());
+                }
+            }
+        }
+        Ok(digests)
+    }
+
     /// Stores `bytes` under `digest`.
     ///
     /// The caller is responsible for having verified that `bytes` hashes to `digest` — the
@@ -468,6 +499,31 @@ mod tests {
             swept.contains(DIGEST),
             "a committed blob is not a temporary at any age"
         );
+    }
+
+    /// The inventory is what a sweep over "everything already mirrored" reads, so it must list
+    /// committed blobs and nothing else — a staged write is not yet content.
+    #[test]
+    fn the_inventory_lists_committed_blobs_and_skips_staged_writes() {
+        const OTHER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("qanungo");
+        let cache = BlobCache::open(&root).unwrap();
+        assert!(cache.digests().unwrap().is_empty());
+
+        cache.store(DIGEST, b"one").unwrap();
+        cache.store(OTHER, b"two").unwrap();
+        fs::write(
+            root.join(BLOB_DIR)
+                .join(&DIGEST[..2])
+                .join(format!("{DIGEST}.tmp-9-0")),
+            b"in flight",
+        )
+        .unwrap();
+
+        let mut digests = cache.digests().unwrap();
+        digests.sort();
+        assert_eq!(digests, vec![OTHER.to_owned(), DIGEST.to_owned()]);
     }
 
     #[test]
