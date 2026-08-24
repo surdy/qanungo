@@ -56,6 +56,25 @@
 //! - **Same redaction line.** Aggregates, plus the model, modifier, and repository identifiers the
 //!   archive itself recorded — clamped on the way out. No transcript content, by construction: the
 //!   cost fold never reads a record's classification at all.
+//!
+//! # The redaction layer (qanungo #8)
+//!
+//! Both lanes above hold that line by *construction*: neither document has a path from a
+//! transcript's free text to its output, and both prove it with canary fixtures. The next lane —
+//! `qanungo standup` (#9) — breaks that, because rendering munshi's summary prose means rendering
+//! text somebody typed into a terminal. [`redaction`] ships first so that it does not have to be
+//! retrofitted: a [`Redactor`](redaction::Redactor) with two independently switched passes,
+//! secrets on by default and profanity off, patterns anchored on structure rather than entropy,
+//! and a report that counts what fired and never carries what it matched.
+//!
+//! It is deliberately **not** wired into `report` or `cost`. A filter over a document that carries
+//! no content can only be decoration, and decoration in a security control invites the reader to
+//! trust it. The standing rule from qanungo #8 stands: any new surface that renders transcript
+//! content says how it satisfies that issue, and from here that means naming the redactor it
+//! called and stamping [`PATTERN_REVISION`](redaction::PATTERN_REVISION) in its footer.
+//!
+//! The issue's other half — `0o600`/`0o700` on the blob cache — was already true and already
+//! tested before this lane; see [`cache`].
 
 pub mod cache;
 pub mod cli;
@@ -67,6 +86,7 @@ pub mod http;
 pub mod metrics;
 pub mod patwari;
 pub mod pricing;
+pub mod redaction;
 pub mod report;
 pub mod rules;
 pub mod scoring;

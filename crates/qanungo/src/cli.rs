@@ -9,12 +9,20 @@
 //! Everything both commands need to reach the archive lives in [`ArchiveArgs`] and is flattened
 //! into each of them, so a flag means the same thing wherever it is typed and a third lane
 //! inherits it by declaring one field.
+//!
+//! [`RedactionArgs`] is the same idea one lane early. Neither command here renders transcript
+//! content, so neither flattens it (see [`crate::redaction`] for why attaching it anyway would be
+//! decoration); it is defined now so that the first lane that *does* render content — `qanungo
+//! standup`, qanungo #9 — inherits the flag surface rather than inventing one, and so that the
+//! spelling of `--no-redact` is settled before anything depends on it.
 
 use std::fmt;
 use std::path::PathBuf;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand};
+
+use crate::redaction::{FILTER_PROFANITY_BY_DEFAULT, REDACT_SECRETS_BY_DEFAULT, Redactor};
 
 /// The production archive's published front door (Caddy on 443; raw :8787 is firewalled to the
 /// archive's own subnet). Same name session-recall uses. Overridable for a tunnel, a
@@ -58,6 +66,40 @@ pub struct ArchiveArgs {
     /// report faster — it starves the archive's other readers.
     #[arg(long, default_value_t = crate::sync::DEFAULT_CONCURRENCY, value_parser = parse_concurrency)]
     pub concurrency: usize,
+}
+
+/// How much of what a transcript said may reach the screen, shared by every lane that renders
+/// transcript content. Flattened for the same reason [`ArchiveArgs`] is: `--no-redact` must mean
+/// exactly one thing, everywhere, forever.
+///
+/// Both flags are opt-*in* to a change from the shipped default, so the safe reading is the one a
+/// person gets by typing nothing:
+///
+/// - `--no-redact` turns the secrets pass off. Phrased as a negation on purpose — there is no
+///   `--redact`, because redaction is not something a person should have to remember to ask for,
+///   and the only way to lose it is to say so out loud in a command line somebody can read back.
+/// - `--filter-profanity` turns the profanity pass on. Default off; see
+///   [`crate::redaction::FILTER_PROFANITY_BY_DEFAULT`] for why that is a tunable rather than a
+///   decision.
+#[derive(Debug, Args)]
+pub struct RedactionArgs {
+    /// Render transcript content without scrubbing secrets. A deliberate choice for a trusted
+    /// terminal, never the default.
+    #[arg(long = "no-redact", default_value_t = !REDACT_SECRETS_BY_DEFAULT)]
+    pub no_redact: bool,
+
+    /// Mask a small conservative list of profane words in rendered transcript content.
+    #[arg(long = "filter-profanity", default_value_t = FILTER_PROFANITY_BY_DEFAULT)]
+    pub filter_profanity: bool,
+}
+
+impl RedactionArgs {
+    /// The redactor these flags ask for.
+    pub const fn redactor(&self) -> Redactor {
+        Redactor::new()
+            .with_secrets(!self.no_redact)
+            .with_profanity(self.filter_profanity)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -267,5 +309,57 @@ mod tests {
         };
         assert_eq!(report.archive.patwari_url, cost.archive.patwari_url);
         assert_eq!(report.archive.concurrency, cost.archive.concurrency);
+    }
+
+    /// [`RedactionArgs`] is flattened by no command yet — qanungo #9 is the first lane that
+    /// renders transcript content — so its flag surface is parsed here through a stand-in the way
+    /// a real lane will, which keeps the spelling and the defaults pinned in the meantime.
+    #[derive(Debug, Parser)]
+    struct RenderingLane {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+    }
+
+    #[test]
+    fn the_redaction_flags_are_well_formed() {
+        RenderingLane::command().debug_assert();
+    }
+
+    /// Typing nothing must be the safe reading: secrets scrubbed, profanity left alone.
+    #[test]
+    fn rendering_defaults_to_redacting_secrets_and_not_filtering_profanity() {
+        let lane = RenderingLane::parse_from(["lane"]);
+        assert!(!lane.redaction.no_redact);
+        assert!(!lane.redaction.filter_profanity);
+        let redactor = lane.redaction.redactor();
+        assert!(redactor.redacts_secrets());
+        assert!(!redactor.filters_profanity());
+        assert_eq!(redactor, crate::redaction::Redactor::new());
+    }
+
+    /// The two passes are switched independently on the command line as well as in the library:
+    /// four flag combinations, four distinct redactors.
+    #[test]
+    fn the_two_redaction_flags_move_independently() {
+        let cases = [
+            (vec![], true, false),
+            (vec!["--no-redact"], false, false),
+            (vec!["--filter-profanity"], true, true),
+            (vec!["--no-redact", "--filter-profanity"], false, true),
+        ];
+        for (flags, secrets, profanity) in cases {
+            let lane = RenderingLane::parse_from(["lane"].into_iter().chain(flags.iter().copied()));
+            let redactor = lane.redaction.redactor();
+            assert_eq!(redactor.redacts_secrets(), secrets, "{flags:?}");
+            assert_eq!(redactor.filters_profanity(), profanity, "{flags:?}");
+        }
+    }
+
+    /// There is no `--redact`: redaction is not a thing to remember to ask for, and losing it has
+    /// to be said out loud.
+    #[test]
+    fn there_is_no_flag_that_turns_redaction_on() {
+        assert!(RenderingLane::try_parse_from(["lane", "--redact"]).is_err());
+        assert!(RenderingLane::try_parse_from(["lane", "--no-filter-profanity"]).is_err());
     }
 }

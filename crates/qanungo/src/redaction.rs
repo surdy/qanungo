@@ -1,0 +1,1651 @@
+//! The redaction layer: what happens to transcript text on its way to a human surface.
+//!
+//! Qanungo renders no verbatim transcript content today. `report` and `cost` cite evidence by
+//! `source_hash` and print aggregates, tool names, and archive-stated identifiers clamped through
+//! [`crate::format::identifier`] — a construction property, not a filter, and one their own tests
+//! pin with canary fixtures. This module exists because that is about to stop being true: the
+//! standup lane (qanungo #9) renders munshi's summary prose, and every surface after it — the
+//! dashboard's evidence view, an instructions doctor's quotes, a narrator's inputs — quotes text
+//! somebody typed into a terminal. Qanungo #8 asks for the scrub to exist *before* the first
+//! surface needs it, so that no lane ever ships "we'll add redaction after".
+//!
+//! Nothing here is wired into `report` or `cost`. Wiring it in would suggest their documents needed
+//! filtering, and they do not: a filter over a document that carries no content can only ever be
+//! decoration, and decoration in a security control is worse than nothing because it invites the
+//! reader to trust it. This module is a library that the *next* lane flattens [`RedactionArgs`]
+//! into and calls.
+//!
+//! # Two passes, independently switched
+//!
+//! - **Secrets, default on** ([`REDACT_SECRETS_BY_DEFAULT`]). Off is a deliberate, documented
+//!   choice a person makes with `--no-redact`, never the default, because the failure mode is
+//!   printing a live credential to a browser on the tailnet.
+//! - **Profanity, default off** ([`FILTER_PROFANITY_BY_DEFAULT`]). A tunable, not a decision: the
+//!   issue asks for it to exist and be switchable, and the default is off because this archive is
+//!   one person's own working transcripts and masking their own swearing back at them is noise.
+//!   A shared or published surface may well want it on, and flipping that constant is the whole
+//!   change.
+//!
+//! The passes do not interact. Turning one on does not turn the other on, and the report says
+//! which fired regardless of which was asked for.
+//!
+//! # Structure, not entropy
+//!
+//! Every secret pattern anchors on **structure** — a vendor prefix, a length class, a charset, a
+//! separator, a key name — and never on how random a string looks. Entropy scoring is explicitly
+//! deferred: it is the thing that turns a sha256 in a commit message, a base64 image, or a UUID
+//! into a redaction, and a coaching report whose prose is pockmarked with `[REDACTED:…]` where the
+//! text said something ordinary is a report nobody reads twice. **Precision over recall is the
+//! standing trade here**, and each place it costs recall is named in
+//! `docs/redaction-patterns-2026-08-24.md` beside the pattern that pays for it.
+//!
+//! Two guards make that concrete on the weakest anchor, the generic assignment
+//! ([`PatternId::SecretAssignment`]): a *bare* value that is entirely digits is never a credential
+//! (`"input_tokens": 61184` appears tens of thousands of times in this archive), and a bare value
+//! that is entirely alphabetic and shorter than [`MIN_ALPHABETIC_SECRET_CHARS`] is prose
+//! (`the token: a short string`). A *quoted* value skips both guards, because the quotes are
+//! themselves the structure: `"password": "letmein"` is data, not a sentence.
+//!
+//! # The report never carries what it matched
+//!
+//! [`RedactionReport`] holds counts per [`PatternId`] and nothing else — no offsets, no excerpts,
+//! no matched text, not even in its `Debug`. A redactor whose report leaks the secret has
+//! redacted nothing, and a report is exactly the thing that ends up in a footer, a log line, or a
+//! panic message. Profanity is counted under one id for the same reason: a per-word count is the
+//! matched text, spelled as a histogram.
+//!
+//! # Idempotence
+//!
+//! Scrubbing scrubbed text changes nothing. The scanner steps over any `[REDACTED:<id>]` marker it
+//! meets rather than re-examining its inside, so a document that passes through two surfaces does
+//! not grow nested markers, and the counts on a second pass are zero. That is a property a
+//! rendering pipeline will rely on without asking.
+//!
+//! # What this module does *not* do
+//!
+//! - **The cache.** Qanungo #8 also asks for `0o600`/`0o700` on the blob cache and any derived
+//!   store. That is already true and already tested — see [`crate::cache`], which creates every
+//!   directory `0o700` and every blob `0o600` and never widens them. Nothing was added here for
+//!   it.
+//! - **Entropy scoring**, per above.
+//! - **Structured redaction.** The scrub is over text, not over a parsed record. A surface that
+//!   renders a field renders it through here; a surface that wants to drop a whole field should
+//!   drop the field.
+
+/// The revision of this pattern set, stamped by any document that renders scrubbed content.
+///
+/// The retrieval date of `docs/redaction-patterns-2026-08-24.md`, which is where every token shape
+/// below came from — the same contract [`crate::pricing::PRICE_TABLE_REVISION`] carries for
+/// dollars. Two documents claim the same scrub only when this matches: adding a pattern, widening
+/// one, or retiring one moves the date and amends that file.
+pub const PATTERN_REVISION: &str = "2026-08-24";
+
+/// Secrets are scrubbed unless a person says otherwise. Not a tunable.
+pub const REDACT_SECRETS_BY_DEFAULT: bool = true;
+
+/// Profanity is not masked unless asked for.
+///
+/// **A tunable choice, not a decision.** The archive is one person's own transcripts and this
+/// surface is read by that person; masking their own words back at them is noise, not safety. A
+/// shared dashboard or a published report is a different audience, and flipping this constant is
+/// the whole of that change.
+pub const FILTER_PROFANITY_BY_DEFAULT: bool = false;
+
+/// Opens the marker a scrubbed secret is replaced by; closed with `]`.
+pub const MARKER_OPEN: &str = "[REDACTED:";
+/// Closes the marker.
+pub const MARKER_CLOSE: char = ']';
+/// Stands in for every character of a masked word but its first.
+pub const PROFANITY_MASK: char = '*';
+
+/// Longest `[REDACTED:<id>]` marker the idempotence skip will look for. Comfortably over the
+/// longest [`PatternId::as_str`], and bounded so a lone `[REDACTED:` in ordinary text costs a
+/// bounded scan rather than a walk to the end of the document.
+const MAX_MARKER_CHARS: usize = 48;
+
+/// Which pattern fired. The string form is what appears inside a marker, so these are part of the
+/// rendered output and change only with [`PATTERN_REVISION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PatternId {
+    /// `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_`.
+    GithubToken,
+    /// `sk-ant-…`.
+    AnthropicKey,
+    /// `sk-…` that is not an Anthropic key.
+    OpenAiKey,
+    /// `AKIA…` / `ASIA…`.
+    AwsAccessKeyId,
+    /// An assignment whose key is an `aws_secret_access_key` spelling.
+    AwsSecretKey,
+    /// `xoxb-` / `xoxp-` / `xoxo-` / `xoxa-` / `xoxs-` / `xoxr-`.
+    SlackToken,
+    /// `glpat-…`.
+    GitlabToken,
+    /// `npm_…`.
+    NpmToken,
+    /// `AIza…`.
+    GoogleApiKey,
+    /// Three base64url segments, the first starting `eyJ`.
+    Jwt,
+    /// A whole `-----BEGIN … PRIVATE KEY-----` block.
+    PrivateKeyBlock,
+    /// The credential after `Authorization: Bearer|Basic|token`.
+    AuthorizationHeader,
+    /// The `user:pass` of a `scheme://user:pass@host` URL.
+    UrlCredentials,
+    /// A `KEY=VALUE` or `"key": "value"` whose key names a credential.
+    SecretAssignment,
+    /// A masked word from the profanity list. Not a secret pattern; never appears in a marker.
+    Profanity,
+}
+
+/// Every id, secrets and profanity alike, in report order.
+pub const PATTERNS: [PatternId; 15] = [
+    PatternId::GithubToken,
+    PatternId::AnthropicKey,
+    PatternId::OpenAiKey,
+    PatternId::AwsAccessKeyId,
+    PatternId::AwsSecretKey,
+    PatternId::SlackToken,
+    PatternId::GitlabToken,
+    PatternId::NpmToken,
+    PatternId::GoogleApiKey,
+    PatternId::Jwt,
+    PatternId::PrivateKeyBlock,
+    PatternId::AuthorizationHeader,
+    PatternId::UrlCredentials,
+    PatternId::SecretAssignment,
+    PatternId::Profanity,
+];
+
+/// The ids the secrets pass can produce — [`PATTERNS`] without [`PatternId::Profanity`].
+pub const SECRET_PATTERNS: [PatternId; 14] = {
+    let mut secrets = [PatternId::GithubToken; 14];
+    let mut index = 0;
+    while index < secrets.len() {
+        secrets[index] = PATTERNS[index];
+        index += 1;
+    }
+    secrets
+};
+
+impl PatternId {
+    /// The id as it is written inside a marker and in a report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GithubToken => "github-token",
+            Self::AnthropicKey => "anthropic-key",
+            Self::OpenAiKey => "openai-key",
+            Self::AwsAccessKeyId => "aws-access-key-id",
+            Self::AwsSecretKey => "aws-secret-key",
+            Self::SlackToken => "slack-token",
+            Self::GitlabToken => "gitlab-token",
+            Self::NpmToken => "npm-token",
+            Self::GoogleApiKey => "google-api-key",
+            Self::Jwt => "jwt",
+            Self::PrivateKeyBlock => "private-key-block",
+            Self::AuthorizationHeader => "authorization-header",
+            Self::UrlCredentials => "url-credentials",
+            Self::SecretAssignment => "secret-assignment",
+            Self::Profanity => "profanity",
+        }
+    }
+
+    /// Position in [`PATTERNS`], which is how [`RedactionReport`] indexes its counters.
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+impl std::fmt::Display for PatternId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// What a scrub fired, and nothing about what it matched.
+///
+/// Counts per [`PatternId`]. There is deliberately no way to ask this type for an offset, an
+/// excerpt, or a matched string — including through `Debug`, which is the form these end up in
+/// inside a log line or a panic. See the module docs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedactionReport {
+    counts: [usize; PATTERNS.len()],
+}
+
+impl RedactionReport {
+    /// How many times `pattern` fired.
+    pub const fn count(&self, pattern: PatternId) -> usize {
+        self.counts[pattern.index()]
+    }
+
+    /// How many replacements were made in total.
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    /// Whether the scrub changed anything.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// The patterns that fired, in [`PATTERNS`] order, with their counts.
+    pub fn fired(&self) -> impl Iterator<Item = (PatternId, usize)> + '_ {
+        PATTERNS
+            .into_iter()
+            .map(|pattern| (pattern, self.count(pattern)))
+            .filter(|(_, count)| *count > 0)
+    }
+
+    /// Adds another report's counts into this one, for a caller scrubbing many documents.
+    pub fn absorb(&mut self, other: &Self) {
+        for (slot, count) in self.counts.iter_mut().zip(other.counts) {
+            *slot += count;
+        }
+    }
+
+    fn record(&mut self, pattern: PatternId) {
+        self.counts[pattern.index()] += 1;
+    }
+}
+
+/// Text that has been through a [`Redactor`], and the account of what that cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scrubbed {
+    /// The text as it may be rendered.
+    pub text: String,
+    /// What fired, by pattern.
+    pub report: RedactionReport,
+}
+
+/// The scrub itself: two independently switched passes over a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Redactor {
+    secrets: bool,
+    profanity: bool,
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Redactor {
+    /// A redactor at the shipped defaults: secrets on, profanity off.
+    pub const fn new() -> Self {
+        Self {
+            secrets: REDACT_SECRETS_BY_DEFAULT,
+            profanity: FILTER_PROFANITY_BY_DEFAULT,
+        }
+    }
+
+    /// Turns the secrets pass on or off. Off is a person's documented choice.
+    #[must_use]
+    pub const fn with_secrets(mut self, on: bool) -> Self {
+        self.secrets = on;
+        self
+    }
+
+    /// Turns the profanity pass on or off.
+    #[must_use]
+    pub const fn with_profanity(mut self, on: bool) -> Self {
+        self.profanity = on;
+        self
+    }
+
+    /// Whether the secrets pass will run.
+    pub const fn redacts_secrets(&self) -> bool {
+        self.secrets
+    }
+
+    /// Whether the profanity pass will run.
+    pub const fn filters_profanity(&self) -> bool {
+        self.profanity
+    }
+
+    /// Scrubs `text`, returning it alongside a count of what fired.
+    ///
+    /// Secrets first, then profanity, so that a masked word can never split a token the secrets
+    /// pass would otherwise have recognized. With both passes off this is a copy and an empty
+    /// report — the honest rendering of "the operator asked for raw".
+    pub fn scrub(&self, text: &str) -> Scrubbed {
+        let mut report = RedactionReport::default();
+        let scrubbed = if self.secrets {
+            scrub_secrets(text, &mut report)
+        } else {
+            text.to_owned()
+        };
+        let scrubbed = if self.profanity {
+            mask_profanity(&scrubbed, &mut report)
+        } else {
+            scrubbed
+        };
+        Scrubbed {
+            text: scrubbed,
+            report,
+        }
+    }
+
+    /// Scrubs `text` and keeps only the text, for a call site that has nowhere to put a report.
+    pub fn scrub_text(&self, text: &str) -> String {
+        self.scrub(text).text
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The secrets pass
+// ---------------------------------------------------------------------------------------------
+
+/// One accepted match: the id to record, and the byte range to replace with its marker.
+///
+/// `start` may be later than the position the pattern anchored at — an assignment anchors on its
+/// key and replaces only its value, so `api_key=` survives into the rendered text and the reader
+/// can still see that a key was set.
+#[derive(Debug, Clone, Copy)]
+struct Hit {
+    id: PatternId,
+    start: usize,
+    end: usize,
+}
+
+type Matcher = fn(&[u8], usize) -> Option<Hit>;
+
+/// Every matcher, most specific first. Order is the tie-break when two matchers accept ranges
+/// ending at the same byte; length wins first.
+const MATCHERS: [Matcher; 13] = [
+    github_token,
+    anthropic_key,
+    openai_key,
+    aws_access_key_id,
+    slack_token,
+    gitlab_token,
+    npm_token,
+    google_api_key,
+    jwt,
+    private_key_block,
+    authorization_header,
+    url_credentials,
+    secret_assignment,
+];
+
+/// Bytes that can begin a match. A cheap reject so the scanner does not run thirteen matchers at
+/// every space in a two-megabyte transcript.
+static MAYBE_START: [bool; 256] = maybe_start_table();
+
+const fn maybe_start_table() -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut index = 0;
+    while index < 256 {
+        let byte = index as u8;
+        table[index] = byte.is_ascii_alphanumeric()
+            || byte == b'_'
+            || byte == b'-'
+            || byte == b'"'
+            || byte == b'\'';
+        index += 1;
+    }
+    table
+}
+
+fn scrub_secrets(text: &str, report: &mut RedactionReport) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        // A marker is not content: stepping over it is what makes a second scrub a no-op.
+        if let Some(after) = marker_end(bytes, cursor) {
+            cursor = after;
+            continue;
+        }
+        if !MAYBE_START[usize::from(bytes[cursor])] {
+            cursor += 1;
+            continue;
+        }
+        let Some(hit) = best_match(bytes, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        // Defensive rather than expected: every matcher anchors and terminates on ASCII, so both
+        // ends are already character boundaries. Skipping rather than slicing keeps a future
+        // pattern from turning a byte-offset mistake into a panic in a rendering path.
+        //
+        // Refusing a span that swallows a marker is what makes idempotence a property of the
+        // scanner rather than of every matcher's byte classes: `Authorization: Bearer <marker>`
+        // must not read the marker as this pass's credential and wrap it in a second one.
+        if hit.end <= hit.start
+            || !text.is_char_boundary(hit.start)
+            || !text.is_char_boundary(hit.end)
+            || find(&bytes[hit.start..hit.end], MARKER_OPEN.as_bytes()).is_some()
+        {
+            cursor += 1;
+            continue;
+        }
+        out.push_str(&text[copied..hit.start]);
+        out.push_str(MARKER_OPEN);
+        out.push_str(hit.id.as_str());
+        out.push(MARKER_CLOSE);
+        report.record(hit.id);
+        copied = hit.end;
+        cursor = hit.end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// The longest match anchored at `at`, ties going to the earlier matcher.
+fn best_match(bytes: &[u8], at: usize) -> Option<Hit> {
+    let mut best: Option<Hit> = None;
+    for matcher in MATCHERS {
+        if let Some(hit) = matcher(bytes, at)
+            && best.is_none_or(|current| hit.end > current.end)
+        {
+            best = Some(hit);
+        }
+    }
+    best
+}
+
+/// The offset just past a `[REDACTED:<id>]` marker beginning at `at`, if one does.
+fn marker_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if !bytes[at..].starts_with(MARKER_OPEN.as_bytes()) {
+        return None;
+    }
+    let from = at + MARKER_OPEN.len();
+    let limit = (from + MAX_MARKER_CHARS).min(bytes.len());
+    bytes[from..limit]
+        .iter()
+        .position(|byte| *byte == MARKER_CLOSE as u8)
+        .map(|offset| from + offset + 1)
+}
+
+// --- vendor-prefixed tokens ------------------------------------------------------------------
+
+/// Body length a classic `gh?_` token must reach. GitHub's classic personal access tokens carry
+/// exactly 36 base62 characters after the prefix; requiring at least that many refuses `ghp_x`
+/// in a sentence about token prefixes while accepting every real one.
+const GITHUB_CLASSIC_BODY_CHARS: usize = 36;
+
+/// Extends a token through a dot-separated base64url tail, if it has one.
+///
+/// GitHub began issuing **stateless** installation tokens shaped `ghs_<app id>_<JWT>` in April
+/// 2026, warning integrators that installation tokens are no longer 40 characters. A JWT is
+/// dot-separated, and a run of word bytes stops dead at the first dot — which would replace the
+/// `ghs_` prefix and leave the payload and signature on the screen. Nothing else this pattern
+/// meets has a dotted base64url tail, so extending through one costs no precision.
+fn dotted_tail(bytes: &[u8], mut end: usize) -> usize {
+    while bytes.get(end) == Some(&b'.') {
+        let segment = run(bytes, end + 1, is_base64url);
+        if segment == 0 {
+            break;
+        }
+        end += 1 + segment;
+    }
+    end
+}
+/// Body length a `github_pat_` token must reach. The fine-grained format is 82 word characters
+/// after the prefix; 40 is the floor kept here so a future length change does not silently stop
+/// redacting.
+const GITHUB_FINE_GRAINED_BODY_CHARS: usize = 40;
+
+fn github_token(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !boundary_before(bytes, at) {
+        return None;
+    }
+    const CLASSIC: [&[u8]; 5] = [b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_"];
+    for prefix in CLASSIC {
+        if bytes[at..].starts_with(prefix) {
+            let body_at = at + prefix.len();
+            // The length floor is measured over the tail as well, because the stateless format
+            // spends most of its length there: `ghs_<app id>_<JWT>` is only twenty-odd characters
+            // before its first dot.
+            let end = dotted_tail(bytes, body_at + run(bytes, body_at, is_word_byte));
+            if end - body_at >= GITHUB_CLASSIC_BODY_CHARS {
+                return Some(Hit {
+                    id: PatternId::GithubToken,
+                    start: at,
+                    end,
+                });
+            }
+        }
+    }
+    const FINE_GRAINED: &[u8] = b"github_pat_";
+    if bytes[at..].starts_with(FINE_GRAINED) {
+        let body = run(bytes, at + FINE_GRAINED.len(), is_word_byte);
+        if body >= GITHUB_FINE_GRAINED_BODY_CHARS {
+            return Some(Hit {
+                id: PatternId::GithubToken,
+                start: at,
+                end: at + FINE_GRAINED.len() + body,
+            });
+        }
+    }
+    None
+}
+
+/// Body length an `sk-ant-` key must reach. The prefix alone is unambiguous — no English word and
+/// no identifier convention produces it — so the floor is only there to refuse the literal
+/// `sk-ant-…` a document writes when it is talking *about* the prefix.
+const ANTHROPIC_BODY_CHARS: usize = 16;
+
+fn anthropic_key(bytes: &[u8], at: usize) -> Option<Hit> {
+    const PREFIX: &[u8] = b"sk-ant-";
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(PREFIX) {
+        return None;
+    }
+    let body = run(bytes, at + PREFIX.len(), is_key_body_byte);
+    (body >= ANTHROPIC_BODY_CHARS).then_some(Hit {
+        id: PatternId::AnthropicKey,
+        start: at,
+        end: at + PREFIX.len() + body,
+    })
+}
+
+/// Body length a bare `sk-` key must reach.
+const OPENAI_BODY_CHARS: usize = 20;
+
+/// `sk-` is a weak anchor on its own: `sk-forward-compatibility` is a perfectly ordinary
+/// kebab-case identifier of the right charset and length. The structural discriminator is
+/// **charset class, not entropy** — an OpenAI key is base62 and therefore carries both an
+/// uppercase letter and a digit, which kebab-case prose does not.
+fn openai_key(bytes: &[u8], at: usize) -> Option<Hit> {
+    const PREFIX: &[u8] = b"sk-";
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(PREFIX) {
+        return None;
+    }
+    if bytes[at..].starts_with(b"sk-ant-") {
+        return None;
+    }
+    let body_at = at + PREFIX.len();
+    let body = run(bytes, body_at, is_key_body_byte);
+    if body < OPENAI_BODY_CHARS {
+        return None;
+    }
+    let body_bytes = &bytes[body_at..body_at + body];
+    let mixed =
+        body_bytes.iter().any(u8::is_ascii_uppercase) && body_bytes.iter().any(u8::is_ascii_digit);
+    mixed.then_some(Hit {
+        id: PatternId::OpenAiKey,
+        start: at,
+        end: body_at + body,
+    })
+}
+
+/// An AWS access key id is its four-character prefix plus exactly sixteen uppercase base36
+/// characters — a fixed length, which is why this pattern needs no other guard.
+const AWS_ACCESS_KEY_BODY_CHARS: usize = 16;
+
+fn aws_access_key_id(bytes: &[u8], at: usize) -> Option<Hit> {
+    const PREFIXES: [&[u8]; 2] = [b"AKIA", b"ASIA"];
+    if !boundary_before(bytes, at) {
+        return None;
+    }
+    for prefix in PREFIXES {
+        if !bytes[at..].starts_with(prefix) {
+            continue;
+        }
+        let body_at = at + prefix.len();
+        let body = run(bytes, body_at, |byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit()
+        });
+        // Exactly sixteen: a longer run is some other SHOUTING_IDENTIFIER that happens to open
+        // with these four letters, and eating it would be the false positive this pattern set is
+        // built to avoid.
+        if body == AWS_ACCESS_KEY_BODY_CHARS
+            && !bytes.get(body_at + body).is_some_and(|b| is_word_byte(*b))
+        {
+            return Some(Hit {
+                id: PatternId::AwsAccessKeyId,
+                start: at,
+                end: body_at + body,
+            });
+        }
+    }
+    None
+}
+
+/// Body length a Slack token must reach after `xox?-`.
+const SLACK_BODY_CHARS: usize = 10;
+
+fn slack_token(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(b"xox") {
+        return None;
+    }
+    let kind = *bytes.get(at + 3)?;
+    if !matches!(kind, b'b' | b'p' | b'o' | b'a' | b's' | b'r') || bytes.get(at + 4) != Some(&b'-')
+    {
+        return None;
+    }
+    let body_at = at + 5;
+    let body = run(bytes, body_at, |byte| {
+        byte.is_ascii_alphanumeric() || byte == b'-'
+    });
+    (body >= SLACK_BODY_CHARS).then_some(Hit {
+        id: PatternId::SlackToken,
+        start: at,
+        end: body_at + body,
+    })
+}
+
+/// Body length a `glpat-` token must reach. GitLab personal access tokens are 20 base64url
+/// characters.
+const GITLAB_BODY_CHARS: usize = 20;
+
+fn gitlab_token(bytes: &[u8], at: usize) -> Option<Hit> {
+    const PREFIX: &[u8] = b"glpat-";
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(PREFIX) {
+        return None;
+    }
+    let body_at = at + PREFIX.len();
+    let body = run(bytes, body_at, is_key_body_byte);
+    (body >= GITLAB_BODY_CHARS).then_some(Hit {
+        id: PatternId::GitlabToken,
+        start: at,
+        end: body_at + body,
+    })
+}
+
+/// An npm automation token is `npm_` plus exactly 36 base62 characters.
+const NPM_BODY_CHARS: usize = 36;
+
+fn npm_token(bytes: &[u8], at: usize) -> Option<Hit> {
+    const PREFIX: &[u8] = b"npm_";
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(PREFIX) {
+        return None;
+    }
+    let body_at = at + PREFIX.len();
+    let body = run(bytes, body_at, is_base62);
+    (body >= NPM_BODY_CHARS).then_some(Hit {
+        id: PatternId::NpmToken,
+        start: at,
+        end: body_at + body,
+    })
+}
+
+/// A Google API key is `AIza` plus exactly 35 base64url characters.
+const GOOGLE_BODY_CHARS: usize = 35;
+
+fn google_api_key(bytes: &[u8], at: usize) -> Option<Hit> {
+    const PREFIX: &[u8] = b"AIza";
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(PREFIX) {
+        return None;
+    }
+    let body_at = at + PREFIX.len();
+    let body = run(bytes, body_at, is_key_body_byte);
+    (body >= GOOGLE_BODY_CHARS).then_some(Hit {
+        id: PatternId::GoogleApiKey,
+        start: at,
+        end: body_at + body,
+    })
+}
+
+/// Shortest first segment a JWT can have. `eyJ` is base64url for `{"`, so anything shorter is not
+/// yet a header object.
+const JWT_HEADER_CHARS: usize = 12;
+/// Shortest payload segment.
+const JWT_PAYLOAD_CHARS: usize = 4;
+
+/// Anchored on the *shape*, not on the prefix alone: any base64 of a JSON document opens with
+/// `eyJ`, so what makes this a token rather than an encoded blob is the two dots.
+fn jwt(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !boundary_before(bytes, at) || !bytes[at..].starts_with(b"eyJ") {
+        return None;
+    }
+    let header = run(bytes, at, is_base64url);
+    if header < JWT_HEADER_CHARS || bytes.get(at + header) != Some(&b'.') {
+        return None;
+    }
+    let payload_at = at + header + 1;
+    let payload = run(bytes, payload_at, is_base64url);
+    if payload < JWT_PAYLOAD_CHARS || bytes.get(payload_at + payload) != Some(&b'.') {
+        return None;
+    }
+    // The signature may legitimately be empty (`alg: none`); the second dot is what has already
+    // established the shape.
+    let signature_at = payload_at + payload + 1;
+    let signature = run(bytes, signature_at, is_base64url);
+    Some(Hit {
+        id: PatternId::Jwt,
+        start: at,
+        end: signature_at + signature,
+    })
+}
+
+const PEM_BEGIN: &[u8] = b"-----BEGIN ";
+const PEM_PRIVATE: &[u8] = b"PRIVATE KEY-----";
+const PEM_END: &[u8] = b"-----END ";
+const PEM_DASHES: &[u8] = b"-----";
+/// How far past `-----BEGIN ` the `PRIVATE KEY-----` label may sit. Long enough for
+/// `RSA`, `EC`, `OPENSSH`, `ENCRYPTED`, and anything of that shape; short enough that the check
+/// is a constant.
+const PEM_LABEL_SCAN_BYTES: usize = 40;
+
+/// The only multi-line pattern. A truncated block — a transcript cut mid-paste — is redacted to
+/// the end of the text rather than left alone: a private key missing its footer is still a
+/// private key.
+fn private_key_block(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !bytes[at..].starts_with(PEM_BEGIN) || (at > 0 && bytes[at - 1] == b'-') {
+        return None;
+    }
+    let label_at = at + PEM_BEGIN.len();
+    let limit = (label_at + PEM_LABEL_SCAN_BYTES).min(bytes.len());
+    let label = &bytes[label_at..limit];
+    let offset = find(label, PEM_PRIVATE)?;
+    if label[..offset].contains(&b'\n') {
+        return None;
+    }
+    let body_at = label_at + offset + PEM_PRIVATE.len();
+    let end = match find(&bytes[body_at..], PEM_END) {
+        Some(footer) => {
+            let after = body_at + footer + PEM_END.len();
+            find(&bytes[after..], PEM_DASHES)
+                .map_or(bytes.len(), |tail| after + tail + PEM_DASHES.len())
+        }
+        None => bytes.len(),
+    };
+    Some(Hit {
+        id: PatternId::PrivateKeyBlock,
+        start: at,
+        end,
+    })
+}
+
+const AUTHORIZATION: &[u8] = b"authorization";
+
+/// Keeps the header name and the scheme word and replaces only the credential, because
+/// `Authorization: Bearer [REDACTED:authorization-header]` tells a reader what happened and
+/// `[REDACTED:authorization-header]` alone does not.
+///
+/// `token` joins `Bearer` and `Basic` because that is the scheme GitHub's own documentation uses.
+fn authorization_header(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !boundary_before(bytes, at) || !starts_with_ignore_case(bytes, at, AUTHORIZATION) {
+        return None;
+    }
+    let mut cursor = at + AUTHORIZATION.len();
+    if bytes.get(cursor).is_some_and(|byte| is_word_byte(*byte)) {
+        return None;
+    }
+    cursor += usize::from(matches!(bytes.get(cursor), Some(b'"' | b'\'')));
+    cursor += run(bytes, cursor, is_blank);
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor += 1;
+    cursor += run(bytes, cursor, is_blank);
+    cursor += usize::from(matches!(bytes.get(cursor), Some(b'"' | b'\'')));
+    const SCHEMES: [&[u8]; 3] = [b"bearer", b"basic", b"token"];
+    let scheme = SCHEMES
+        .into_iter()
+        .find(|scheme| starts_with_ignore_case(bytes, cursor, scheme))?;
+    cursor += scheme.len();
+    let blanks = run(bytes, cursor, is_blank);
+    if blanks == 0 {
+        return None;
+    }
+    cursor += blanks;
+    let credential = run(bytes, cursor, is_credential_byte);
+    (credential > 0).then_some(Hit {
+        id: PatternId::AuthorizationHeader,
+        start: cursor,
+        end: cursor + credential,
+    })
+}
+
+/// Shortest URL scheme this will believe in.
+const MIN_URL_SCHEME_CHARS: usize = 2;
+/// Longest userinfo; past this the `@` found is almost certainly not a URL's.
+const MAX_USERINFO_CHARS: usize = 256;
+
+/// `scheme://user:pass@host` — and only with the colon. Requiring `user:pass` rather than any
+/// userinfo is what keeps `ssh://git@github.com/surdy/munshi.git`, which is in this repository's
+/// own manifest, out of the report.
+///
+/// The whole userinfo goes, not just the password: `https://oauth2:x@…` and
+/// `https://ghp_…@…` both put the credential in the part a naive reading calls the username.
+fn url_credentials(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !boundary_before(bytes, at) || !bytes[at].is_ascii_alphabetic() {
+        return None;
+    }
+    let scheme = run(bytes, at, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-')
+    });
+    if scheme < MIN_URL_SCHEME_CHARS || !bytes[at + scheme..].starts_with(b"://") {
+        return None;
+    }
+    let userinfo_at = at + scheme + 3;
+    let userinfo = run(bytes, userinfo_at, is_userinfo_byte);
+    if userinfo == 0 || userinfo > MAX_USERINFO_CHARS {
+        return None;
+    }
+    let at_sign = userinfo_at + userinfo;
+    if bytes.get(at_sign) != Some(&b'@') || !bytes[userinfo_at..at_sign].contains(&b':') {
+        return None;
+    }
+    Some(Hit {
+        id: PatternId::UrlCredentials,
+        start: userinfo_at,
+        end: at_sign,
+    })
+}
+
+/// Key names a *normalized* key (lowercased, with `_`, `-`, and `.` removed) must **end with** to
+/// make the assignment a credential.
+///
+/// Ends-with, not contains, and the archive is what settled it. A contains-match fired 17,302
+/// times over the 723 mirrored transcripts, and the keys doing it were overwhelmingly *code*:
+/// `tokenType`, `tokenState`, `onBearerTokenChange`, `credentials_path`, `check-theme-tokens.sh`,
+/// `splitRightTokens`. What separates those from `cloudflare_api_token` is the same convention in
+/// every naming style there is — **the thing a name denotes goes last**. `resume_token` holds a
+/// token; `token_grant` holds a grant.
+///
+/// The multi-word entries are there because normalization removes the separators, so
+/// `AWS_SECRET_ACCESS_KEY` becomes `awssecretaccesskey` and ends with `secretaccesskey` rather
+/// than with `secret`. The recall this costs is named in the provenance file: a key that buries
+/// its noun (`GITHUB_TOKEN_FOR_CI`) is not matched *as an assignment* — though a real value under
+/// it usually still is, by its own vendor pattern.
+const SECRET_KEY_WORDS: [&[u8]; 12] = [
+    b"token",
+    b"secret",
+    b"password",
+    b"passwd",
+    b"passphrase",
+    b"apikey",
+    b"credential",
+    b"privatekey",
+    b"secretkey",
+    b"secretaccesskey",
+    b"accesskey",
+    b"authkey",
+];
+
+/// The normalized key that earns [`PatternId::AwsSecretKey`] instead of the generic id.
+const AWS_SECRET_KEY_NAME: &[u8] = b"secretaccesskey";
+
+/// Shortest key that can end in a keyword (`token`).
+const MIN_KEY_CHARS: usize = 5;
+/// Longest key this will normalize. A "key" longer than this is a sentence.
+const MAX_KEY_CHARS: usize = 64;
+/// Shortest *bare* value this will believe is a credential.
+const MIN_BARE_SECRET_CHARS: usize = 6;
+/// A bare value that is entirely alphabetic and shorter than this is prose, not a credential —
+/// `the token: a short string` must survive a coaching report intact.
+///
+/// **This is one of the two places precision is bought with recall**, and the price is named: a
+/// weak all-letter password (`password: letmein`) is not redacted bare. Quoting it
+/// (`password: "letmein"`) is enough to bring it back, because a quoted value is structure rather
+/// than a sentence.
+pub const MIN_ALPHABETIC_SECRET_CHARS: usize = 20;
+
+fn secret_assignment(bytes: &[u8], at: usize) -> Option<Hit> {
+    let quote = match bytes[at] {
+        byte @ (b'"' | b'\'') => Some(byte),
+        byte if is_key_name_byte(byte) => None,
+        _ => return None,
+    };
+    if quote.is_none() && !boundary_before(bytes, at) {
+        return None;
+    }
+    let key_at = at + usize::from(quote.is_some());
+    let key = run(bytes, key_at, is_key_name_byte);
+    if !(MIN_KEY_CHARS..=MAX_KEY_CHARS).contains(&key) {
+        return None;
+    }
+    let mut cursor = key_at + key;
+    if let Some(quote) = quote {
+        if bytes.get(cursor) != Some(&quote) {
+            return None;
+        }
+        cursor += 1;
+    }
+    cursor += run(bytes, cursor, is_blank);
+    // Cheap structural gate before the key is normalized at all: no separator, no assignment.
+    if !matches!(bytes.get(cursor), Some(b'=' | b':')) {
+        return None;
+    }
+    cursor += 1;
+    // `==` is a comparison, not an assignment.
+    if bytes.get(cursor) == Some(&b'=') {
+        return None;
+    }
+    cursor += run(bytes, cursor, is_blank);
+    let name = normalized_key(&bytes[key_at..key_at + key])?;
+    let normalized = &name.0[..name.1];
+    if !SECRET_KEY_WORDS
+        .iter()
+        .any(|word| normalized.ends_with(word))
+    {
+        return None;
+    }
+    let id = if normalized.ends_with(AWS_SECRET_KEY_NAME) {
+        PatternId::AwsSecretKey
+    } else {
+        PatternId::SecretAssignment
+    };
+
+    let (value_at, value_end, quoted) = match bytes.get(cursor) {
+        Some(&quote @ (b'"' | b'\'')) => {
+            let value_at = cursor + 1;
+            let value = run(bytes, value_at, |byte| byte != quote && byte != b'\n');
+            if bytes.get(value_at + value) != Some(&quote) {
+                return None;
+            }
+            (value_at, value_at + value, true)
+        }
+        _ => {
+            let value = run(bytes, cursor, is_bare_value_byte);
+            (cursor, cursor + value, false)
+        }
+    };
+    let value = &bytes[value_at..value_end];
+    if value.is_empty() {
+        return None;
+    }
+    if !quoted {
+        // A bare number is a measurement. This archive records `"input_tokens": 61184` tens of
+        // thousands of times, and a key ending in `token` is exactly what that is.
+        if value.len() < MIN_BARE_SECRET_CHARS || value.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        // The other half of what the archive taught this pattern. An unquoted value carrying no
+        // digit at all is, in a transcript, almost always an *expression*: `token = self.next`,
+        // `password = config.password`. A credential is base62, base64url, or hex, and all three
+        // carry digits. The exception kept is the long all-letter passphrase, which has no digits
+        // by design and is not an expression either, because an expression that long would have
+        // punctuation in it.
+        let digits = value.iter().any(u8::is_ascii_digit);
+        let passphrase =
+            value.len() >= MIN_ALPHABETIC_SECRET_CHARS && value.iter().all(u8::is_ascii_alphabetic);
+        if !digits && !passphrase {
+            return None;
+        }
+    }
+    Some(Hit {
+        id,
+        start: value_at,
+        end: value_end,
+    })
+}
+
+/// The key lowercased with `_`, `-`, and `.` dropped, in a stack buffer plus its length. `None`
+/// when it does not fit, which [`MAX_KEY_CHARS`] has already made impossible for a real key.
+fn normalized_key(key: &[u8]) -> Option<([u8; MAX_KEY_CHARS], usize)> {
+    let mut buffer = [0u8; MAX_KEY_CHARS];
+    let mut length = 0;
+    for byte in key {
+        if matches!(byte, b'_' | b'-' | b'.') {
+            continue;
+        }
+        *buffer.get_mut(length)? = byte.to_ascii_lowercase();
+        length += 1;
+    }
+    Some((buffer, length))
+}
+
+// --- byte classes ----------------------------------------------------------------------------
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_base62(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+/// The charset of a URL-safe vendor key: base62 plus `-` and `_`.
+fn is_key_body_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+fn is_base64url(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=')
+}
+
+fn is_key_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+fn is_blank(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+/// What a bare (unquoted) assigned value may be made of: **the credential charset**, which is
+/// base62 plus the six punctuation marks base64url, hex-with-separators, and `.env` values use.
+///
+/// An allow-list rather than a deny-list, and that is the whole point. A deny-list admitted
+/// `self.next_token(`, `Option<String>`, and `crate::Token` — the assignments a transcript is
+/// actually full of, because a transcript is mostly source code. None of those is expressible in
+/// this charset, and every real credential is.
+fn is_bare_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+' | b'/' | b'=')
+}
+
+/// What a credential after `Bearer` may be made of. Wider than a bare value — a base64 Basic
+/// credential ends in `=` and may contain `/` and `+` — and narrower than a line.
+fn is_credential_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic()
+        && !matches!(
+            byte,
+            b',' | b';' | b'"' | b'\'' | b'`' | b'[' | b']' | b'{' | b'}'
+        )
+}
+
+fn is_userinfo_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic()
+        && !matches!(
+            byte,
+            b'/' | b'?'
+                | b'#'
+                | b'@'
+                | b'['
+                | b']'
+                | b'"'
+                | b'\''
+                | b'`'
+                | b'\\'
+                | b'<'
+                | b'>'
+                | b','
+        )
+}
+
+// --- small scanning helpers ------------------------------------------------------------------
+
+/// How many consecutive bytes from `from` satisfy `allowed`.
+fn run(bytes: &[u8], from: usize, allowed: impl Fn(u8) -> bool) -> usize {
+    bytes.get(from..).map_or(0, |tail| {
+        tail.iter().take_while(|byte| allowed(**byte)).count()
+    })
+}
+
+/// Whether the byte before `at` cannot be part of the same token.
+fn boundary_before(bytes: &[u8], at: usize) -> bool {
+    at == 0 || !is_word_byte(bytes[at - 1])
+}
+
+fn starts_with_ignore_case(bytes: &[u8], at: usize, literal: &[u8]) -> bool {
+    bytes
+        .get(at..at + literal.len())
+        .is_some_and(|window| window.eq_ignore_ascii_case(literal))
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The profanity pass
+// ---------------------------------------------------------------------------------------------
+
+/// The wordlist, in full forms rather than stems.
+///
+/// Conservative on purpose, and enumerated rather than generated: a stemmer that accepted
+/// `<entry> + s|ed|ing` would decide what it masks by arithmetic nobody reviewed, and the point of
+/// a list is that a person can read all of it. `dick` and `prick` are deliberately absent — one is
+/// a name and the other has an ordinary sense, and a coaching report that masks a colleague's name
+/// has done more damage than the word it caught.
+///
+/// Matched as **whole words**, case-insensitively. Never as substrings: `Scunthorpe`, `class`, and
+/// `assassin` are ordinary words, and the classic failure of this feature is masking them.
+const PROFANITY: [&[u8]; 26] = [
+    b"arse",
+    b"arsehole",
+    b"arseholes",
+    b"ass",
+    b"asshole",
+    b"assholes",
+    b"bastard",
+    b"bastards",
+    b"bitch",
+    b"bitches",
+    b"bollocks",
+    b"bullshit",
+    b"cunt",
+    b"cunts",
+    b"fuck",
+    b"fucked",
+    b"fucker",
+    b"fuckers",
+    b"fucking",
+    b"fucks",
+    b"motherfucker",
+    b"motherfuckers",
+    b"shit",
+    b"shits",
+    b"shitting",
+    b"shitty",
+];
+
+/// Longest entry in [`PROFANITY`]; a word longer than this cannot be one.
+const MAX_PROFANITY_CHARS: usize = 16;
+
+fn mask_profanity(text: &str, report: &mut RedactionReport) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        // Markers are the secrets pass's output, not content — and a pattern id is not a word this
+        // pass gets to rewrite.
+        if let Some(after) = marker_end(bytes, cursor) {
+            cursor = after;
+            continue;
+        }
+        if !bytes[cursor].is_ascii_alphabetic() || !boundary_before(bytes, cursor) {
+            cursor += 1;
+            continue;
+        }
+        let word = run(bytes, cursor, |byte| byte.is_ascii_alphabetic());
+        let end = cursor + word;
+        // A word abutting a digit or an underscore is an identifier fragment, not a word.
+        let standalone = !bytes.get(end).is_some_and(|byte| is_word_byte(*byte));
+        if standalone && word <= MAX_PROFANITY_CHARS && is_profane(&bytes[cursor..end]) {
+            out.push_str(&text[copied..cursor]);
+            out.push(char::from(bytes[cursor]));
+            for _ in 1..word {
+                out.push(PROFANITY_MASK);
+            }
+            report.record(PatternId::Profanity);
+            copied = end;
+        }
+        cursor = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+fn is_profane(word: &[u8]) -> bool {
+    let mut lowered = [0u8; MAX_PROFANITY_CHARS];
+    let Some(slot) = lowered.get_mut(..word.len()) else {
+        return false;
+    };
+    for (target, byte) in slot.iter_mut().zip(word) {
+        *target = byte.to_ascii_lowercase();
+    }
+    let lowered = &lowered[..word.len()];
+    PROFANITY.contains(&lowered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One planted canary per secret pattern. Every value is obviously fake — the bodies are
+    /// keyboard filler of the right shape — and every one is a *complete* example, because a
+    /// pattern set tested only on the prefix would pass while redacting nothing real.
+    const CANARIES: [(PatternId, &str); 17] = [
+        (
+            PatternId::GithubToken,
+            "the classic one is ghp_FAKEfake0123456789ABCDEFabcdef012345 in the log",
+        ),
+        (
+            PatternId::GithubToken,
+            "and gho_FAKEfake0123456789ABCDEFabcdef012345 alongside it",
+        ),
+        (
+            // The stateless installation format GitHub began issuing in April 2026, whose JWT
+            // tail a word-byte run would have stopped short of.
+            PatternId::GithubToken,
+            "ghs_123456_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJGQUtFIn0.FAKEfakeSIGNATURE",
+        ),
+        (
+            PatternId::GithubToken,
+            "github_pat_11FAKEFAKE0aaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        (
+            PatternId::AnthropicKey,
+            "export it as sk-ant-api03-FAKEfake0123456789-ABCDEFabcdefFAKE and move on",
+        ),
+        (
+            PatternId::OpenAiKey,
+            "sk-FAKEfake0123456789ABCDEFabcdef0123456789ABCDEF was in the env",
+        ),
+        (
+            PatternId::AwsAccessKeyId,
+            "AKIAFAKEFAKEFAKE1234 was printed by the terminal",
+        ),
+        (
+            PatternId::AwsSecretKey,
+            "aws_secret_access_key=FAKEfake0123456789ABCDEFabcdef0123456789",
+        ),
+        (
+            PatternId::SlackToken,
+            "xoxb-000000000000-111111111111-FAKEfakeFAKEfakeFAKEfake",
+        ),
+        (
+            PatternId::GitlabToken,
+            "glpat-FAKEfake0123456789AB in the runner config",
+        ),
+        (
+            PatternId::NpmToken,
+            "npm_FAKEfake0123456789ABCDEFabcdef012345 in .npmrc",
+        ),
+        (
+            PatternId::GoogleApiKey,
+            "AIzaFAKEfake0123456789ABCDEFabcdef01234 came from the console",
+        ),
+        (
+            PatternId::Jwt,
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJGQUtFIn0.FAKEfakeSIGNATUREvalue",
+        ),
+        (
+            PatternId::PrivateKeyBlock,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEfakeFAKEfake\nmore==\n-----END OPENSSH PRIVATE KEY-----",
+        ),
+        (
+            PatternId::AuthorizationHeader,
+            "Authorization: Bearer FAKEfake0123456789ABCDEFabcdef",
+        ),
+        (
+            PatternId::UrlCredentials,
+            "cloned https://surdy:FAKEfakePASSWORD@example.com/repo.git today",
+        ),
+        (
+            PatternId::SecretAssignment,
+            "PATWARI_API_KEY=FAKEfake0123456789ABCDEF was exported",
+        ),
+    ];
+
+    /// The fake bodies above, so a test can assert none of them survives anywhere.
+    const CANARY_BODIES: [&str; 12] = [
+        "ghp_FAKEfake0123456789ABCDEFabcdef012345",
+        "sk-ant-api03-FAKEfake0123456789-ABCDEFabcdefFAKE",
+        "AKIAFAKEFAKEFAKE1234",
+        "xoxb-000000000000-111111111111-FAKEfakeFAKEfakeFAKEfake",
+        "glpat-FAKEfake0123456789AB",
+        "npm_FAKEfake0123456789ABCDEFabcdef012345",
+        "AIzaFAKEfake0123456789ABCDEFabcdef01234",
+        "eyJzdWIiOiJGQUtFIn0",
+        "FAKEfakeFAKEfake",
+        "FAKEfake0123456789ABCDEFabcdef",
+        "FAKEfakePASSWORD",
+        "FAKEfake0123456789ABCDEF",
+    ];
+
+    fn secrets() -> Redactor {
+        Redactor::new()
+    }
+
+    /// The done-bar of the pattern set: every class has a canary, and every canary is both
+    /// recognized *as its own pattern* and gone from the text.
+    #[test]
+    fn every_planted_canary_is_recognized_and_removed() {
+        for (expected, text) in CANARIES {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.report.count(expected),
+                1,
+                "{expected} did not fire on {text:?}"
+            );
+            assert_eq!(
+                scrubbed.report.total(),
+                1,
+                "extra patterns fired on {text:?}"
+            );
+            assert!(
+                scrubbed.text.contains(&format!("{MARKER_OPEN}{expected}]")),
+                "no marker for {expected} in {:?}",
+                scrubbed.text
+            );
+        }
+    }
+
+    /// Nothing of a planted secret survives into the rendered text, whichever pattern caught it.
+    #[test]
+    fn no_planted_secret_body_survives_the_scrub() {
+        let corpus = CANARIES.map(|(_, text)| text).join("\n");
+        let scrubbed = secrets().scrub(&corpus);
+        for body in CANARY_BODIES {
+            assert!(
+                !scrubbed.text.contains(body),
+                "{body} survived into {:?}",
+                scrubbed.text
+            );
+        }
+    }
+
+    /// The property the whole design turns on: a report that carried what it matched would have
+    /// redacted nothing. `Debug` is checked, not just the accessors, because `Debug` is the form a
+    /// report reaches a log line or a panic message in.
+    #[test]
+    fn the_report_never_carries_what_it_matched() {
+        let corpus = CANARIES.map(|(_, text)| text).join("\n");
+        let scrubbed = Redactor::new().with_profanity(true).scrub(&corpus);
+        let rendered = format!(
+            "{:?} {:?}",
+            scrubbed.report,
+            scrubbed.report.fired().collect::<Vec<_>>()
+        );
+        for body in CANARY_BODIES {
+            assert!(!rendered.contains(body), "{body} leaked into the report");
+        }
+        for fragment in ["FAKE", "fake", "surdy", "PATWARI"] {
+            assert!(
+                !rendered.contains(fragment),
+                "{fragment} leaked into the report"
+            );
+        }
+        assert!(scrubbed.report.total() >= CANARIES.len());
+    }
+
+    /// A document that passes through two surfaces must not grow nested markers, and the second
+    /// scrub must report nothing.
+    #[test]
+    fn scrubbing_scrubbed_text_changes_nothing() {
+        let corpus = format!(
+            "{}\nthis fucking thing again\n",
+            CANARIES.map(|(_, text)| text).join("\n")
+        );
+        let redactor = Redactor::new().with_profanity(true);
+        let once = redactor.scrub(&corpus);
+        let twice = redactor.scrub(&once.text);
+        assert_eq!(twice.text, once.text);
+        assert!(
+            twice.report.is_empty(),
+            "a second scrub fired {:?}",
+            twice.report.fired().collect::<Vec<_>>()
+        );
+    }
+
+    /// A marker is not content: neither pass may take one apart, whichever pass wrote it.
+    #[test]
+    fn a_marker_is_never_re_examined() {
+        let text = "key=[REDACTED:secret-assignment] and [REDACTED:jwt] stay put";
+        let scrubbed = Redactor::new().with_profanity(true).scrub(text);
+        assert_eq!(scrubbed.text, text);
+        assert!(scrubbed.report.is_empty());
+    }
+
+    #[test]
+    fn the_defaults_are_secrets_on_and_profanity_off() {
+        let redactor = Redactor::new();
+        assert!(redactor.redacts_secrets());
+        assert!(!redactor.filters_profanity());
+        assert_eq!(redactor, Redactor::default());
+        const { assert!(REDACT_SECRETS_BY_DEFAULT) };
+        const { assert!(!FILTER_PROFANITY_BY_DEFAULT) };
+    }
+
+    /// Four independent combinations, not two: turning one pass on must not turn the other on,
+    /// and turning secrets off must not disable profanity.
+    #[test]
+    fn the_two_passes_are_independently_switched() {
+        let text = "sk-FAKEfake0123456789ABCDEFabcdef0123456789ABCDEF, this shit again";
+        let cases = [
+            (false, false, false, false),
+            (true, false, true, false),
+            (false, true, false, true),
+            (true, true, true, true),
+        ];
+        for (secrets_on, profanity_on, expect_secret, expect_profanity) in cases {
+            let scrubbed = Redactor::new()
+                .with_secrets(secrets_on)
+                .with_profanity(profanity_on)
+                .scrub(text);
+            assert_eq!(
+                scrubbed.report.count(PatternId::OpenAiKey) > 0,
+                expect_secret,
+                "secrets={secrets_on} profanity={profanity_on}"
+            );
+            assert_eq!(
+                scrubbed.report.count(PatternId::Profanity) > 0,
+                expect_profanity,
+                "secrets={secrets_on} profanity={profanity_on}"
+            );
+        }
+        let raw = Redactor::new().with_secrets(false).scrub(text);
+        assert_eq!(raw.text, text, "both passes off is a copy");
+        assert!(raw.report.is_empty());
+    }
+
+    /// The precision half of the trade. Every line here is ordinary text a coaching report could
+    /// plausibly quote, and a redactor that ate any of it would be worse than none.
+    #[test]
+    fn ordinary_prose_and_ordinary_code_survive_untouched() {
+        const INNOCENT: [&str; 18] = [
+            "the token: a short string the tokenizer emits",
+            "\"input_tokens\": 61184, \"output_tokens\": 2048",
+            "max_tokens=4096",
+            "sk-forward-compatibility-shim is the module name",
+            "we set the api_key from 1Password rather than the env",
+            "password: letmein",
+            "AKIAFAKEFAKEFAKE1234567890 is not a key id, it is too long",
+            "ghp_short",
+            "ssh://git@github.com/surdy/munshi.git",
+            "https://patwari.clusterfault.com/v1/sessions",
+            "the secret sauce is that it does nothing clever",
+            "credential helper: osxkeychain",
+            "AIzaSHORT",
+            "eyJhbGciOiJIUzI1NiJ9 alone is not a token",
+            "authorization is a topic, not a header",
+            "xoxb-short",
+            "-----BEGIN CERTIFICATE-----",
+            "npm_install failed",
+        ];
+        for text in INNOCENT {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.text,
+                text,
+                "redacted ordinary text: {:?}",
+                scrubbed.report.fired().collect::<Vec<_>>()
+            );
+            assert!(scrubbed.report.is_empty());
+        }
+    }
+
+    /// The assignment pattern as the archive left it. A contains-match on the key fired 17,302
+    /// times over the 723 mirrored transcripts, and almost all of it was *source code*, because a
+    /// transcript is mostly source code. Both tightenings are pinned here: the key must **end** in
+    /// a credential word, and a bare value must be spellable in the credential charset and carry a
+    /// digit.
+    #[test]
+    fn an_assignment_is_anchored_on_the_end_of_its_key_and_the_charset_of_its_value() {
+        const CODE: [&str; 8] = [
+            // The noun is not last: these names are *about* a credential, they do not hold one.
+            "\"tokenType\": \"bearer\"",
+            "tokenState = Idle",
+            "onBearerTokenChange(handler)",
+            "let credentials_path = home.join(\".aws\")",
+            "splitRightTokens = 3",
+            // The key is right, but the value is an expression rather than a credential.
+            "token = self.next_token",
+            "password: Option<String>",
+            "let api_key = config.api_key.clone();",
+        ];
+        for text in CODE {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, text, "redacted source code: {text:?}");
+        }
+        const CREDENTIALS: [(&str, PatternId); 4] = [
+            (
+                "CLOUDFLARE_API_TOKEN=FAKEfake0123456789abcdef",
+                PatternId::SecretAssignment,
+            ),
+            (
+                "ts_authkey: FAKEfake0123456789",
+                PatternId::SecretAssignment,
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY=FAKEfake0123456789ABCDEFabcdef0123456789",
+                PatternId::AwsSecretKey,
+            ),
+            (
+                "password = correcthorsebatterystaple",
+                PatternId::SecretAssignment,
+            ),
+        ];
+        for (text, expected) in CREDENTIALS {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.report.count(expected), 1, "missed {text:?}");
+        }
+    }
+
+    /// A quoted value is structure rather than a sentence, so it skips the prose guards that a
+    /// bare value has to pass. This is the documented way back to the recall the guards cost.
+    #[test]
+    fn a_quoted_value_is_data_even_when_a_bare_one_would_read_as_prose() {
+        let scrubbed = secrets().scrub("\"password\": \"letmein\"");
+        assert_eq!(scrubbed.report.count(PatternId::SecretAssignment), 1);
+        assert_eq!(
+            scrubbed.text,
+            "\"password\": \"[REDACTED:secret-assignment]\""
+        );
+    }
+
+    /// The assignment keeps its key and the header keeps its scheme: a reader has to be able to
+    /// tell *that* a credential was there, which is half of what makes a coaching report useful.
+    #[test]
+    fn a_scrub_leaves_the_shape_of_what_it_removed() {
+        let cases = [
+            (
+                "PATWARI_API_KEY=FAKEfake0123456789ABCDEF",
+                "PATWARI_API_KEY=[REDACTED:secret-assignment]",
+            ),
+            (
+                "Authorization: Bearer FAKEfake0123456789ABCDEFabcdef",
+                "Authorization: Bearer [REDACTED:authorization-header]",
+            ),
+            (
+                "https://surdy:FAKEfakePASSWORD@example.com/repo.git",
+                "https://[REDACTED:url-credentials]@example.com/repo.git",
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(secrets().scrub(text).text, expected);
+        }
+    }
+
+    /// A key block goes whole, header and footer included, and a truncated one goes to the end of
+    /// the text rather than being left as a key with no footer.
+    #[test]
+    fn a_private_key_block_is_removed_whole_even_when_truncated() {
+        let complete = "before\n-----BEGIN RSA PRIVATE KEY-----\nAAAA\nBBBB\n-----END RSA PRIVATE KEY-----\nafter";
+        let scrubbed = secrets().scrub(complete);
+        assert_eq!(scrubbed.text, "before\n[REDACTED:private-key-block]\nafter");
+
+        let truncated = "before\n-----BEGIN EC PRIVATE KEY-----\nAAAA\nBBBB";
+        let scrubbed = secrets().scrub(truncated);
+        assert_eq!(scrubbed.text, "before\n[REDACTED:private-key-block]");
+    }
+
+    /// The Scunthorpe test, and its relatives. Substring matching is the classic failure of this
+    /// feature and the reason the list is matched on whole words only.
+    #[test]
+    fn profanity_is_matched_as_a_whole_word_only() {
+        let redactor = Redactor::new().with_profanity(true);
+        const INNOCENT: [&str; 8] = [
+            "Scunthorpe is in Lincolnshire",
+            "the class assassin passed the bitchute check",
+            "shiitake mushrooms",
+            "assessment of the massive dataset",
+            "arsenal, bassist, cassette",
+            "he was pissed_off_flag in the enum",
+            "FUCKS_GIVEN_COUNT is an identifier",
+            "the compass, the bassline, and the cassowary",
+        ];
+        for text in INNOCENT {
+            let scrubbed = redactor.scrub(text);
+            assert_eq!(scrubbed.text, text, "masked inside a word: {text:?}");
+        }
+    }
+
+    /// The mask keeps the first character and the length, which is enough for a reader to see
+    /// that something was masked without reading it.
+    #[test]
+    fn profanity_is_masked_case_insensitively_keeping_shape() {
+        let redactor = Redactor::new().with_profanity(true);
+        let scrubbed = redactor.scrub("What the Fuck, this SHIT is bollocks.");
+        assert_eq!(scrubbed.text, "What the F***, this S*** is b*******.");
+        assert_eq!(scrubbed.report.count(PatternId::Profanity), 3);
+        // One id, not one per word: a per-word count is the matched text spelled as a histogram.
+        assert_eq!(scrubbed.report.fired().count(), 1);
+    }
+
+    /// The scrub is a rendering path, and a rendering path that panics on a non-ASCII transcript
+    /// is a bug that reaches production the first time someone works in Hindi.
+    #[test]
+    fn text_around_a_secret_survives_byte_for_byte_including_non_ascii() {
+        let text = "परियोजना की कुंजी ghp_FAKEfake0123456789ABCDEFabcdef012345 है — मिटाओ";
+        let scrubbed = secrets().scrub(text);
+        assert_eq!(
+            scrubbed.text,
+            "परियोजना की कुंजी [REDACTED:github-token] है — मिटाओ"
+        );
+    }
+
+    /// Ids are what a marker and a report footer are made of, so they must be unique, stable, and
+    /// safe to render inside `[REDACTED:…]` and a Markdown table alike.
+    #[test]
+    fn pattern_ids_are_unique_and_safe_to_render() {
+        let mut ids: Vec<_> = PATTERNS.iter().map(|pattern| pattern.as_str()).collect();
+        ids.sort_unstable();
+        let count = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "pattern ids must be unique");
+        for pattern in PATTERNS {
+            let id = pattern.as_str();
+            assert!(!id.is_empty());
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-'),
+                "{id} is not a kebab-case id"
+            );
+            assert!(id.len() + MARKER_OPEN.len() < MAX_MARKER_CHARS);
+            assert_eq!(PATTERNS[pattern.index()], pattern);
+        }
+        assert_eq!(SECRET_PATTERNS.len(), PATTERNS.len() - 1);
+        assert!(!SECRET_PATTERNS.contains(&PatternId::Profanity));
+    }
+
+    /// The revision is a date because two documents are comparable only when the pattern set that
+    /// produced them was the same, and a date is what names the research file beside it.
+    #[test]
+    fn the_pattern_revision_names_the_provenance_file() {
+        assert_eq!(PATTERN_REVISION.len(), "2026-08-24".len());
+        assert!(
+            PATTERN_REVISION
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        );
+    }
+
+    /// A caller scrubbing a whole archive needs the counts to add up across documents without
+    /// ever holding the documents.
+    #[test]
+    fn reports_absorb_one_another() {
+        let redactor = secrets();
+        let mut total = RedactionReport::default();
+        for (_, text) in CANARIES {
+            total.absorb(&redactor.scrub(text).report);
+        }
+        assert_eq!(total.total(), CANARIES.len());
+        assert_eq!(total.count(PatternId::GithubToken), 4);
+    }
+
+    /// Two secrets on one line, and a secret at each end of the text: the scanner has to resume
+    /// correctly after a replacement rather than swallowing the rest of the line.
+    #[test]
+    fn several_secrets_in_one_document_are_each_replaced() {
+        let text = "ghp_FAKEfake0123456789ABCDEFabcdef012345 then AKIAFAKEFAKEFAKE1234 then glpat-FAKEfake0123456789AB";
+        let scrubbed = secrets().scrub(text);
+        assert_eq!(
+            scrubbed.text,
+            "[REDACTED:github-token] then [REDACTED:aws-access-key-id] then [REDACTED:gitlab-token]"
+        );
+        assert_eq!(scrubbed.report.total(), 3);
+    }
+
+    #[test]
+    fn an_empty_document_scrubs_to_an_empty_document() {
+        let scrubbed = Redactor::new().with_profanity(true).scrub("");
+        assert!(scrubbed.text.is_empty());
+        assert!(scrubbed.report.is_empty());
+        assert_eq!(secrets().scrub_text("plain"), "plain");
+    }
+}
