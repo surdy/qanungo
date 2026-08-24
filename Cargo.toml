@@ -14,7 +14,7 @@ clap = { version = "4.5.41", features = ["derive", "env"] }
 # The read-time transcript interpreter (munshi ADR 0011). Pinned by revision, not by branch:
 # what a fold *means* is decided by this crate's version-pinned format knowledge, so a report
 # must not silently change its numbers because the dependency moved.
-munshi-transcript = { git = "ssh://git@github.com/surdy/munshi.git", rev = "aa22070" }
+munshi-transcript = { git = "ssh://git@github.com/surdy/munshi.git", rev = "a717ddc" }
 # TLS for the Caddy-published Patwari endpoints (munshi ADR 0013): rustls on the `ring`
 # provider, verifying against the system trust store with no policy knobs.
 rustls = { version = "0.23.29", default-features = false, features = ["ring", "std", "logging", "tls12"] }
