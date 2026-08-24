@@ -17,6 +17,7 @@ fn main() -> ExitCode {
     let mut out = stdout.lock();
     let result = match &cli.command {
         Command::Report(args) => command::report(args, &mut out),
+        Command::Cost(args) => command::cost(args, &mut out),
     };
     if let Err(error) = result.and_then(|()| out.flush().map_err(command::CommandError::Output)) {
         let mut message = error.to_string();

@@ -1,8 +1,14 @@
 //! The command-line surface.
 //!
-//! P0 is one command — `qanungo report` — because the vertical slice is the point: sync, fold,
+//! P0 was one command — `qanungo report` — because the vertical slice was the point: sync, fold,
 //! evaluate, emit, all in one invocation, with nothing between the archive and the Markdown on
-//! stdout.
+//! stdout. `qanungo cost` (qanungo #12) is the second lane over the same slice: the same mirror,
+//! the same blob cache, the same [`Window`] and its comparison window, a different fold and a
+//! different document.
+//!
+//! Everything both commands need to reach the archive lives in [`ArchiveArgs`] and is flattened
+//! into each of them, so a flag means the same thing wherever it is typed and a third lane
+//! inherits it by declaring one field.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -30,14 +36,14 @@ pub struct Cli {
 pub enum Command {
     /// Fold recent archived sessions into a Markdown coaching report on stdout.
     Report(ReportArgs),
+    /// Fold recent archived sessions into a Markdown token/cost breakdown on stdout.
+    Cost(CostArgs),
 }
 
+/// How to reach the archive, shared by every lane. Flattened rather than repeated so
+/// `--patwari-url` cannot come to mean two slightly different things in two subcommands.
 #[derive(Debug, Args)]
-pub struct ReportArgs {
-    /// How far back to report, as `<count><unit>` with unit `h`, `d`, or `w`.
-    #[arg(long = "last", default_value = "30d", value_parser = parse_window)]
-    pub last: Window,
-
+pub struct ArchiveArgs {
     /// Base URL of the Patwari archive server.
     #[arg(long = "patwari-url", env = "PATWARI_URL", default_value = DEFAULT_PATWARI_URL)]
     pub patwari_url: String,
@@ -52,6 +58,29 @@ pub struct ReportArgs {
     /// report faster — it starves the archive's other readers.
     #[arg(long, default_value_t = crate::sync::DEFAULT_CONCURRENCY, value_parser = parse_concurrency)]
     pub concurrency: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct ReportArgs {
+    /// How far back to report, as `<count><unit>` with unit `h`, `d`, or `w`.
+    #[arg(long = "last", default_value = "30d", value_parser = parse_window)]
+    pub last: Window,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct CostArgs {
+    /// How far back to price, as `<count><unit>` with unit `h`, `d`, or `w`. The default is a
+    /// quarter, spelled `12w`: qanungo #12 asks for "3m", and the window grammar deliberately has
+    /// no month unit — `m` reads as either minutes or months, and a coaching window that could be
+    /// misread by a factor of forty thousand is worse than one that has to be spelled in weeks.
+    #[arg(long = "last", default_value = "12w", value_parser = parse_window)]
+    pub last: Window,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
 }
 
 /// A report window, kept in the spelling the operator typed so the report can echo it back.
@@ -185,15 +214,58 @@ mod tests {
         for bad in ["0", "9", "64", "-1", "many"] {
             assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
         }
-        assert!(Cli::try_parse_from(["qanungo", "report", "--concurrency", "64"]).is_err());
+        for command in ["report", "cost"] {
+            assert!(Cli::try_parse_from(["qanungo", command, "--concurrency", "64"]).is_err());
+        }
     }
 
     #[test]
     fn report_defaults_to_the_lan_archive_over_thirty_days() {
-        let Command::Report(args) = Cli::parse_from(["qanungo", "report"]).command;
+        let Command::Report(args) = Cli::parse_from(["qanungo", "report"]).command else {
+            panic!("`report` parses as the report command");
+        };
         assert_eq!(args.last.to_string(), "30d");
-        assert_eq!(args.patwari_url, DEFAULT_PATWARI_URL);
-        assert_eq!(args.concurrency, crate::sync::DEFAULT_CONCURRENCY);
-        assert!(args.cache_dir.is_none());
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
+        assert!(args.archive.cache_dir.is_none());
+    }
+
+    /// The cost lane's default is a quarter spelled in the units the grammar actually has. The
+    /// month unit the issue asked for is *not* accepted, here as anywhere else: `12w` is a window
+    /// a reader can only read one way.
+    #[test]
+    fn cost_defaults_to_a_quarter_spelled_in_weeks() {
+        let Command::Cost(args) = Cli::parse_from(["qanungo", "cost"]).command else {
+            panic!("`cost` parses as the cost command");
+        };
+        assert_eq!(args.last.to_string(), "12w");
+        assert_eq!(args.last.delta(), TimeDelta::weeks(12));
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
+        assert!(Cli::try_parse_from(["qanungo", "cost", "--last", "3m"]).is_err());
+    }
+
+    /// Both lanes reach the archive through the same flattened arguments, so a flag means the
+    /// same thing wherever it is typed.
+    #[test]
+    fn every_lane_takes_the_same_archive_arguments() {
+        let arguments = ["--patwari-url", "http://127.0.0.1:9", "--concurrency", "2"];
+        let report = Cli::parse_from(
+            ["qanungo", "report"]
+                .into_iter()
+                .chain(arguments)
+                .collect::<Vec<_>>(),
+        );
+        let cost = Cli::parse_from(
+            ["qanungo", "cost"]
+                .into_iter()
+                .chain(arguments)
+                .collect::<Vec<_>>(),
+        );
+        let (Command::Report(report), Command::Cost(cost)) = (report.command, cost.command) else {
+            panic!("each subcommand parses as itself");
+        };
+        assert_eq!(report.archive.patwari_url, cost.archive.patwari_url);
+        assert_eq!(report.archive.concurrency, cost.archive.concurrency);
     }
 }

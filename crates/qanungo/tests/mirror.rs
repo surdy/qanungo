@@ -83,6 +83,10 @@ struct ArchivedSession {
     /// snapshots by. Distinct per snapshot so the ordering is a fact about the data rather than
     /// about the order the fixtures happen to be declared in.
     completed_at: String,
+    /// The repository the archive projects onto the session row, as Patwari's own
+    /// `latest_snapshot.repository` does. `None` serves a JSON `null`, which is the ordinary
+    /// state for a session captured outside a checkout.
+    repository: Option<&'static str>,
     corruption: Corruption,
 }
 
@@ -111,6 +115,7 @@ impl ArchivedSession {
             has_transcript: true,
             listed: true,
             completed_at: "2026-08-10T10:00:00.000Z".to_owned(),
+            repository: None,
             corruption: Corruption::None,
         }
     }
@@ -340,7 +345,7 @@ fn session_page(sessions: &[ArchivedSession], query: &str) -> String {
                 r#"{{"session_id":"{}","source_agent":"{}","source_session_id":"harness-{}",
                     "created_at":"2026-08-10T09:00:00.000Z","updated_at":"2026-08-10T10:00:00.000Z",
                     "latest_snapshot":{{"snapshot_id":"{}","completed_at":"{}",
-                    "project":null,"repository":null,"branch":null,"source_agent_version":null,
+                    "project":null,"repository":{},"branch":null,"source_agent_version":null,
                     "artifact_set_version":{},"snapshot_url":"/api/v1/snapshots/{}",
                     "manifest_url":"/api/v1/snapshots/{}/manifest"}},
                     "captures_url":"/api/v1/sessions/{}/captures",
@@ -350,6 +355,9 @@ fn session_page(sessions: &[ArchivedSession], query: &str) -> String {
                 session.session_id,
                 session.snapshot_id,
                 session.completed_at,
+                session
+                    .repository
+                    .map_or_else(|| "null".to_owned(), |name| format!("\"{name}\"")),
                 session.artifact_set_version,
                 session.snapshot_id,
                 session.snapshot_id,
@@ -506,6 +514,19 @@ const TRANSCRIPT: &str = concat!(
     r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-10T09:01:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
     "\n",
     r#"{"type":"user","uuid":"r1","timestamp":"2026-08-10T09:01:30.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"out","is_error":false}]}}"#,
+    "\n",
+);
+
+/// A transcript whose one billed API message reaches it as **two** records repeating the same
+/// `usage` verbatim — the shape the cost lane's deduplication exists for, exercised end to end
+/// rather than only in the fold's own tests. One million output tokens of Opus 5 is $25.00 at the
+/// committed table; summed per record it would read $50.00.
+const BILLING_TRANSCRIPT: &str = concat!(
+    r#"{"type":"user","uuid":"u1","timestamp":"2026-08-10T09:00:00.000Z","message":{"role":"user","content":"do the thing"}}"#,
+    "\n",
+    r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-10T09:01:00.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"on it"}],"usage":{"input_tokens":0,"output_tokens":1000000,"service_tier":"standard"}}}"#,
+    "\n",
+    r#"{"type":"assistant","uuid":"a2","timestamp":"2026-08-10T09:01:01.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":0,"output_tokens":1000000,"service_tier":"standard"}}}"#,
     "\n",
 );
 
@@ -1167,6 +1188,97 @@ fn the_report_command_runs_end_to_end_against_the_archive() {
     assert!(markdown.contains("cache 0 hits / 1 misses"));
     // Nothing in a three-record session crosses a threshold.
     assert!(markdown.contains("Nothing crossed a rule threshold"));
+}
+
+/// The context Patwari projects onto a session row is the only place the cost lane can learn
+/// which repository the money was spent in, so it has to survive the mirror rather than being
+/// re-derived from a snapshot that may not be the one the window selected.
+#[test]
+fn the_projected_repository_travels_with_the_mirrored_session() {
+    let mut with_repository = ArchivedSession::claude(70, TRANSCRIPT, "identity");
+    with_repository.repository = Some("surdy/qanungo");
+    let without = ArchivedSession::claude(71, OTHER_TRANSCRIPT, "identity");
+    let (base, _requests) = spawn_archive(vec![with_repository, without]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    assert_eq!(mirror.sessions.len(), 2);
+    assert_eq!(
+        mirror.sessions[0].repository.as_deref(),
+        Some("surdy/qanungo")
+    );
+    assert_eq!(
+        mirror.sessions[1].repository, None,
+        "a null projection is no repository, not an error",
+    );
+}
+
+/// The cost lane end to end: the binary lists the window, mirrors the transcript, deduplicates
+/// the split message, prices it against the committed table, and attributes it to the repository
+/// the archive projected.
+#[test]
+fn the_cost_command_runs_end_to_end_against_the_archive() {
+    let mut session = ArchivedSession::claude(72, BILLING_TRANSCRIPT, "zstd");
+    session.repository = Some("surdy/qanungo");
+    let (base, _requests) = spawn_archive(vec![session]);
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_qanungo"))
+        .args(["cost", "--last", "12w", "--patwari-url", &base])
+        .arg("--cache-dir")
+        .arg(directory.path().join("qanungo"))
+        .env_remove("PATWARI_URL")
+        .output()
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let markdown = String::from_utf8(output.stdout).unwrap();
+    assert!(markdown.starts_with("# Cost report — last 12w"));
+    assert!(markdown.contains("**1 sessions** — 1 priced in dollars (claude-code)"));
+    assert!(
+        markdown.contains("**$25.00** across 1 sessions and 1 billed messages"),
+        "one message, not two records: {markdown}"
+    );
+    assert!(
+        markdown.contains("| `claude-opus-5` | 1 | 0 | 1.0M | 0 | 0 | 0 | $25.00 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| `surdy/qanungo` | 1 | 1.0M | $25.00 |"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("_Instrumentation —"), "{markdown}");
+    assert!(markdown.contains("price table 2026-08-23"), "{markdown}");
+    assert!(markdown.contains("cache 0 hits / 1 misses"), "{markdown}");
+    // Nothing in this session is unpriceable, so the flagged section is elided rather than
+    // printed as a row of zeroes.
+    assert!(!markdown.contains("## Unpriced / flagged"), "{markdown}");
+}
+
+#[test]
+fn the_cost_command_reports_an_empty_archive_cleanly() {
+    let (base, _requests) = spawn_archive(Vec::new());
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_qanungo"))
+        .args(["cost", "--patwari-url", &base])
+        .arg("--cache-dir")
+        .arg(directory.path().join("qanungo"))
+        .env_remove("PATWARI_URL")
+        .output()
+        .expect("the binary runs");
+    assert!(output.status.success());
+    let markdown = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        markdown.starts_with("# Cost report — last 12w"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("nothing to price yet"), "{markdown}");
+    assert!(markdown.contains("_Instrumentation —"), "{markdown}");
 }
 
 #[test]

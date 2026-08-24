@@ -155,6 +155,19 @@ pub struct ListedSession {
     /// Server-side completion time of the latest snapshot. This is *archive* time, not
     /// transcript time: it selects the window, while the metrics use record timestamps.
     pub completed_at: String,
+    /// The repository the archive recorded for that snapshot, when it recorded one.
+    ///
+    /// Optional in Patwari's own projection (`SessionLatestSnapshot.repository`, alongside
+    /// `project`, `branch`, and `source_agent_version`), so an absent or null value stays `None`
+    /// rather than failing the listing: a session captured outside a checkout genuinely has no
+    /// repository, and that is a fact about the session rather than a protocol error. Every
+    /// *required* field on this type keeps its protocol-error discipline unchanged.
+    ///
+    /// This is the projection's repository — the one on the session's latest snapshot — while
+    /// `source_agent` and the artifact contract are taken from whichever snapshot actually
+    /// carries the transcript. The two can differ for a session whose projection is degenerate,
+    /// and the honest reading is the one each field's own source states.
+    pub repository: Option<String>,
 }
 
 /// One entry in a session's snapshot listing: enough to ask for the snapshot itself, and the
@@ -650,6 +663,7 @@ fn listed_session(item: &Value) -> Result<ListedSession, PatwariError> {
         completed_at: nested_str(item, &["latest_snapshot", "completed_at"]).ok_or_else(|| {
             PatwariError::Protocol("session missing latest_snapshot.completed_at".to_owned())
         })?,
+        repository: nested_str(item, &["latest_snapshot", "repository"]),
     })
 }
 
@@ -857,11 +871,46 @@ mod tests {
             "latest_snapshot": {
                 "snapshot_id": "22222222-2222-4222-8222-222222222222",
                 "completed_at": "2026-08-16T10:00:00.000Z",
+                "repository": "surdy/qanungo",
             },
         });
         let session = listed_session(&item).unwrap();
         assert_eq!(session.source_agent, "claude-code");
         assert_eq!(session.snapshot_id, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(session.repository.as_deref(), Some("surdy/qanungo"));
+    }
+
+    /// The projection's context fields are optional in Patwari's own contract, so a session
+    /// captured outside a checkout reads as having no repository rather than failing the listing
+    /// that every other session in the window is in.
+    #[test]
+    fn an_absent_repository_is_a_session_state_and_not_a_protocol_error() {
+        for latest in [
+            serde_json::json!({
+                "snapshot_id": "2".repeat(32),
+                "completed_at": "2026-08-16T10:00:00.000Z",
+            }),
+            serde_json::json!({
+                "snapshot_id": "2".repeat(32),
+                "completed_at": "2026-08-16T10:00:00.000Z",
+                "repository": serde_json::Value::Null,
+            }),
+            // Not a string at all: still a session with no repository this build will read,
+            // rather than a guess at what the archive meant.
+            serde_json::json!({
+                "snapshot_id": "2".repeat(32),
+                "completed_at": "2026-08-16T10:00:00.000Z",
+                "repository": 7,
+            }),
+        ] {
+            let item = serde_json::json!({
+                "session_id": "1".repeat(32),
+                "source_agent": "claude-code",
+                "latest_snapshot": latest,
+            });
+            let session = listed_session(&item).expect("the required fields are all present");
+            assert_eq!(session.repository, None);
+        }
     }
 
     #[test]

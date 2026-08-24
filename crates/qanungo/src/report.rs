@@ -670,7 +670,7 @@ impl Report<'_> {
 /// inferred from the archive's own clock, and it is not guessed from a hostname: a late-evening
 /// session west of Greenwich lands on the following UTC day, and the report would rather be
 /// visibly off by a day than invisibly wrong about a timezone.
-fn stamp(at: DateTime<Utc>) -> String {
+pub(crate) fn stamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -715,7 +715,11 @@ fn arrow(now: u8, before: Option<u8>) -> String {
 }
 
 /// A metric's movement, on the same rule: no reading on either side, no arrow.
-fn change(now: Option<f64>, before: Option<f64>, render: fn(f64) -> String) -> String {
+///
+/// Shared with [`crate::cost_report`], which draws its window-over-window delta on exactly this
+/// rule — a total that moved is an arrow, a total the other window could not measure is a dash,
+/// and a move too small for the renderer to show is flat.
+pub(crate) fn change(now: Option<f64>, before: Option<f64>, render: fn(f64) -> String) -> String {
     let (Some(now), Some(before)) = (now, before) else {
         return "—".to_owned();
     };
@@ -792,7 +796,10 @@ mod tests {
         use clap::Parser;
 
         let crate::cli::Command::Report(args) =
-            crate::cli::Cli::parse_from(["qanungo", "report", "--last", "7d"]).command;
+            crate::cli::Cli::parse_from(["qanungo", "report", "--last", "7d"]).command
+        else {
+            panic!("`report` parses as the report command");
+        };
         args.last
     }
 

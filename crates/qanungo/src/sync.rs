@@ -62,6 +62,12 @@ pub struct MirroredSession {
     /// the archive stated a time this build cannot parse, which places the session nowhere and is
     /// reported as a gap rather than guessed into a window.
     pub archived_at: Option<DateTime<Utc>>,
+    /// The repository the archive recorded for the snapshot it listed this session by, when it
+    /// recorded one. Carried from the listing rather than re-derived, on the same reasoning as
+    /// [`MirroredSession::archived_at`]: it describes the row the window selected. `None` is a
+    /// real state — a session captured outside a checkout — and the cost lane gives it its own
+    /// row rather than merging it into a named repository's.
+    pub repository: Option<String>,
 }
 
 /// Snapshots of one session this client will look through when its `latest_snapshot` turns out
@@ -235,6 +241,7 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
         // session is placed in is decided by the same timestamp that put it in the listing at all.
         // A fallback sibling's own completion time would be a different clock reading.
         archived_at: parse_archive_time(&session.completed_at),
+        repository: session.repository.clone(),
     };
 
     if cache.contains(&mirrored.source_hash) {

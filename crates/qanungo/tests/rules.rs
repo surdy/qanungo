@@ -333,7 +333,10 @@ fn a_retry_loop_report_names_no_command_it_counted() {
 }
 
 fn render(sessions: &[SessionMetrics], findings: &[Finding]) -> String {
-    let Command::Report(args) = Cli::parse_from(["qanungo", "report", "--last", "30d"]).command;
+    let Command::Report(args) = Cli::parse_from(["qanungo", "report", "--last", "30d"]).command
+    else {
+        panic!("`report` parses as the report command");
+    };
     let window: Window = args.last;
     let instrumentation = Instrumentation {
         sync: SyncStats::default(),

@@ -33,14 +33,40 @@
 //! history with the *current* rule pack rather than reading frozen scores back (qanungo ADR 0001),
 //! and stamps the pack's digest into the footer so two reports can tell whether they are
 //! comparable at all. A lane no typed signal feeds is never scored — see [`scoring`].
+//!
+//! # The cost lane (qanungo #12)
+//!
+//! ```text
+//! qanungo cost --last 12w
+//! ```
+//!
+//! is the second lane over the same spine: the same mirror, the same blob cache, the same window
+//! pair, a different fold ([`cost`]), a static date-versioned price table ([`pricing`]), and its
+//! own document ([`cost_report`]). Three of its properties are the whole of its honesty:
+//!
+//! - **Deduplicate before summing.** One API message reaches a transcript as several records
+//!   repeating its usage verbatim; summing records over-counts output tokens 2.6-fold. The fold
+//!   counts distinct message ids and reports how many records that dropped.
+//! - **Price what is priceable, and say what is not.** Dollars are claimed for claude-code
+//!   sessions only, at Anthropic API *list* prices, from rows effective at each session's archive
+//!   time. A model with no row, an unrecognized billing modifier, a cache write with no tier, and
+//!   claude-code's own `<synthetic>` placeholder each land in their own flagged line with tokens
+//!   shown and no dollars invented. Copilot gets token volumes and no money at all, because its
+//!   billing regime is not recoverable from a transcript.
+//! - **Same redaction line.** Aggregates, plus the model, modifier, and repository identifiers the
+//!   archive itself recorded — clamped on the way out. No transcript content, by construction: the
+//!   cost fold never reads a record's classification at all.
 
 pub mod cache;
 pub mod cli;
 pub mod command;
+pub mod cost;
+pub mod cost_report;
 pub mod format;
 pub mod http;
 pub mod metrics;
 pub mod patwari;
+pub mod pricing;
 pub mod report;
 pub mod rules;
 pub mod scoring;

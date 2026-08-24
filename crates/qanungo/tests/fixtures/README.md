@@ -46,3 +46,26 @@ retry fixture the repeated command itself). Two redaction tests fold them, rende
 and assert that not one of those tokens survives into the Markdown — the second exists because the
 churn fold is the first metric that compares transcript *content*, and the report must still be
 able to say a command ran six times without saying which command it was.
+
+## `cost/`
+
+Synthesized here for the cost lane (qanungo #12), because none of the fixtures above records a
+single token figure — the munshi ones predate `assistant_meta` entirely, and the rules ones are
+built around timestamps and tool outcomes.
+
+| File | Shape | Pins |
+| --- | --- | --- |
+| `claude-billing.jsonl` | 9 records, 5 message ids: one API message split across **3** records repeating its `usage` verbatim, a second model, a fast-mode message, a `<synthetic>` placeholder, and a model no price table has heard of | deduplication, per-tier cache pricing, the fast tier, the unbilled line, the unpriced fallthrough |
+| `copilot-billing.jsonl` | 3 `assistant.message` records across two models, each with `model` and `outputTokens` and nothing else | the token-only path: volumes by model, no dollars anywhere |
+
+The figures are round on purpose — 200k input, 100k output, 400k of 1-hour cache write, 1M of
+cache read — so a rendered dollar can be checked against `docs/pricing-sources-2026-08-23.md` by
+eye rather than by rerunning the arithmetic the code under test just did. The claude fixture's
+message ids are also the whole point of two assertions at once: the fold must count **5** messages
+across **9** records, and the report must never print one of those ids.
+
+Both files carry `CANARY_*` tokens in every free-text field, including the `cwd` and `gitBranch`
+envelope keys, and a redaction test renders a full cost report and asserts that not one of them
+survives. That test is a stronger claim here than in `rules/`: the cost fold never reads a
+record's classification at all, so the canaries have no path to the document even in principle,
+and the test exists to keep it that way.

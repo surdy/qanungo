@@ -65,17 +65,43 @@ digest into the footer, so two reports compare only when that stamp matches. Eve
 nothing in munshi types the capture machine's local offset yet, so the report says UTC rather than
 guessing one.
 
+**The cost lane** ([#12](https://github.com/surdy/qanungo/issues/12)) is the second lane over the
+same slice: `qanungo cost` folds the per-message model and token usage `munshi-transcript` types
+(munshi#77) into a token/cost breakdown by model and by repository. Three things make it honest.
+It **deduplicates by `message_id` before summing** — one API message reaches a transcript as
+several records repeating its `usage` verbatim, and summing records over-counts output tokens
+2.6-fold. It prices from a **static, date-versioned table** whose provenance is committed beside it
+([`docs/pricing-sources-2026-08-23.md`](docs/pricing-sources-2026-08-23.md)), selecting the row
+effective at each session's archive time, with cache writes priced from the per-tier buckets
+rather than from the undifferentiated total (the two TTLs bill at different multiples, and
+claude-code uses the 1-hour cache exclusively). And it **says what it cannot price**: a model with
+no row, an unrecognized billing modifier, a cache write with no tier, and Claude Code's own
+`<synthetic>` placeholder each get their own flagged line, tokens shown and no dollars invented.
+Dollars are Anthropic API **list** prices for claude-code sessions only — the archive does not know
+the account's billing plan — and Copilot sessions get output-token volumes and no money at all,
+because a transcript cannot say which of Copilot's two billing regimes the account was on. The
+by-machine cut the issue asks for is deferred rather than faked: Patwari's session projection
+carries `repository` and no hostname.
+
 ```sh
 cargo run -- report --last 30d                       # the production archive on the LAN
 cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
+cargo run -- cost --last 12w                         # a quarter, in the units the grammar has
 ```
+
+The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
+minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default.
 
 `--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the transcript cache, which
 otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` /
-`0o600`. The report renders **aggregates, tool names, and content hashes only** — never transcript
-content. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
+`0o600`. Both flags work on either lane. The coaching report renders **aggregates, tool names, and
+content hashes only**, and the cost report adds exactly the model, billing-modifier, and repository
+identifiers the archive itself recorded, each clamped on the way out — never transcript content, in
+either. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
 constants in `crates/qanungo/src/scoring.rs` are the same kind of knob — all explicitly arbitrary
-until the footer's fold-cost and rule-firing data say otherwise.
+until the footer's fold-cost and rule-firing data say otherwise. The prices in
+`crates/qanungo/src/pricing.rs` are the opposite kind of number: not a knob at all, but a sourced
+figure with a date, changed only by adding a row.
 
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the dashboard (#5), the
 narrator (#6). Full research + rationale: `~/repos/research/ai-coach/`. See
