@@ -524,9 +524,9 @@ const TRANSCRIPT: &str = concat!(
 const BILLING_TRANSCRIPT: &str = concat!(
     r#"{"type":"user","uuid":"u1","timestamp":"2026-08-10T09:00:00.000Z","message":{"role":"user","content":"do the thing"}}"#,
     "\n",
-    r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-10T09:01:00.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"on it"}],"usage":{"input_tokens":0,"output_tokens":1000000,"service_tier":"standard"}}}"#,
+    r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-10T09:01:00.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"on it"}],"usage":{"input_tokens":0,"output_tokens":1000000,"service_tier":"standard","inference_geo":"not_available"}}}"#,
     "\n",
-    r#"{"type":"assistant","uuid":"a2","timestamp":"2026-08-10T09:01:01.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":0,"output_tokens":1000000,"service_tier":"standard"}}}"#,
+    r#"{"type":"assistant","uuid":"a2","timestamp":"2026-08-10T09:01:01.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":0,"output_tokens":1000000,"service_tier":"standard","inference_geo":"not_available"}}}"#,
     "\n",
 );
 

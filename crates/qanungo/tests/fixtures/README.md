@@ -58,6 +58,12 @@ built around timestamps and tool outcomes.
 | `claude-billing.jsonl` | 9 records, 5 message ids: one API message split across **3** records repeating its `usage` verbatim, a second model, a fast-mode message, a `<synthetic>` placeholder, and a model no price table has heard of | deduplication, per-tier cache pricing, the fast tier, the unbilled line, the unpriced fallthrough |
 | `copilot-billing.jsonl` | 3 `assistant.message` records across two models, each with `model` and `outputTokens` and nothing else | the token-only path: volumes by model, no dollars anywhere |
 
+The billed records carry `"inference_geo":"not_available"`, which is what the archive actually
+records on 61,122 of its 61,184 usage records — the API stating that no geo-routing premium
+applied. It is the base-rate case, so the fixture's dollars are the same as if the field were
+absent; the fixture spells it out anyway, because reading it as an unknown region is what priced
+the entire first production run at zero.
+
 The figures are round on purpose — 200k input, 100k output, 400k of 1-hour cache write, 1M of
 cache read — so a rendered dollar can be checked against `docs/pricing-sources-2026-08-23.md` by
 eye rather than by rerunning the arithmetic the code under test just did. The claude fixture's

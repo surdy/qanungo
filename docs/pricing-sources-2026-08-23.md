@@ -36,6 +36,14 @@ Versioning notes (documented history only):
   Haiku 4.5 is 200K-only. The old 2x >200K premium applied only to Sonnet 4/4.5 1M beta — absent
   from this archive.
 - Other modifiers only if flagged in usage: inference_geo "us" = 1.1x (Claude 4.6+); Batch = 0.5x.
+- **inference_geo, measured on the archive 2026-08-23**: of the same 61,184 claude usage records,
+  61,122 read `not_available` and the remaining 62 record no readable value; `"us"` never occurs.
+  `not_available` is the API stating that **no geo-routing premium applied** — it is the field's
+  ordinary state and the base-rate case, NOT an unknown region. Reading it as one flagged 100% of
+  the first production run (311 sessions, 35,001 messages, 8.2B tokens) as unpriced, which is how
+  the misreading was caught. The 1.1x above therefore applies to a value this archive has never
+  held; keep it for correctness on `"us"` and keep flagging genuinely unrecognized regions, so a
+  new routing premium cannot be silently priced at base.
 - **Cache-write tier, measured on the archive 2026-08-23**: of 389.8M cache-write tokens across all
   61,184 claude usage records, ephemeral_1h = 389,777,788 and ephemeral_5m = 0 — claude-code uses
   the 1h cache exclusively. Cache writes MUST be priced from the promoted per-tier buckets

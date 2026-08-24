@@ -129,6 +129,42 @@ fn the_window_prices_each_model_at_its_committed_rates() {
     assert_eq!(totals.flagged.untiered_cache_writes, 0);
 }
 
+/// The archive's universal `inference_geo`, exercised the way it actually occurs. Every claude
+/// record in the fixture carries `not_available` — 61,122 of the archive's 61,184 usage records do
+/// — and it is the base-rate case, so the dollars are the same as if the field were absent and
+/// nothing is flagged for it. Reading it as an unknown region priced the first production run at
+/// zero across all 311 sessions, which is what this pins against.
+#[test]
+fn the_archives_own_inference_geo_prices_at_base_and_flags_nothing() {
+    let raw = std::fs::read_to_string(fixture("cost/claude-billing.jsonl")).unwrap();
+    assert!(
+        raw.contains(r#""inference_geo":"not_available""#),
+        "the fixture must carry the value the archive actually records",
+    );
+
+    let totals = CostTotals::fold(&[billing_session()]);
+    assert!(
+        (totals.priced.dollars - 18.00).abs() < 1e-9,
+        "un-routed usage prices at base: {totals:?}",
+    );
+    assert!(
+        !totals
+            .flagged
+            .unpriced
+            .keys()
+            .any(|reason| matches!(reason, Unpriced::InferenceGeo(_))),
+        "nothing about the region is unpriced: {:?}",
+        totals.flagged.unpriced,
+    );
+
+    let markdown = render(&totals);
+    assert!(
+        !markdown.contains("inference region"),
+        "no region flag reaches the document: {markdown}"
+    );
+    assert!(markdown.contains("**$18.00**"), "{markdown}");
+}
+
 /// The repository cut comes from Patwari's projection, not from anything in the transcript, so a
 /// session archived without one is its own row.
 #[test]

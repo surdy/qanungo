@@ -36,13 +36,15 @@
 //! - `speed` — fast mode bills the same model at a distinct, higher tier ([`Rates::fast`]). A
 //!   `fast` reading on a model with no fast row, or any spelling neither this build nor the
 //!   research file recognizes, leaves the usage unpriced rather than priced at the base rate.
-//! - `inference_geo` — `us` is a flat [`US_GEO_MULTIPLIER`] on every category, **but only for the
-//!   models the research file scopes it to** (it records the premium as "Claude 4.6+"). It is
-//!   therefore a per-row property, [`PriceRow::us_geo_multiplier`], and not a global constant:
-//!   this table holds a pre-4.6 model, and charging Haiku 4.5 a premium the source never
-//!   documents would be inventing a rate — the one thing this module exists not to do. A row with
-//!   no multiplier for the region, and any region this build does not recognize at all, leaves
-//!   the usage unpriced.
+//! - `inference_geo` — [`NO_GEO_ROUTING_INFERENCE_GEO`] (`not_available`), and the field being
+//!   absent, both mean the base rate: the API is stating that no geo-routing premium applied.
+//!   `us` is a flat [`US_GEO_MULTIPLIER`] on every category, **but only for the models the
+//!   research file scopes it to** (it records the premium as "Claude 4.6+"). That makes it a
+//!   per-row property, [`PriceRow::us_geo_multiplier`], and not a global constant: this table
+//!   holds a pre-4.6 model, and charging Haiku 4.5 a premium the source never documents would be
+//!   inventing a rate — the one thing this module exists not to do. A `us` reading against a row
+//!   with no multiplier, and any region this build does not recognize at all, leave the usage
+//!   unpriced.
 //! - `service_tier` — anything other than `standard` (or absent) is priced by a different
 //!   schedule (batch at 0.5x, priority at a premium), and this table holds none of them, so such
 //!   usage is unpriced.
@@ -71,6 +73,23 @@ pub const STANDARD_SPEED: &str = "standard";
 pub const STANDARD_SERVICE_TIER: &str = "standard";
 /// The `inference_geo` reading that carries [`US_GEO_MULTIPLIER`].
 pub const US_INFERENCE_GEO: &str = "us";
+
+/// The `inference_geo` reading that means **no geo routing applied**, and therefore the base
+/// rate — not an unknown region.
+///
+/// **Measured on the archive 2026-08-23**, and then confirmed by the cost lane's first production
+/// run: of the 61,184 claude usage records, 61,122 read `not_available` and the remaining 62
+/// record no readable value at all. `us` never occurs. This is the field's ordinary state rather
+/// than an edge case — it is the API saying the request was not geo-routed — so reading it as an
+/// unrecognized region flagged **100%** of 311 sessions, 35,001 messages and 8.2B tokens as
+/// unpriced, which is how the misreading was found.
+///
+/// Distinguishing it from an absent field would be a distinction without a rate: both say no
+/// premium applied, and neither selects [`PriceRow::us_geo_multiplier`], so a pre-4.6 row prices
+/// normally under either. A region this build has never heard of is still flagged — that rule is
+/// unchanged, and is what keeps a genuinely new routing premium from being silently priced at
+/// base.
+pub const NO_GEO_ROUTING_INFERENCE_GEO: &str = "not_available";
 
 /// US-only inference bills 1.1x on every token category, **for Claude 4.6 and later** (research
 /// file §1, "Other modifiers": `inference_geo "us" = 1.1x (Claude 4.6+)`).
@@ -366,7 +385,8 @@ pub fn price_for(
     // a row predating that qualifier has no documented rate for US-only inference at all, and
     // neither the base rate nor an undocumented premium would be an honest answer for it.
     let multiplier = match inference_geo {
-        None => 1.0,
+        // No geo routing, stated or unstated: the base rate, for every row.
+        None | Some(NO_GEO_ROUTING_INFERENCE_GEO) => 1.0,
         Some(US_INFERENCE_GEO) => match row.us_geo_multiplier {
             Some(multiplier) => multiplier,
             None => return Price::Unpriced(Unpriced::InferenceGeo(US_INFERENCE_GEO.to_owned())),
@@ -557,6 +577,40 @@ mod tests {
         );
     }
 
+    /// The archive's universal reading. `not_available` is the API saying no geo routing applied,
+    /// so it prices at base on every row — including the pre-4.6 one, which has no US premium to
+    /// decline. Treating it as an unknown region flagged the entire first production run.
+    #[test]
+    fn no_geo_routing_prices_at_base_on_every_row() {
+        let when = Some(at("2026-08-01T00:00:00Z"));
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            // Pre-4.6, and so carrying no US premium at all: "no routing applied" is still the
+            // base rate for it, because there is no premium in question.
+            "claude-haiku-4-5-20251001",
+        ] {
+            for geo in [None, Some(NO_GEO_ROUTING_INFERENCE_GEO)] {
+                let priced = price_for(Some(model), None, None, geo, when);
+                assert!(
+                    matches!(priced, Price::Priced { multiplier, .. } if multiplier == 1.0),
+                    "{model} at geo {geo:?}: {priced:?}",
+                );
+            }
+        }
+        // Absent and `not_available` are the same claim, so they must price identically.
+        assert_eq!(
+            price_for(Some("claude-opus-5"), None, None, None, when),
+            price_for(
+                Some("claude-opus-5"),
+                None,
+                None,
+                Some(NO_GEO_ROUTING_INFERENCE_GEO),
+                when,
+            ),
+        );
+    }
+
     #[test]
     fn us_inference_multiplies_every_category_and_an_unknown_region_prices_nothing() {
         let us = price_for(
@@ -572,16 +626,21 @@ mod tests {
         );
         assert!((dollars(1_000_000, 2.00, US_GEO_MULTIPLIER) - 2.20).abs() < 1e-9);
 
-        assert_eq!(
-            price_for(
-                Some("claude-sonnet-5"),
-                None,
-                None,
-                Some("moon"),
-                Some(at("2026-08-01T00:00:00Z")),
-            ),
-            Price::Unpriced(Unpriced::InferenceGeo("moon".to_owned())),
-        );
+        // A region this build has never heard of is still flagged, which is what keeps a new
+        // routing premium from being silently priced at base the way `not_available` now is.
+        for unknown in ["moon", "eu", "apac", "NOT_AVAILABLE"] {
+            assert_eq!(
+                price_for(
+                    Some("claude-sonnet-5"),
+                    None,
+                    None,
+                    Some(unknown),
+                    Some(at("2026-08-01T00:00:00Z")),
+                ),
+                Price::Unpriced(Unpriced::InferenceGeo(unknown.to_owned())),
+                "{unknown}",
+            );
+        }
     }
 
     /// The premium is scoped by its own source line — "Claude 4.6+" — so the one pre-4.6 row in
@@ -596,13 +655,15 @@ mod tests {
             price_for(Some(haiku), None, None, Some(US_INFERENCE_GEO), when),
             Price::Unpriced(Unpriced::InferenceGeo(US_INFERENCE_GEO.to_owned())),
         );
-        assert!(
-            matches!(
-                price_for(Some(haiku), None, None, None, when),
-                Price::Priced { multiplier, .. } if multiplier == 1.0,
-            ),
-            "a row with no region premium still prices ordinary usage",
-        );
+        for ordinary in [None, Some(NO_GEO_ROUTING_INFERENCE_GEO)] {
+            assert!(
+                matches!(
+                    price_for(Some(haiku), None, None, ordinary, when),
+                    Price::Priced { multiplier, .. } if multiplier == 1.0,
+                ),
+                "a row with no region premium still prices un-routed usage: {ordinary:?}",
+            );
+        }
 
         // The scoping is a property of the row, not of this test: exactly the rows the research
         // file calls 4.6+ carry the multiplier.
