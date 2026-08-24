@@ -25,7 +25,7 @@
 //!
 //! # The verified download
 //!
-//! [`ReadClient::download_transcript`] streams. The stored bytes are read off the socket a buffer
+//! [`ReadClient::download_artifact`] streams. The stored bytes are read off the socket a buffer
 //! at a time, hashed and counted as they arrive, decoded per the declared compression, and the
 //! recovered original bytes are hashed, counted, and written straight through to the caller's
 //! sink.
@@ -57,8 +57,11 @@
 //!   transfer aborts — mid-stream, before the excess is written anywhere. A zstd bomb and a
 //!   server that lies about a length both stop at the first byte past the promise, so neither can
 //!   spend memory or disk that was not declared up front.
-//! - **[`MAX_DECLARED_TRANSCRIPT_BYTES`] bounds the declarations.** A listing that claims an
-//!   absurd size is refused before a byte moves, purely so a lying archive cannot fill the disk.
+//! - **The caller's ceiling bounds the declarations.** A listing that claims an absurd size is
+//!   refused before a byte moves, purely so a lying archive cannot fill the disk. The ceiling is
+//!   an argument rather than a constant because the two artifacts this client fetches are four
+//!   orders of magnitude apart in plausible size: see [`MAX_DECLARED_TRANSCRIPT_BYTES`] and
+//!   [`MAX_DECLARED_SUMMARY_BYTES`].
 //!
 //! The declarations are worth trusting as bounds because the archive verified them at ingest and
 //! re-derives them from the canonical manifest on every read.
@@ -88,7 +91,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LISTING_PAGE_SIZE: usize = 100;
 /// Guards the pagination loop against a peer that never stops returning cursors.
 const MAX_LISTING_PAGES: usize = 10_000;
-/// Sanity ceiling on the sizes an artifact *declares*, in either its stored or its original form.
+/// Sanity ceiling on the sizes a *transcript* artifact declares, in either its stored or its
+/// original form.
 ///
 /// This is a disk-space guard, not a memory bound. The download streams, so a transcript costs
 /// the same fixed set of buffers however large it is (see the module docs); what this stops is a
@@ -96,6 +100,23 @@ const MAX_LISTING_PAGES: usize = 10_000;
 /// disagree with it. It is deliberately far above any plausible transcript — a coaching report
 /// should never see this fire, and if it does, the archive is wrong rather than the session long.
 pub const MAX_DECLARED_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The same guard for a `summary.md`, four orders of magnitude lower because a summary is four
+/// orders of magnitude smaller.
+///
+/// A summary is munshi's curated record of a session — a title, a goal, and five short lists — and
+/// the ones in this archive are single-digit kilobytes. Measured over the 104 summaries a `standup
+/// --last 7d` mirrored on 2026-08-24: 1.2 KB smallest, 5.3 KB median, 18.9 KB largest. A megabyte
+/// is fifty-fold headroom over the largest of those, so a `summary.md` over it is *suspect*: not a
+/// long session, but an artifact that is not what its logical path says it is.
+///
+/// It is not a bound the format guarantees. Munshi's own validation admits up to two hundred
+/// four-thousand-character items in each of five lists, so a summary that is pathological but
+/// perfectly valid could in principle declare several megabytes. That summary is refused here and
+/// named in the standup's Gaps section with the size it declared, which is the honest outcome:
+/// the reader learns the archive holds something this build would not fetch, rather than the run
+/// silently spending a hundredfold its expected disk on one row.
+pub const MAX_DECLARED_SUMMARY_BYTES: u64 = 1024 * 1024;
 /// Stored bytes read from the socket per pass. One of the fixed buffers a download's peak memory
 /// is made of; see the module docs for the rest.
 const TRANSFER_BUFFER_BYTES: usize = 256 * 1024;
@@ -119,6 +140,11 @@ const INVALID_ERROR_CODE: &str = "invalid-error-code";
 /// The reserved logical path of the raw transcript inside a Munshi artifact set (Patwari ADR
 /// 0005: artifact roles are conveyed by logical path alone).
 pub const TRANSCRIPT_LOGICAL_PATH: &str = "transcript.jsonl";
+
+/// The reserved logical path of the rendered session summary in the same artifact set (munshi ADR
+/// 0009/0010). Every snapshot carries one; it is the frontmatter-plus-Markdown record
+/// `munshi_transcript::parse_archive_markdown` reads back.
+pub const SUMMARY_LOGICAL_PATH: &str = "summary.md";
 
 #[derive(Debug, Error)]
 pub enum PatwariError {
@@ -191,9 +217,24 @@ impl SnapshotDetail {
     /// The artifact holding the raw transcript, when the set contains one. A snapshot without
     /// one is a real archive state (a summary-only capture), not an error.
     pub fn transcript(&self) -> Option<&ListedArtifact> {
+        self.artifact(TRANSCRIPT_LOGICAL_PATH)
+    }
+
+    /// The artifact holding the rendered session summary, when the set contains one.
+    ///
+    /// Absent is a real archive state here too, and the mirror image of the one above: the
+    /// backfill that produced summary-only snapshots (munshi #78) is precisely why the transcript
+    /// lanes look past a snapshot, and nothing rules out the other shape — a capture written
+    /// before the summary was rendered, or one whose summarizer never returned. The standup lane
+    /// therefore applies exactly the same sibling discipline, in the other direction.
+    pub fn summary(&self) -> Option<&ListedArtifact> {
+        self.artifact(SUMMARY_LOGICAL_PATH)
+    }
+
+    fn artifact(&self, logical_path: &str) -> Option<&ListedArtifact> {
         self.artifacts
             .iter()
-            .find(|artifact| artifact.logical_path == TRANSCRIPT_LOGICAL_PATH)
+            .find(|artifact| artifact.logical_path == logical_path)
     }
 }
 
@@ -335,8 +376,8 @@ impl ReadClient {
         })
     }
 
-    /// Streams one transcript artifact into `sink`, verifying every declaration the archive made
-    /// about it, and reports what actually moved.
+    /// Streams one artifact into `sink`, verifying every declaration the archive made about it,
+    /// and reports what actually moved.
     ///
     /// `sink` receives the *original* (decompressed) bytes, and receives them before they have
     /// been fully verified — the digests are only complete once the last byte is through. A
@@ -344,22 +385,30 @@ impl ReadClient {
     /// [`BlobCache::stage`](crate::cache::BlobCache::stage) exists precisely to make that
     /// discipline the default.
     ///
+    /// `declared_ceiling` is the largest size this caller will believe of *this* artifact, in
+    /// either its stored or its original form. It is a parameter rather than one constant because
+    /// the plausible size of an archived artifact is a property of what the artifact is: a
+    /// transcript may run to hundreds of megabytes ([`MAX_DECLARED_TRANSCRIPT_BYTES`]) while a
+    /// summary is kilobytes ([`MAX_DECLARED_SUMMARY_BYTES`]), and a single ceiling wide enough for
+    /// the first is no bound at all on the second.
+    ///
     /// # Errors
     ///
-    /// Returns [`PatwariError::DeclaredSizeRefused`] before any transfer when either declared
-    /// size is over [`MAX_DECLARED_TRANSCRIPT_BYTES`], and a [`PatwariError::Verification`] when
-    /// the transfer runs past a declared size or the transferred or recovered bytes do not hash
-    /// to what the archive declared.
-    pub fn download_transcript(
+    /// Returns [`PatwariError::DeclaredSizeRefused`] before any transfer when either declared size
+    /// is over `declared_ceiling`, and a [`PatwariError::Verification`] when the transfer runs past
+    /// a declared size or the transferred or recovered bytes do not hash to what the archive
+    /// declared.
+    pub fn download_artifact(
         &self,
         artifact: &ListedArtifact,
+        declared_ceiling: u64,
         sink: &mut impl Write,
     ) -> Result<DownloadReceipt, PatwariError> {
         for size_bytes in [artifact.stored_size_bytes, artifact.original_size_bytes] {
-            if size_bytes > MAX_DECLARED_TRANSCRIPT_BYTES {
+            if size_bytes > declared_ceiling {
                 return Err(PatwariError::DeclaredSizeRefused {
                     size_bytes,
-                    ceiling: MAX_DECLARED_TRANSCRIPT_BYTES,
+                    ceiling: declared_ceiling,
                 });
             }
         }
@@ -934,14 +983,14 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_transcript_by_its_reserved_logical_path() {
+    fn finds_each_artifact_by_its_reserved_logical_path() {
         let detail = SnapshotDetail {
             source_agent: "claude-code".to_owned(),
             artifact_set_version: 2,
             artifacts: vec![
                 ListedArtifact {
                     artifact_id: "a".to_owned(),
-                    logical_path: "summary.md".to_owned(),
+                    logical_path: SUMMARY_LOGICAL_PATH.to_owned(),
                     original_sha256: "aa".to_owned(),
                     original_size_bytes: 1,
                     stored_size_bytes: 1,
@@ -958,11 +1007,22 @@ mod tests {
             ],
         };
         assert_eq!(detail.transcript().unwrap().artifact_id, "b");
+        assert_eq!(detail.summary().unwrap().artifact_id, "a");
 
+        // The two degenerate shapes, one per lane: a summary-only capture has nothing for the
+        // transcript lanes, and a transcript-only one has nothing for the standup lane.
         let summary_only = SnapshotDetail {
             artifacts: detail.artifacts[..1].to_vec(),
-            ..detail
+            ..detail.clone()
         };
         assert!(summary_only.transcript().is_none());
+        assert!(summary_only.summary().is_some());
+
+        let transcript_only = SnapshotDetail {
+            artifacts: detail.artifacts[1..].to_vec(),
+            ..detail
+        };
+        assert!(transcript_only.summary().is_none());
+        assert!(transcript_only.transcript().is_some());
     }
 }

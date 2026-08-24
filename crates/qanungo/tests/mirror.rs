@@ -13,8 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use qanungo::cache::BlobCache;
 use qanungo::metrics;
-use qanungo::patwari::{MAX_DECLARED_TRANSCRIPT_BYTES, ReadClient, sha256_hex};
-use qanungo::sync::{self, SkipReason};
+use qanungo::patwari::{
+    MAX_DECLARED_SUMMARY_BYTES, MAX_DECLARED_TRANSCRIPT_BYTES, ReadClient, sha256_hex,
+};
+use qanungo::sync::{self, Artifact, SkipReason};
 
 // ---------------------------------------------------------------------------
 // The stand-in archive
@@ -75,6 +77,16 @@ struct ArchivedSession {
     wire_chunks: Option<usize>,
     /// A summary-only capture has no `transcript.jsonl` artifact at all.
     has_transcript: bool,
+    /// The `summary.md` this snapshot carries, if it carries one. Served `identity` and never
+    /// corrupted: what the summary lane's tests are about is *which* artifact and *which*
+    /// snapshot, and the verified-download machinery is already exercised to destruction above.
+    summary: Option<Vec<u8>>,
+    /// The artifact id the summary is served under — distinct from the transcript's, because a
+    /// snapshot carrying both offers the client two artifacts to choose between and choosing is
+    /// the thing under test.
+    summary_artifact_id: String,
+    /// The `original_size_bytes` the summary *declares*, when that is deliberately not the truth.
+    declared_summary_bytes: Option<u64>,
     /// Whether the session listing projects *this* snapshot as the session's latest. A fixture
     /// with `false` is an older snapshot of some other fixture's session: reachable through
     /// `/api/v1/sessions/{id}/snapshots` and by its own id, but never the projection.
@@ -113,6 +125,9 @@ impl ArchivedSession {
             declared_original_bytes: None,
             wire_chunks: None,
             has_transcript: true,
+            summary: None,
+            summary_artifact_id: format!("{:02x}", index.wrapping_add(150)).repeat(16),
+            declared_summary_bytes: None,
             listed: true,
             completed_at: "2026-08-10T10:00:00.000Z".to_owned(),
             repository: None,
@@ -160,6 +175,19 @@ impl ArchivedSession {
             Corruption::HeaderSizeDisagreement => self.declared_original_bytes() + 1,
             _ => self.declared_original_bytes(),
         }
+    }
+
+    /// Gives this snapshot a `summary.md` beside whatever else it carries.
+    fn with_summary(mut self, summary: &str) -> Self {
+        self.summary = Some(summary.as_bytes().to_vec());
+        self
+    }
+
+    /// Drops the transcript, leaving a summary-only capture — the shape the 2026-07-28 backfill
+    /// wrote, and the one the transcript lanes look past.
+    fn without_transcript(mut self) -> Self {
+        self.has_transcript = false;
+        self
     }
 
     /// The `original_sha256` the *listing* advertises.
@@ -274,7 +302,13 @@ fn serve(mut stream: TcpStream, sessions: &[ArchivedSession], recorded: &Mutex<R
     {
         match sessions.iter().find(|session| session.artifact_id == id) {
             Some(session) => content_response(session),
-            None => not_found(),
+            None => match sessions
+                .iter()
+                .find(|session| session.summary_artifact_id == id)
+            {
+                Some(session) => summary_content_response(session),
+                None => not_found(),
+            },
         }
     } else {
         not_found()
@@ -374,14 +408,15 @@ fn session_page(sessions: &[ArchivedSession], query: &str) -> String {
 
 fn snapshot_document(session: &ArchivedSession) -> String {
     let stored = session.stored();
-    let artifacts = if session.has_transcript {
-        format!(
-            r#"[{{"artifact_id":"{}","artifact_index":0,"logical_path":"transcript.jsonl",
+    let mut listed: Vec<String> = Vec::new();
+    if session.has_transcript {
+        listed.push(format!(
+            r#"{{"artifact_id":"{}","artifact_index":0,"logical_path":"transcript.jsonl",
                 "media_type":"application/jsonl","original_size_bytes":{},
                 "original_sha256":"sha256:{}","stored_size_bytes":{},
                 "stored_sha256":"sha256:{}","compression":"{}",
                 "metadata_url":"/api/v1/artifacts/{}",
-                "content_url":"/api/v1/artifacts/{}/content"}}]"#,
+                "content_url":"/api/v1/artifacts/{}/content"}}"#,
             session.artifact_id,
             session.declared_original_bytes(),
             session.listed_original_sha256(),
@@ -390,10 +425,30 @@ fn snapshot_document(session: &ArchivedSession) -> String {
             session.compression,
             session.artifact_id,
             session.artifact_id,
-        )
-    } else {
-        "[]".to_owned()
-    };
+        ));
+    }
+    if let Some(summary) = &session.summary {
+        listed.push(format!(
+            r#"{{"artifact_id":"{}","artifact_index":1,"logical_path":"summary.md",
+                "media_type":"text/markdown","original_size_bytes":{},
+                "original_sha256":"sha256:{}","stored_size_bytes":{},
+                "stored_sha256":"sha256:{}","compression":"identity",
+                "metadata_url":"/api/v1/artifacts/{}",
+                "content_url":"/api/v1/artifacts/{}/content"}}"#,
+            session.summary_artifact_id,
+            session
+                .declared_summary_bytes
+                .unwrap_or(summary.len() as u64),
+            sha256_hex(summary),
+            session
+                .declared_summary_bytes
+                .unwrap_or(summary.len() as u64),
+            sha256_hex(summary),
+            session.summary_artifact_id,
+            session.summary_artifact_id,
+        ));
+    }
+    let artifacts = format!("[{}]", listed.join(","));
     format!(
         r#"{{"snapshot_id":"{}","session_id":"{}","snapshot_fingerprint":"sha256:{}",
             "manifest_id":"{}","manifest_sha256":"sha256:{}",
@@ -493,6 +548,30 @@ fn content_response(session: &ArchivedSession) -> Vec<u8> {
     response
 }
 
+/// A `summary.md`, served honestly: `identity`, `Content-Length`, and headers that agree with the
+/// listing unless the fixture deliberately inflated the declaration.
+fn summary_content_response(session: &ArchivedSession) -> Vec<u8> {
+    let summary = session.summary.as_deref().unwrap_or_default();
+    let declared = session
+        .declared_summary_bytes
+        .unwrap_or(summary.len() as u64);
+    let digest = sha256_hex(summary);
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/markdown\r\n\
+         Content-Length: {}\r\n\
+         x-patwari-compression: identity\r\n\
+         x-patwari-original-size-bytes: {declared}\r\n\
+         x-patwari-original-sha256: sha256:{digest}\r\n\
+         x-patwari-stored-size-bytes: {declared}\r\n\
+         x-patwari-stored-sha256: sha256:{digest}\r\n\r\n",
+        summary.len(),
+    )
+    .into_bytes();
+    response.extend_from_slice(summary);
+    response
+}
+
 fn not_found() -> Vec<u8> {
     let body = r#"{"error":{"code":"not_found","message":"not found"}}"#;
     let mut response = format!(
@@ -535,6 +614,15 @@ const OTHER_TRANSCRIPT: &str = concat!(
     "\n",
 );
 
+/// Two real `summary.md` records, shared with `tests/standup.rs`. The mirror never parses one —
+/// it moves bytes under a digest — but a fixture that is not a real archive record would leave the
+/// end-to-end run below testing the stand-in rather than the lane.
+const SUMMARY: &str = include_str!("fixtures/standup/qanungo-scoring.md");
+/// The two ceilings are a pair, and the summary one is the tighter: raising it past the
+/// transcript's would make the summary lane's bound meaningless without failing anything else.
+const _: () = assert!(MAX_DECLARED_SUMMARY_BYTES < MAX_DECLARED_TRANSCRIPT_BYTES);
+const OTHER_SUMMARY: &str = include_str!("fixtures/standup/munshi-tombstone.md");
+
 fn cache() -> (tempfile::TempDir, BlobCache) {
     let directory = tempfile::tempdir().unwrap();
     let cache = BlobCache::open(directory.path().join("qanungo")).unwrap();
@@ -547,7 +635,14 @@ fn an_empty_archive_mirrors_cleanly() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 4).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        4,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     assert!(mirror.skipped.is_empty());
     assert_eq!(mirror.stats.sessions_listed, 0);
@@ -576,7 +671,14 @@ fn a_first_sync_fetches_every_transcript_and_a_second_serves_them_from_cache() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let first = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 4).unwrap();
+    let first = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        4,
+    )
+    .unwrap();
     assert_eq!(first.stats.sessions_listed, 2);
     assert_eq!(first.sessions.len(), 2);
     assert_eq!(first.stats.cache_misses, 2);
@@ -585,7 +687,14 @@ fn a_first_sync_fetches_every_transcript_and_a_second_serves_them_from_cache() {
     assert_eq!(requests.lock().unwrap().content_requests(), 2);
 
     // The cache is keyed by content hash, so the naive re-list costs listings only.
-    let second = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 4).unwrap();
+    let second = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        4,
+    )
+    .unwrap();
     assert_eq!(second.stats.cache_hits, 2);
     assert_eq!(second.stats.cache_misses, 0);
     assert_eq!(second.stats.bytes_transferred, 0);
@@ -603,7 +712,14 @@ fn the_zstd_transcript_is_decoded_and_cached_under_its_original_hash() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     let mirrored = &mirror.sessions[0];
     assert_eq!(mirrored.source_hash, sha256_hex(TRANSCRIPT.as_bytes()));
     assert_eq!(mirrored.artifact_set_version, 2);
@@ -621,7 +737,14 @@ fn the_mirrored_window_keeps_the_archives_listing_order() {
     let client = ReadClient::connect(&base).unwrap();
 
     // Concurrency 4 over a two-page listing: workers finish out of order, the mirror does not.
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 4).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        4,
+    )
+    .unwrap();
     let hashes: Vec<_> = mirror
         .sessions
         .iter()
@@ -647,10 +770,20 @@ fn a_summary_only_snapshot_is_a_recorded_gap_not_a_failure() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(mirror.skipped.len(), 1);
-    assert_eq!(mirror.skipped[0].reason, SkipReason::NoTranscript);
+    assert_eq!(
+        mirror.skipped[0].reason,
+        SkipReason::MissingArtifact(Artifact::Transcript)
+    );
 }
 
 /// munshi #78: a degenerate summary-only snapshot can be the *newest* one and so become the
@@ -667,7 +800,14 @@ fn a_summary_only_latest_snapshot_falls_back_to_the_sibling_that_has_the_transcr
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(
@@ -695,10 +835,20 @@ fn a_session_with_no_transcript_in_any_snapshot_is_still_a_recorded_gap() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     assert_eq!(mirror.skipped.len(), 1);
-    assert_eq!(mirror.skipped[0].reason, SkipReason::NoTranscript);
+    assert_eq!(
+        mirror.skipped[0].reason,
+        SkipReason::MissingArtifact(Artifact::Transcript)
+    );
     assert_eq!(requests.lock().unwrap().snapshot_listing_requests(), 1);
     assert_eq!(
         requests.lock().unwrap().content_requests(),
@@ -724,7 +874,14 @@ fn the_fallback_takes_the_newest_sibling_that_carries_a_transcript() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(
@@ -761,9 +918,19 @@ fn the_fallback_stops_probing_at_the_bound() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
-    assert_eq!(mirror.skipped[0].reason, SkipReason::NoTranscript);
+    assert_eq!(
+        mirror.skipped[0].reason,
+        SkipReason::MissingArtifact(Artifact::Transcript)
+    );
     let requests = requests.lock().unwrap();
     assert_eq!(requests.snapshot_listing_requests(), 1);
     assert_eq!(
@@ -789,7 +956,14 @@ fn a_latest_snapshot_naming_an_unreadable_harness_still_falls_back() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(
@@ -811,7 +985,14 @@ fn a_transcript_only_in_an_unreadable_harness_is_an_unknown_agent_gap() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     assert_eq!(
         mirror.skipped[0].reason,
@@ -831,7 +1012,14 @@ fn a_complete_latest_snapshot_costs_no_snapshot_listing() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(requests.lock().unwrap().snapshot_listing_requests(), 0);
 }
@@ -844,7 +1032,14 @@ fn a_harness_without_an_interpreter_is_a_recorded_gap() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     assert_eq!(
         mirror.skipped[0].reason,
@@ -890,7 +1085,14 @@ fn corrupt_content_is_refused_at_every_stage_and_never_cached() {
         let (directory, cache) = cache();
         let client = ReadClient::connect(&base).unwrap();
 
-        let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+        let mirror = sync::sync(
+            &client,
+            &cache,
+            Artifact::Transcript,
+            "2026-07-18T00:00:00.000Z",
+            2,
+        )
+        .unwrap();
         assert!(
             mirror.sessions.is_empty(),
             "corrupt content must not be folded"
@@ -967,7 +1169,14 @@ fn a_transcript_past_the_old_cap_streams_verifies_caches_and_folds() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
     assert_eq!(mirror.sessions.len(), 1);
     let mirrored = &mirror.sessions[0];
@@ -1018,7 +1227,14 @@ fn a_body_arriving_in_many_small_chunks_is_reassembled_and_verified() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
     assert_eq!(mirror.sessions.len(), 1);
     assert_eq!(
@@ -1061,7 +1277,14 @@ fn a_frame_demanding_an_oversized_window_is_refused() {
     let (directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
         panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
@@ -1088,7 +1311,14 @@ fn more_decompressed_bytes_than_declared_aborts_the_transfer() {
     let (directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
         panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
@@ -1117,7 +1347,14 @@ fn a_declared_size_past_the_ceiling_is_refused_before_any_transfer() {
     let (directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert!(mirror.sessions.is_empty());
     let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
         panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
@@ -1129,6 +1366,175 @@ fn a_declared_size_past_the_ceiling_is_refused_before_any_transfer() {
         "an absurd declaration must not be dignified with a transfer"
     );
     assert_eq!(blob_count(directory.path()), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The summary lane (qanungo #9)
+// ---------------------------------------------------------------------------
+
+/// A snapshot that carries both artifacts offers the client a choice, and the lane's whole
+/// correctness starts with taking the right one: the same session mirrors two different blobs
+/// depending on what was asked for.
+#[test]
+fn each_lane_mirrors_its_own_artifact_out_of_the_same_snapshot() {
+    let both = ArchivedSession::claude(60, TRANSCRIPT, "identity").with_summary(SUMMARY);
+    let (base, _requests) = spawn_archive(vec![both]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let summaries = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert_eq!(summaries.skipped.len(), 0, "{:?}", summaries.skipped);
+    assert_eq!(
+        summaries.sessions[0].source_hash,
+        sha256_hex(SUMMARY.as_bytes())
+    );
+    assert_eq!(summaries.sessions[0].size_bytes, SUMMARY.len() as u64);
+
+    let transcripts = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        transcripts.sessions[0].source_hash,
+        sha256_hex(TRANSCRIPT.as_bytes()),
+    );
+    assert_ne!(
+        summaries.sessions[0].source_hash,
+        transcripts.sessions[0].source_hash,
+    );
+}
+
+/// The other side of the munshi #78 shape. A capture whose summary was never rendered shadows a
+/// complete sibling exactly as a summary-only one shadows a transcript-bearing sibling, and the
+/// standup lane looks past it for the same reason and at the same bounded cost.
+#[test]
+fn the_summary_lane_falls_back_to_the_newest_summary_bearing_sibling() {
+    let shadowed = ArchivedSession::claude(61, TRANSCRIPT, "identity");
+    let stale = ArchivedSession::claude(62, TRANSCRIPT, "identity")
+        .with_summary(OTHER_SUMMARY)
+        .older_snapshot_of(&shadowed, "2026-08-01T10:00:00.000Z");
+    let newest = ArchivedSession::claude(63, TRANSCRIPT, "identity")
+        .with_summary(SUMMARY)
+        .older_snapshot_of(&shadowed, "2026-08-09T10:00:00.000Z");
+    // Declared stale-first, as the transcript fallback's own test does: only `completed_at`
+    // ordering can pick the right sibling.
+    let (base, requests) = spawn_archive(vec![shadowed, stale, newest]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert_eq!(mirror.skipped.len(), 0, "{:?}", mirror.skipped);
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(
+        mirror.sessions[0].source_hash,
+        sha256_hex(SUMMARY.as_bytes()),
+        "the stale sibling's summary was taken instead of the newest one's",
+    );
+    assert_eq!(
+        requests.lock().unwrap().snapshot_listing_requests(),
+        1,
+        "the fallback costs exactly one listing, as it does in the other lane",
+    );
+}
+
+/// A session no snapshot of which ever carried a summary is a named gap, not a silent omission —
+/// and it is named as the summary that is missing rather than as some general failure.
+#[test]
+fn a_session_with_no_summary_anywhere_is_a_recorded_gap() {
+    let bare = ArchivedSession::claude(64, TRANSCRIPT, "identity");
+    let (base, _requests) = spawn_archive(vec![bare]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert!(mirror.sessions.is_empty());
+    assert_eq!(
+        mirror.skipped[0].reason,
+        SkipReason::MissingArtifact(Artifact::Summary),
+    );
+}
+
+/// The summary lane's ceiling is three orders of magnitude below the transcript lane's, and it has
+/// to be the one that applies: a `summary.md` declaring more than a megabyte is refused before a
+/// byte moves, where the very same declaration on a transcript would be fetched without comment.
+#[test]
+fn a_summary_past_its_own_ceiling_is_refused_before_any_transfer() {
+    let mut session = ArchivedSession::claude(65, TRANSCRIPT, "identity").with_summary(SUMMARY);
+    // The declaration under test is one the transcript lane would have fetched without comment,
+    // which is what makes this a test of *which* ceiling applied rather than of a ceiling.
+    session.declared_summary_bytes = Some(MAX_DECLARED_SUMMARY_BYTES + 1);
+
+    let (base, requests) = spawn_archive(vec![session]);
+    let (directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert!(mirror.sessions.is_empty());
+    let SkipReason::Unreadable(detail) = &mirror.skipped[0].reason else {
+        panic!("expected an unreadable skip, got {:?}", mirror.skipped[0]);
+    };
+    assert!(detail.contains("declared-size ceiling"), "{detail}");
+    assert_eq!(requests.lock().unwrap().content_requests(), 0);
+    assert_eq!(blob_count(directory.path()), 0);
+}
+
+/// A summary-only snapshot — the exact shape the 2026-07-28 backfill wrote — is a *complete*
+/// capture as far as this lane is concerned, and costs it no probe at all.
+#[test]
+fn a_summary_only_snapshot_needs_no_fallback_in_the_summary_lane() {
+    let summary_only = ArchivedSession::claude(66, TRANSCRIPT, "identity")
+        .with_summary(SUMMARY)
+        .without_transcript();
+    let (base, requests) = spawn_archive(vec![summary_only]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert_eq!(mirror.sessions.len(), 1);
+    assert_eq!(
+        requests.lock().unwrap().snapshot_listing_requests(),
+        0,
+        "a projection that is already usable costs no probe",
+    );
 }
 
 /// Files anywhere under a cache root, temporary or not.
@@ -1159,7 +1565,16 @@ fn an_unreachable_archive_fails_the_run_rather_than_reporting_on_nothing() {
     };
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&format!("http://127.0.0.1:{port}")).unwrap();
-    assert!(sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).is_err());
+    assert!(
+        sync::sync(
+            &client,
+            &cache,
+            Artifact::Transcript,
+            "2026-07-18T00:00:00.000Z",
+            2
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1202,7 +1617,14 @@ fn the_projected_repository_travels_with_the_mirrored_session() {
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
 
-    let mirror = sync::sync(&client, &cache, "2026-07-18T00:00:00.000Z", 2).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
     assert_eq!(mirror.sessions.len(), 2);
     assert_eq!(
         mirror.sessions[0].repository.as_deref(),
@@ -1307,7 +1729,14 @@ fn against_a_live_archive() {
     let base = std::env::var("PATWARI_URL").expect("PATWARI_URL");
     let (_directory, cache) = cache();
     let client = ReadClient::connect(&base).unwrap();
-    let mirror = sync::sync(&client, &cache, "2026-01-01T00:00:00.000Z", 4).unwrap();
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Transcript,
+        "2026-01-01T00:00:00.000Z",
+        4,
+    )
+    .unwrap();
     println!(
         "listed {} sessions, {} hits, {} misses",
         mirror.stats.sessions_listed, mirror.stats.cache_hits, mirror.stats.cache_misses

@@ -3,8 +3,8 @@
 //! sync → fold → emit, in one pass, with the fold timed separately from the network so the
 //! instrumentation footer measures what it claims to measure. [`report`] evaluates rules and
 //! scores between the fold and the emit; [`cost`] prices instead. Everything before that fork —
-//! opening the cache, listing both windows, mirroring the transcripts, cutting the result into
-//! the reported and comparison windows — is [`Prepared`] and is shared, so the two lanes cannot
+//! opening the cache, listing the window, mirroring an artifact per session, cutting the result
+//! into the reported and comparison windows — is [`Prepared`] and is shared, so the lanes cannot
 //! come to disagree about what "the last 30 days" selected.
 //!
 //! # Two windows, one pass
@@ -25,6 +25,7 @@
 //!
 //! Archive time is also the clock the cost lane selects a **price row** as of, so a window
 //! spanning a price change reports each session at what it cost when it was taken.
+//!
 
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Write};
@@ -43,7 +44,7 @@ use crate::patwari::{PatwariError, ReadClient};
 use crate::report::{Instrumentation, Report, SkippedNote};
 use crate::rules;
 use crate::scoring::RulePack;
-use crate::sync::{self, Mirror, MirroredSession, Skip, SkipReason};
+use crate::sync::{self, Artifact, Mirror, MirroredSession, Skip, SkipReason};
 
 #[derive(Debug, Error)]
 pub enum CommandError {
@@ -66,7 +67,7 @@ pub enum CommandError {
 /// Returns an error when the cache is unusable, the archive window cannot be listed, or the
 /// report cannot be written. A single unreadable session is a reported gap, not a failure.
 pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(&args.archive, &args.last)?;
+    let prepared = Prepared::mirror(&args.archive, &args.last, Artifact::Transcript)?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -130,7 +131,7 @@ pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandErro
 /// Returns an error on the same three conditions [`report`] does, and for the same reason: a
 /// single unreadable session is a gap the document states, never a failed run.
 pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(&args.archive, &args.last)?;
+    let prepared = Prepared::mirror(&args.archive, &args.last, Artifact::Transcript)?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -201,8 +202,12 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// Opens the cache and mirrors both windows.
-    fn mirror(archive: &ArchiveArgs, window: &Window) -> Result<Self, CommandError> {
+    /// Opens the cache and mirrors the window `reach` asks for.
+    fn mirror(
+        archive: &ArchiveArgs,
+        window: &Window,
+        artifact: Artifact,
+    ) -> Result<Self, CommandError> {
         let cache = match &archive.cache_dir {
             Some(dir) => BlobCache::open(dir),
             None => BlobCache::open_default(),
@@ -223,13 +228,17 @@ impl Prepared {
         let activity_from = comparison_opens_at
             .unwrap_or(opens_at)
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let mirror =
-            sync::sync(&client, &cache, &activity_from, archive.concurrency).map_err(|source| {
-                CommandError::Archive {
-                    url: archive.patwari_url.clone(),
-                    source,
-                }
-            })?;
+        let mirror = sync::sync(
+            &client,
+            &cache,
+            artifact,
+            &activity_from,
+            archive.concurrency,
+        )
+        .map_err(|source| CommandError::Archive {
+            url: archive.patwari_url.clone(),
+            source,
+        })?;
 
         Ok(Self {
             cache,
@@ -353,8 +362,11 @@ fn summarize(skipped: &[Skip], unplaceable: usize) -> Vec<SkippedNote> {
     for skip in skipped {
         let agent = format::identifier(&skip.source_agent);
         let reason = match &skip.reason {
-            SkipReason::NoTranscript => {
-                format!("{agent}: snapshot has no transcript artifact")
+            SkipReason::MissingArtifact(artifact) => {
+                format!(
+                    "{agent}: snapshot has no `{}` artifact",
+                    artifact.logical_path()
+                )
             }
             SkipReason::UnknownAgent(named) => format!(
                 "{}: no interpreter for this harness in this build",
@@ -386,11 +398,11 @@ mod tests {
         let skips = vec![
             Skip {
                 source_agent: "claude-code".to_owned(),
-                reason: SkipReason::NoTranscript,
+                reason: SkipReason::MissingArtifact(Artifact::Transcript),
             },
             Skip {
                 source_agent: "claude-code".to_owned(),
-                reason: SkipReason::NoTranscript,
+                reason: SkipReason::MissingArtifact(Artifact::Transcript),
             },
             Skip {
                 source_agent: "future".to_owned(),
@@ -400,7 +412,7 @@ mod tests {
         let notes = summarize(&skips, 0);
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].count, 2);
-        assert!(notes[0].reason.contains("no transcript artifact"));
+        assert!(notes[0].reason.contains("no `transcript.jsonl` artifact"));
         assert_eq!(notes[1].count, 1);
     }
 
@@ -416,7 +428,10 @@ mod tests {
         };
         let notes = summarize(
             &[
-                hostile("claude-code | evil", SkipReason::NoTranscript),
+                hostile(
+                    "claude-code | evil",
+                    SkipReason::MissingArtifact(Artifact::Transcript),
+                ),
                 hostile(
                     "fine",
                     SkipReason::UnknownAgent("newline\ninjected".to_owned()),
@@ -445,10 +460,16 @@ mod tests {
             "each of the three is replaced wholesale, not truncated: {rendered}",
         );
         // An ordinary label is untouched, so the clamp costs the common case nothing.
-        let ordinary = summarize(&[hostile("claude-code", SkipReason::NoTranscript)], 0);
+        let ordinary = summarize(
+            &[hostile(
+                "claude-code",
+                SkipReason::MissingArtifact(Artifact::Transcript),
+            )],
+            0,
+        );
         assert_eq!(
             ordinary[0].reason,
-            "claude-code: snapshot has no transcript artifact",
+            "claude-code: snapshot has no `transcript.jsonl` artifact",
         );
     }
 

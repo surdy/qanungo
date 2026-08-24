@@ -2,13 +2,22 @@
 //!
 //! There is no cursor protocol and no local index (qanungo #7 pulls all of that out of P0). A run
 //! lists the sessions whose latest snapshot landed inside the window, resolves each one's
-//! transcript artifact, and asks the blob cache whether it already holds that content hash. A
-//! naive re-sync is affordable precisely because the expensive part — transferring transcript
-//! bytes — is skipped by content hash, and the cheap part is one small JSON request per session.
+//! artifact, and asks the blob cache whether it already holds that content hash. A naive re-sync
+//! is affordable precisely because the expensive part — transferring the bytes — is skipped by
+//! content hash, and the cheap part is one small JSON request per session.
 //!
 //! The one place that budget stretches is a session whose projected latest snapshot cannot be
-//! folded: the mirror then asks for that session's own snapshot listing and folds the newest
-//! sibling that can be. See [`foldable_snapshot`].
+//! used: the mirror then asks for that session's own snapshot listing and takes the newest sibling
+//! that can be. See [`usable_snapshot`].
+//!
+//! # One mirror, two artifacts
+//!
+//! Which artifact a run wants is an argument ([`Artifact`]), not a second copy of this file.
+//! `report` and `cost` want each session's `transcript.jsonl`; `standup` (qanungo #9) wants its
+//! `summary.md`. Everything else is identical and has to *stay* identical — the same listing, the
+//! same window, the same sibling fallback, the same staged content-addressed write — because two
+//! lanes that selected the window differently for the same `--last` would be two lanes describing
+//! two different weeks.
 //!
 //! # Being a polite client
 //!
@@ -24,7 +33,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::cache::BlobCache;
-use crate::patwari::{ListedSession, PatwariError, ReadClient, SnapshotDetail};
+use crate::patwari::{
+    ListedArtifact, ListedSession, MAX_DECLARED_SUMMARY_BYTES, MAX_DECLARED_TRANSCRIPT_BYTES,
+    PatwariError, ReadClient, SUMMARY_LOGICAL_PATH, SnapshotDetail, TRANSCRIPT_LOGICAL_PATH,
+};
 
 /// Worker threads used against the archive. Comfortably under Patwari's concurrency limit, so a
 /// report never crowds out the archive's other clients.
@@ -40,18 +52,77 @@ pub const MAX_CONCURRENCY: usize = 8;
 /// raising one of the two constants without the other cannot build.
 const _: () = assert!(DEFAULT_CONCURRENCY >= 1 && DEFAULT_CONCURRENCY <= MAX_CONCURRENCY);
 
-/// One session's transcript, present in the cache and ready to fold.
+/// Which of a snapshot's artifacts a run mirrors.
+///
+/// The variants are the two reserved logical paths a Munshi snapshot carries (Patwari ADR 0005),
+/// and each one answers the same three questions for the mirror: which artifact to take out of a
+/// snapshot, whether a snapshot carrying it is usable at all, and how large a declaration to
+/// believe about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Artifact {
+    /// `transcript.jsonl` — the raw session, folded by `report` and `cost`.
+    Transcript,
+    /// `summary.md` — munshi's curated record of the session, rendered by `standup`.
+    Summary,
+}
+
+impl Artifact {
+    /// The reserved logical path this artifact is conveyed by.
+    pub const fn logical_path(self) -> &'static str {
+        match self {
+            Self::Transcript => TRANSCRIPT_LOGICAL_PATH,
+            Self::Summary => SUMMARY_LOGICAL_PATH,
+        }
+    }
+
+    /// The largest size the download path will believe of a declaration about this artifact.
+    const fn declared_ceiling(self) -> u64 {
+        match self {
+            Self::Transcript => MAX_DECLARED_TRANSCRIPT_BYTES,
+            Self::Summary => MAX_DECLARED_SUMMARY_BYTES,
+        }
+    }
+
+    /// This artifact within one snapshot, when the snapshot carries it.
+    fn of(self, snapshot: &SnapshotDetail) -> Option<&ListedArtifact> {
+        match self {
+            Self::Transcript => snapshot.transcript(),
+            Self::Summary => snapshot.summary(),
+        }
+    }
+
+    /// Whether a snapshot is usable for this artifact *on its own* — which is precisely the
+    /// question of whether it is worth looking at the snapshot's siblings.
+    ///
+    /// The two answers differ, and the difference is not an oversight. A transcript is only usable
+    /// if this build also has an interpreter for the harness that wrote it, because a transcript
+    /// is a harness-shaped file. A `summary.md` is munshi's *own* format whatever harness produced
+    /// the session — the parser reads the frontmatter's `agent` key itself — so the manifest's
+    /// `source_agent` decides nothing about whether it can be read, and asking would only make the
+    /// standup lane blind to a session whose manifest this build does not recognize.
+    fn usable(self, snapshot: &SnapshotDetail) -> bool {
+        self.of(snapshot).is_some()
+            && match self {
+                Self::Transcript => {
+                    crate::metrics::source_for_agent(&snapshot.source_agent).is_some()
+                }
+                Self::Summary => true,
+            }
+    }
+}
+
+/// One session's artifact, present in the cache and ready to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirroredSession {
-    /// The transcript's content hash — cache key and cited evidence in one.
+    /// The artifact's content hash — cache key and cited evidence in one.
     pub source_hash: String,
     /// The harness that produced it, from the snapshot's canonical manifest.
     pub source_agent: String,
-    /// The artifact contract the transcript was captured under; decides which interpreter reads
-    /// it.
+    /// The artifact contract the snapshot was captured under; decides which interpreter reads a
+    /// transcript.
     pub artifact_set_version: u16,
-    /// The transcript's size in bytes once decompressed — what the fold reads, and what the
-    /// footer counts as "folded". Distinct from the stored size that crosses the wire.
+    /// The artifact's size in bytes once decompressed — what the fold reads, and what the footer
+    /// counts as "folded". Distinct from the stored size that crosses the wire.
     pub size_bytes: u64,
     /// When the archive finished the snapshot this session was listed by — **archive time, not
     /// transcript time**.
@@ -83,9 +154,10 @@ const MAX_FALLBACK_PROBES: usize = 8;
 /// that quietly dropped a third of the window would be worse than one that says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// No snapshot of this session carries a `transcript.jsonl` artifact — a summary-only
-    /// capture, with no complete sibling to fall back to.
-    NoTranscript,
+    /// No snapshot of this session carries the artifact this run was mirroring, and there was no
+    /// sibling to fall back to. A summary-only capture for the transcript lanes; a snapshot whose
+    /// summary was never rendered for the standup lane.
+    MissingArtifact(Artifact),
     /// The manifest names a harness this build has no interpreter for.
     UnknownAgent(String),
     /// The archive could not be read for this session. Carries the classified failure's text.
@@ -103,9 +175,9 @@ pub struct Skip {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncStats {
     pub sessions_listed: usize,
-    /// Transcripts already held under their content hash: no transfer.
+    /// Artifacts already held under their content hash: no transfer.
     pub cache_hits: u64,
-    /// Transcripts fetched and verified this run.
+    /// Artifacts fetched and verified this run.
     pub cache_misses: u64,
     /// Bytes that actually crossed the wire on the misses: the *stored* (compressed) size the
     /// archive serves, not the larger transcript it decompresses into. The two differ by a lot
@@ -115,7 +187,7 @@ pub struct SyncStats {
     pub elapsed: Duration,
 }
 
-/// The mirror's result: what can be folded, and what could not be.
+/// The mirror's result: what can be read, and what could not be.
 #[derive(Debug, Clone, Default)]
 pub struct Mirror {
     pub sessions: Vec<MirroredSession>,
@@ -123,7 +195,7 @@ pub struct Mirror {
     pub stats: SyncStats,
 }
 
-/// Lists the window and ensures every listed session's transcript is in the cache.
+/// Lists the window and ensures every listed session's `artifact` is in the cache.
 ///
 /// Sessions come back in the archive's own newest-first listing order, so the report is stable
 /// across runs even though the workers finish out of order.
@@ -138,6 +210,7 @@ pub struct Mirror {
 pub fn sync(
     client: &ReadClient,
     cache: &BlobCache,
+    artifact: Artifact,
     activity_from: &str,
     concurrency: usize,
 ) -> Result<Mirror, PatwariError> {
@@ -160,7 +233,7 @@ pub fn sync(
                     let Some((index, session)) = lock(&queue).next() else {
                         break;
                     };
-                    let outcome = mirror_session(client, cache, &session);
+                    let outcome = mirror_session(client, cache, artifact, &session);
                     lock(&outcomes).push((index, outcome));
                 }
             });
@@ -202,8 +275,13 @@ enum Outcome {
     Skipped(Skip),
 }
 
-/// Resolves one session's transcript and makes sure the cache holds it.
-fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSession) -> Outcome {
+/// Resolves one session's `artifact` and makes sure the cache holds it.
+fn mirror_session(
+    client: &ReadClient,
+    cache: &BlobCache,
+    artifact: Artifact,
+    session: &ListedSession,
+) -> Outcome {
     let skip = |source_agent: &str, reason: SkipReason| {
         Outcome::Skipped(Skip {
             source_agent: source_agent.to_owned(),
@@ -220,23 +298,23 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
         }
     };
     let source_agent = snapshot.source_agent.clone();
-    let snapshot = match foldable_snapshot(client, session, snapshot) {
-        Ok(Resolution::Foldable(snapshot)) => snapshot,
-        Ok(Resolution::Unfoldable(reason)) => return skip(&source_agent, reason),
-        // The listing itself failed, so what this session holds is unknown. Saying "no
-        // transcript artifact" here would be reporting a fact this run never learned.
+    let snapshot = match usable_snapshot(client, artifact, session, snapshot) {
+        Ok(Resolution::Usable(snapshot)) => snapshot,
+        Ok(Resolution::Unusable(reason)) => return skip(&source_agent, reason),
+        // The listing itself failed, so what this session holds is unknown. Saying "no such
+        // artifact" here would be reporting a fact this run never learned.
         Err(error) => return skip(&source_agent, SkipReason::Unreadable(error.to_string())),
     };
-    let Some(transcript) = snapshot.transcript() else {
-        return skip(&source_agent, SkipReason::NoTranscript);
+    let Some(wanted) = artifact.of(&snapshot) else {
+        return skip(&source_agent, SkipReason::MissingArtifact(artifact));
     };
     let mirrored = MirroredSession {
-        source_hash: transcript.original_sha256.clone(),
-        // Both taken from whichever snapshot actually carries the transcript: a fallback sibling
+        source_hash: wanted.original_sha256.clone(),
+        // Both taken from whichever snapshot actually carries the artifact: a fallback sibling
         // states its own provenance, and a degenerate snapshot's is not evidence about it.
         source_agent: snapshot.source_agent.clone(),
         artifact_set_version: snapshot.artifact_set_version,
-        size_bytes: transcript.original_size_bytes,
+        size_bytes: wanted.original_size_bytes,
         // Taken from the *listing*, which is the row `activity_from` filtered, so the window a
         // session is placed in is decided by the same timestamp that put it in the listing at all.
         // A fallback sibling's own completion time would be a different clock reading.
@@ -251,10 +329,12 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
             transferred_bytes: 0,
         };
     }
-    // The transcript is streamed straight into a staged cache write: it is never held in memory,
+    // The artifact is streamed straight into a staged cache write: it is never held in memory,
     // and it becomes a blob only once the download has verified every digest and size the archive
     // declared. Dropping the staged write on any failure below unlinks the partial file, so an
-    // aborted transfer leaves the cache exactly as it found it.
+    // aborted transfer leaves the cache exactly as it found it. A summary is kilobytes and could
+    // be held in a `String` instead — but then the two lanes would cache by two different routes,
+    // and only one of them would be the one that refuses unverified bytes.
     let mut staged = match cache.stage(&mirrored.source_hash) {
         Ok(staged) => staged,
         Err(error) => {
@@ -264,7 +344,7 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
             );
         }
     };
-    let receipt = match client.download_transcript(transcript, &mut staged) {
+    let receipt = match client.download_artifact(wanted, artifact.declared_ceiling(), &mut staged) {
         Ok(receipt) => receipt,
         Err(error) => {
             return skip(
@@ -291,21 +371,13 @@ fn mirror_session(client: &ReadClient, cache: &BlobCache, session: &ListedSessio
 
 /// What looking through a session's snapshots concluded.
 enum Resolution {
-    /// A snapshot that carries a transcript this build can interpret.
-    Foldable(SnapshotDetail),
+    /// A snapshot carrying the wanted artifact in a form this build can read.
+    Usable(SnapshotDetail),
     /// None does, and this is why — stated from what was actually seen.
-    Unfoldable(SkipReason),
+    Unusable(SkipReason),
 }
 
-/// Whether a snapshot can be folded at all: it has to carry a transcript *and* name a harness
-/// this build has an interpreter for. Either half missing makes the snapshot useless on its own,
-/// which is precisely when it is worth looking at its siblings.
-fn foldable(snapshot: &SnapshotDetail) -> bool {
-    snapshot.transcript().is_some()
-        && crate::metrics::source_for_agent(&snapshot.source_agent).is_some()
-}
-
-/// Picks the snapshot of this session to fold: the archive's projected one when it is usable,
+/// Picks the snapshot of this session to read: the archive's projected one when it is usable,
 /// otherwise the newest sibling that is.
 ///
 /// # Why this exists (munshi #78)
@@ -317,36 +389,43 @@ fn foldable(snapshot: &SnapshotDetail) -> bool {
 /// here while the bytes sat in it the whole time.
 ///
 /// The fix belongs upstream — tombstoning those snapshots re-elects the complete ones — and this
-/// is defense in depth, not a substitute for it: a read-side client that can see a transcript
-/// should fold it.
+/// is defense in depth, not a substitute for it: a read-side client that can see an artifact
+/// should read it.
 ///
-/// # Why an unreadable harness is not a short-circuit
+/// The standup lane inherits the discipline unchanged rather than assuming its own artifact is
+/// immune. The 2026-07-28 shape happens to favour it — a summary-only snapshot is exactly what
+/// `standup` wants — but "the newest snapshot is the one worth reading" was never a safe belief
+/// about *either* artifact, and a capture whose summary was never rendered is the mirror image of
+/// the one that broke the transcript lanes.
+///
+/// # Why an unusable snapshot is not a short-circuit
 ///
 /// It is tempting to skip a snapshot whose `source_agent` has no interpreter before spending the
 /// listing request, and an earlier draft of this did. That re-creates the very blindness the
 /// function exists to remove: the *degenerate* snapshot is the one carrying the odd manifest, and
 /// believing its provenance over a complete sibling's is exactly the mistake of trusting a
-/// projection. A snapshot is therefore looked past when it has no transcript **or** no
-/// interpreter, and the cost is bounded the same way in both cases — one listing plus at most
-/// [`MAX_FALLBACK_PROBES`] snapshot reads, and nothing at all for a session whose projection is
-/// already foldable.
+/// projection. A snapshot is therefore looked past whenever [`Artifact::usable`] says so, and the
+/// cost is bounded the same way in every case — one listing plus at most [`MAX_FALLBACK_PROBES`]
+/// snapshot reads, and nothing at all for a session whose projection is already usable.
 ///
-/// The reason returned when nothing is foldable is taken from what was seen rather than from
-/// which check ran last: a transcript that exists but cannot be interpreted is
-/// [`SkipReason::UnknownAgent`], and only a session where no snapshot carries a transcript at all
-/// is [`SkipReason::NoTranscript`].
-fn foldable_snapshot(
+/// The reason returned when nothing is usable is taken from what was seen rather than from which
+/// check ran last: a transcript that exists but cannot be interpreted is
+/// [`SkipReason::UnknownAgent`], and only a session where no snapshot carries the artifact at all
+/// is [`SkipReason::MissingArtifact`]. For [`Artifact::Summary`] the first of those cannot arise,
+/// because a summary needs no interpreter to be read.
+fn usable_snapshot(
     client: &ReadClient,
+    artifact: Artifact,
     session: &ListedSession,
     projected: SnapshotDetail,
 ) -> Result<Resolution, PatwariError> {
-    if foldable(&projected) {
-        return Ok(Resolution::Foldable(projected));
+    if artifact.usable(&projected) {
+        return Ok(Resolution::Usable(projected));
     }
     // Remembered across the probes so the eventual gap describes the whole session rather than
     // whichever snapshot happened to be examined last.
-    let mut uninterpretable = projected
-        .transcript()
+    let mut uninterpretable = artifact
+        .of(&projected)
         .is_some()
         .then(|| projected.source_agent.clone());
 
@@ -359,16 +438,16 @@ fn foldable_snapshot(
         .take(MAX_FALLBACK_PROBES)
     {
         let detail = client.snapshot(&sibling.snapshot_id)?;
-        if foldable(&detail) {
-            return Ok(Resolution::Foldable(detail));
+        if artifact.usable(&detail) {
+            return Ok(Resolution::Usable(detail));
         }
-        if detail.transcript().is_some() {
+        if artifact.of(&detail).is_some() {
             uninterpretable.get_or_insert(detail.source_agent.clone());
         }
     }
-    Ok(Resolution::Unfoldable(match uninterpretable {
+    Ok(Resolution::Unusable(match uninterpretable {
         Some(agent) => SkipReason::UnknownAgent(agent),
-        None => SkipReason::NoTranscript,
+        None => SkipReason::MissingArtifact(artifact),
     }))
 }
 
@@ -390,7 +469,81 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::patwari::ListedArtifact;
+
     use super::*;
+
+    fn artifact(logical_path: &str) -> ListedArtifact {
+        ListedArtifact {
+            artifact_id: "a".to_owned(),
+            logical_path: logical_path.to_owned(),
+            original_sha256: "0".repeat(64),
+            original_size_bytes: 1,
+            stored_size_bytes: 1,
+            content_url: "/x".to_owned(),
+        }
+    }
+
+    fn snapshot(source_agent: &str, logical_paths: &[&str]) -> SnapshotDetail {
+        SnapshotDetail {
+            source_agent: source_agent.to_owned(),
+            artifact_set_version: 2,
+            artifacts: logical_paths.iter().copied().map(artifact).collect(),
+        }
+    }
+
+    /// The one place the two lanes deliberately disagree: a transcript is a harness-shaped file
+    /// and needs an interpreter, a `summary.md` is munshi's own format and does not. A harness
+    /// this build has never heard of therefore hides a transcript and not a summary.
+    #[test]
+    fn a_summary_needs_no_interpreter_and_a_transcript_does() {
+        let known = snapshot(
+            "claude-code",
+            &[TRANSCRIPT_LOGICAL_PATH, SUMMARY_LOGICAL_PATH],
+        );
+        assert!(Artifact::Transcript.usable(&known));
+        assert!(Artifact::Summary.usable(&known));
+
+        let unknown = snapshot(
+            "future-harness",
+            &[TRANSCRIPT_LOGICAL_PATH, SUMMARY_LOGICAL_PATH],
+        );
+        assert!(!Artifact::Transcript.usable(&unknown));
+        assert!(
+            Artifact::Summary.usable(&unknown),
+            "the standup lane must still see a session whose manifest this build cannot place",
+        );
+    }
+
+    /// Each lane is blind to exactly the snapshot that lacks *its* artifact, which is what makes
+    /// the sibling fallback worth spending a listing request on in both directions.
+    #[test]
+    fn each_lane_looks_past_the_snapshot_missing_its_own_artifact() {
+        let summary_only = snapshot("claude-code", &[SUMMARY_LOGICAL_PATH]);
+        assert!(!Artifact::Transcript.usable(&summary_only));
+        assert!(Artifact::Summary.usable(&summary_only));
+
+        let transcript_only = snapshot("claude-code", &[TRANSCRIPT_LOGICAL_PATH]);
+        assert!(Artifact::Transcript.usable(&transcript_only));
+        assert!(!Artifact::Summary.usable(&transcript_only));
+    }
+
+    /// A summary is kilobytes and a transcript is megabytes, so one ceiling cannot bound both:
+    /// the transcript's is no bound at all on a summary.
+    #[test]
+    fn the_declared_ceiling_is_a_property_of_the_artifact() {
+        assert_eq!(
+            Artifact::Transcript.declared_ceiling(),
+            MAX_DECLARED_TRANSCRIPT_BYTES
+        );
+        assert_eq!(
+            Artifact::Summary.declared_ceiling(),
+            MAX_DECLARED_SUMMARY_BYTES
+        );
+        assert!(Artifact::Summary.declared_ceiling() < Artifact::Transcript.declared_ceiling());
+        assert_eq!(Artifact::Summary.logical_path(), SUMMARY_LOGICAL_PATH);
+        assert_eq!(Artifact::Transcript.logical_path(), TRANSCRIPT_LOGICAL_PATH);
+    }
 
     #[test]
     fn skips_name_the_agent_they_could_not_read() {
