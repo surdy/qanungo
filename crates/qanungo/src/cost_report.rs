@@ -19,9 +19,10 @@
 //! or a model wrote: `message.model` is the harness's own field, `speed` / `service_tier` /
 //! `inference_geo` are the API's, and `repository` comes from Patwari's session projection. They
 //! are still peer-supplied strings reaching a rendered document, so each one goes through
-//! [`identifier`] first, on the same reasoning that clamps `error.code` — an archive that is
-//! confused, compromised, or not Patwari at all does not get to put characters of its choosing
-//! into a report.
+//! [`crate::format::identifier`] first, on the same reasoning that clamps `error.code` — an
+//! archive that is confused, compromised, or not Patwari at all does not get to put characters of
+//! its choosing into a report. That clamp lives in [`crate::format`] rather than here because the
+//! Gaps section both lanes share applies it too.
 //!
 //! Evidence remains a content hash: a reader who wants to know *which* session spent the money
 //! fetches the transcript from the archive and reads it in full.
@@ -42,18 +43,10 @@ use chrono::{DateTime, Utc};
 
 use crate::cli::Window;
 use crate::cost::CostTotals;
-use crate::format;
+use crate::format::{self, identifier};
 use crate::pricing::PRICE_TABLE_REVISION;
 use crate::report::{SkippedNote, change, stamp};
 use crate::sync::SyncStats;
-
-/// Longest archive-stated identifier this report will render before replacing it wholesale.
-/// Comfortably over any real model id or repository name and far under anything that could turn a
-/// table cell into a paragraph.
-const MAX_IDENTIFIER_CHARS: usize = 64;
-
-/// Stands in for an archive-stated identifier that is not shaped like one.
-const INVALID_IDENTIFIER: &str = "invalid-identifier";
 
 /// What a cost run cost, folded into the footer.
 #[derive(Debug, Clone)]
@@ -149,8 +142,15 @@ impl CostReport<'_> {
             out.push_str(
                 "No claude-code session in this window carried usage this build could price.",
             );
-            out.push_str(if totals.flagged.any() {
-                " What the archive did record is in the flagged section below.\n"
+            // "Nothing at all" is a claim about the whole document, not about the dollars: a
+            // window of copilot sessions has a populated token table further down, and a harness
+            // that records no usage is itself something the archive said. Printing the stronger
+            // sentence directly above either of them would be contradicted by the next heading.
+            let recorded_elsewhere = totals.flagged.any()
+                || !totals.copilot.is_empty()
+                || !totals.no_signal_sessions.is_empty();
+            out.push_str(if recorded_elsewhere {
+                " What the archive did record is below.\n"
             } else {
                 " The archive recorded no billing signal here at all.\n"
             });
@@ -258,8 +258,9 @@ impl CostReport<'_> {
         if fast > 0 {
             let _ = writeln!(
                 out,
-                "\nFast mode: {fast} of those messages ran in it and are priced at its own tier, \
-                 which is why a model's realized rate can sit above its base row.",
+                "\nFast mode: {fast} of those messages ran in it, priced at its own tier rather \
+                 than the model's base row — which is why a model's realized rate can sit above \
+                 that row.",
             );
         }
         // The deduplication note lives with the table it is a property of rather than in the
@@ -501,33 +502,6 @@ impl CostReport<'_> {
     }
 }
 
-/// An archive-stated identifier — a model id, a billing modifier, a repository name — rendered
-/// only when it is shaped like one.
-///
-/// These are the only strings this report lifts out of somebody else's data, and they end up in a
-/// document sworn to carry no upstream free text, so they are clamped on the same reasoning that
-/// clamps Patwari's `error.code` (see [`crate::patwari`]): a peer that is confused, compromised,
-/// or not the archive at all does not get to choose characters in a report. A value carrying a
-/// control character, a newline, a table pipe, or a backtick — or one longer than
-/// [`MAX_IDENTIFIER_CHARS`] — is replaced wholesale rather than truncated, because a prefix of
-/// arbitrary text is still arbitrary text.
-///
-/// Deliberately permissive about everything else, including non-ASCII: `<synthetic>` and a
-/// repository named in a script other than Latin are both real identifiers, and the point of the
-/// clamp is the rendering surface, not the alphabet.
-pub fn identifier(value: &str) -> String {
-    let usable = !value.is_empty()
-        && value.chars().count() <= MAX_IDENTIFIER_CHARS
-        && value
-            .chars()
-            .all(|character| !character.is_control() && !"|`".contains(character));
-    if usable {
-        value.to_owned()
-    } else {
-        INVALID_IDENTIFIER.to_owned()
-    }
-}
-
 fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
@@ -539,6 +513,7 @@ mod tests {
 
     use super::*;
     use crate::cost::{CostFold, SessionCost, fold_cost};
+    use crate::format::INVALID_IDENTIFIER;
 
     fn window(spelling: &str) -> Window {
         let crate::cli::Command::Cost(args) =
@@ -793,34 +768,8 @@ mod tests {
         );
     }
 
-    /// The identifier clamp is a redaction control, not tidiness: it is the only place a peer's
-    /// bytes reach the rendered document.
-    #[test]
-    fn an_archive_stated_identifier_is_rendered_only_when_it_is_shaped_like_one() {
-        for good in [
-            "claude-opus-5",
-            "<synthetic>",
-            "surdy/qanungo",
-            "claude-opus-4.8",
-            "ansh/परियोजना",
-        ] {
-            assert_eq!(identifier(good), good);
-        }
-        for hostile in [
-            "",
-            "pipes | break | tables",
-            "back`tick",
-            "new\nline",
-            "null\0byte",
-            &"a".repeat(MAX_IDENTIFIER_CHARS + 1),
-        ] {
-            assert_eq!(identifier(hostile), INVALID_IDENTIFIER, "{hostile:?}");
-        }
-        let at_the_limit = "a".repeat(MAX_IDENTIFIER_CHARS);
-        assert_eq!(identifier(&at_the_limit), at_the_limit);
-    }
-
-    /// And the clamp is actually applied on the way into the tables, not merely available.
+    /// The clamp itself is pinned in [`crate::format`]; what matters here is that it is actually
+    /// applied on the way into the tables rather than merely available to be.
     #[test]
     fn a_hostile_model_id_cannot_break_out_of_a_table_cell() {
         let totals = CostTotals::fold(&[claude_session(
@@ -850,6 +799,55 @@ mod tests {
         assert!(footer.contains("4.0 KiB folded"), "{footer}");
         assert!(footer.contains("cache 1 hits / 0 misses"), "{footer}");
         assert!(footer.contains("price table 2026-08-23"), "{footer}");
+    }
+
+    /// "No billing signal at all" is a claim about the whole document. A window of copilot
+    /// sessions has a populated token table further down it, so the stronger sentence must not
+    /// appear above one — and the same goes for a harness that records nothing, which is itself
+    /// something the archive told us.
+    #[test]
+    fn a_window_with_no_dollars_does_not_deny_signal_it_is_about_to_print() {
+        let transcript = r#"{"type":"assistant.message","timestamp":"2026-08-01T10:00:00.000Z","data":{"content":"one","messageId":"m1","model":"claude-opus-4.8","outputTokens":128}}"#;
+        let copilot = SessionCost {
+            source_agent: "copilot-cli".to_owned(),
+            fold: fold_cost(Source::Copilot, 2, transcript.as_bytes()).unwrap(),
+            ..claude_session("unused", "unused", r#"{"output_tokens":0}"#, None)
+        };
+        let markdown = render(&CostTotals::fold(&[copilot]), None);
+        assert!(
+            markdown.contains(
+                "No claude-code session in this window carried usage this build \
+                               could price. What the archive did record is below."
+            ),
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains("no billing signal here at all"),
+            "the copilot table two headings down contradicts that: {markdown}"
+        );
+        assert!(
+            markdown.contains("| `claude-opus-4.8` | 1 | 128 |"),
+            "{markdown}"
+        );
+
+        // A harness that records nothing is also something the archive said.
+        let codex = SessionCost {
+            source_agent: "codex-cli".to_owned(),
+            fold: CostFold::default(),
+            ..claude_session("unused", "unused", r#"{"output_tokens":0}"#, None)
+        };
+        let markdown = render(&CostTotals::fold(&[codex]), None);
+        assert!(
+            !markdown.contains("no billing signal here at all"),
+            "{markdown}"
+        );
+
+        // And a genuinely empty window still says the strong thing, because there it is true.
+        let markdown = render(&CostTotals::default(), None);
+        assert!(
+            markdown.contains("The archive recorded no billing signal here at all."),
+            "{markdown}"
+        );
     }
 
     /// A harness that records no usage is named rather than left out, so a reader can tell a

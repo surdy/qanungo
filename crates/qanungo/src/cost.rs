@@ -29,13 +29,17 @@
 //! 1-hour cache exclusively (389,777,788 1-hour tokens against zero 5-minute ones, measured over
 //! the archive on 2026-08-23).
 //!
-//! So the buckets are what this fold reads, and they win outright where they are present — the
-//! archive holds a message whose total reads 0 while its 1-hour bucket reads 2,277, and the
-//! bucket is the tier that bills. A write stated **only** as a total, with neither bucket
-//! present, is not priced at an assumed tier and not dropped either: its tokens land in
-//! [`TokenTally::cache_write_untiered`], are reported, and are flagged. That case has never been
-//! observed in the archive; the code is honest about it anyway, because the alternative is a
-//! silent 1.6x error the day it appears.
+//! So the buckets are what this fold reads, and a **non-zero** split wins outright — the archive
+//! holds a message whose total reads 0 while its 1-hour bucket reads 2,277, and the bucket is the
+//! tier that bills.
+//!
+//! A write the source did not split that way is not priced at an assumed tier and not dropped
+//! either: its tokens land in [`TokenTally::cache_write_untiered`], are reported, and are
+//! flagged. "Did not split" covers two shapes, and lumping them together is deliberate — bucket
+//! fields that are *present and zero* alongside a non-zero total say exactly as much about the
+//! tier as absent ones do, which is nothing, so trusting the empty split would price real spend
+//! at $0 and raise no flag at all. Neither shape has been observed in the archive; the code is
+//! honest about both anyway, because the alternative is a silent error the day one appears.
 //!
 //! # What this module renders
 //!
@@ -133,10 +137,16 @@ pub struct TokenTally {
     pub cache_write_5m: u64,
     /// Cache writes at the 1-hour tier, from the per-tier bucket.
     pub cache_write_1h: u64,
-    /// Cache writes stated only as `cache_creation_input_tokens`, with neither bucket present.
-    /// Real tokens that no rate applies to, because the rate depends on the tier — reported and
-    /// flagged, never priced at an assumed one. See the module docs.
+    /// Cache-creation tokens with no usable per-tier split: the source stated a non-zero total
+    /// and either no buckets at all, or buckets that sum to zero. Real tokens that no rate
+    /// applies to, because the rate depends on the tier — reported and flagged, never priced at
+    /// an assumed one. See the module docs.
     pub cache_write_untiered: u64,
+    /// Messages *carrying* such a write. Deliberately not the message count of whatever tally
+    /// this is — a billing key that billed three messages, one of which wrote an untiered cache,
+    /// has one message here and three in [`TokenTally::messages`], and the report's flagged line
+    /// means the former.
+    pub cache_write_untiered_messages: u64,
     pub cache_read: u64,
     /// The share of `output` spent on extended thinking. Context, not a category: it is already
     /// inside `output` and is never added to it or priced separately.
@@ -145,53 +155,81 @@ pub struct TokenTally {
 
 impl TokenTally {
     /// Folds one message's usage.
+    ///
+    /// Every sum saturates rather than wrapping, on the same reasoning
+    /// [`crate::metrics::Activity::sittings`] saturates: these are counts read from somebody
+    /// else's file, and a transcript crafted to overflow a `u64` of tokens should produce an
+    /// absurd number a reader can see, never a small one they cannot.
     fn observe(&mut self, usage: &TokenUsage) {
-        self.messages += 1;
-        self.input += usage.input_tokens.unwrap_or_default();
-        self.output += usage.output_tokens.unwrap_or_default();
-        self.cache_read += usage.cache_read_input_tokens.unwrap_or_default();
-        self.thinking += usage.thinking_tokens.unwrap_or_default();
-        // The buckets are the billing tiers, so where the source stated either of them it has
-        // stated the split, and the undifferentiated total is not consulted at all — not to
-        // reconcile a residue, not to fill in the sibling bucket. Where it stated neither, the
-        // total is real spend nobody can price, and it is carried as exactly that.
-        match (usage.cache_5m_input_tokens, usage.cache_1h_input_tokens) {
-            (None, None) => {
-                self.cache_write_untiered += usage.cache_creation_input_tokens.unwrap_or_default();
-            }
-            (five_minute, one_hour) => {
-                self.cache_write_5m += five_minute.unwrap_or_default();
-                self.cache_write_1h += one_hour.unwrap_or_default();
-            }
+        self.messages = self.messages.saturating_add(1);
+        self.input = add(self.input, usage.input_tokens);
+        self.output = add(self.output, usage.output_tokens);
+        self.cache_read = add(self.cache_read, usage.cache_read_input_tokens);
+        self.thinking = add(self.thinking, usage.thinking_tokens);
+        self.observe_cache_write(usage);
+    }
+
+    /// Folds one message's cache-creation figures.
+    ///
+    /// The buckets are the billing tiers, so where the source stated a **non-zero** split it has
+    /// said everything needed to price the write, and the undifferentiated total is not consulted
+    /// at all — not to reconcile a residue, not to fill in an absent sibling bucket.
+    ///
+    /// The zero case is where care is needed, and it is the one an earlier draft got wrong. A
+    /// split that sums to zero prices nothing, so if the *total* is non-zero the source has
+    /// reported real cache-write spend whose tier it has not disclosed — bucket fields present
+    /// and reading `0` say no more about the tier than absent ones do. Trusting the empty split
+    /// there would silently drop the spend at $0 with no flag, which is the failure mode this
+    /// whole module is arranged against; it is therefore treated exactly like an absent split,
+    /// and flagged. A zero total alongside a zero split is simply a message that wrote no cache,
+    /// and raises nothing.
+    fn observe_cache_write(&mut self, usage: &TokenUsage) {
+        let five_minute = usage.cache_5m_input_tokens.unwrap_or_default();
+        let one_hour = usage.cache_1h_input_tokens.unwrap_or_default();
+        if five_minute > 0 || one_hour > 0 {
+            self.cache_write_5m = self.cache_write_5m.saturating_add(five_minute);
+            self.cache_write_1h = self.cache_write_1h.saturating_add(one_hour);
+            return;
+        }
+        let total = usage.cache_creation_input_tokens.unwrap_or_default();
+        if total > 0 {
+            self.cache_write_untiered = self.cache_write_untiered.saturating_add(total);
+            self.cache_write_untiered_messages =
+                self.cache_write_untiered_messages.saturating_add(1);
         }
     }
 
     /// Adds another tally into this one.
     fn absorb(&mut self, other: &Self) {
-        self.messages += other.messages;
-        self.input += other.input;
-        self.output += other.output;
-        self.cache_write_5m += other.cache_write_5m;
-        self.cache_write_1h += other.cache_write_1h;
-        self.cache_write_untiered += other.cache_write_untiered;
-        self.cache_read += other.cache_read;
-        self.thinking += other.thinking;
+        self.messages = self.messages.saturating_add(other.messages);
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_write_5m = self.cache_write_5m.saturating_add(other.cache_write_5m);
+        self.cache_write_1h = self.cache_write_1h.saturating_add(other.cache_write_1h);
+        self.cache_write_untiered = self
+            .cache_write_untiered
+            .saturating_add(other.cache_write_untiered);
+        self.cache_write_untiered_messages = self
+            .cache_write_untiered_messages
+            .saturating_add(other.cache_write_untiered_messages);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.thinking = self.thinking.saturating_add(other.thinking);
     }
 
     /// Every token counted, of any category. `thinking` is excluded because it is already part of
     /// `output`, and counting it would double one message's own reasoning.
     pub fn total(&self) -> u64 {
         self.input
-            + self.output
-            + self.cache_write_5m
-            + self.cache_write_1h
-            + self.cache_write_untiered
-            + self.cache_read
+            .saturating_add(self.output)
+            .saturating_add(self.cache_write_5m)
+            .saturating_add(self.cache_write_1h)
+            .saturating_add(self.cache_write_untiered)
+            .saturating_add(self.cache_read)
     }
 
     /// Cache writes across both tiers, priced.
     pub fn cache_write_priceable(&self) -> u64 {
-        self.cache_write_5m + self.cache_write_1h
+        self.cache_write_5m.saturating_add(self.cache_write_1h)
     }
 
     /// What this tally costs at `rates`, scaled by a modifier multiplier.
@@ -206,6 +244,12 @@ impl TokenTally {
             + pricing::dollars(self.cache_write_1h, rates.cache_write_1h, multiplier)
             + pricing::dollars(self.cache_read, rates.cache_read, multiplier)
     }
+}
+
+/// Adds a figure the source may not have recorded, saturating. An absent figure adds nothing —
+/// `None` is never a zero, but it is also never a number to add.
+fn add(running: u64, recorded: Option<u64>) -> u64 {
+    running.saturating_add(recorded.unwrap_or_default())
 }
 
 /// Usage that could not be deduplicated, and therefore was summed per record.
@@ -231,13 +275,16 @@ impl Undeduplicatable {
 
     /// Records summed per record rather than per message.
     pub fn records(&self) -> u64 {
-        self.without_a_message_id + self.past_the_id_cap
+        self.without_a_message_id
+            .saturating_add(self.past_the_id_cap)
     }
 
     fn absorb(&mut self, other: &Self) {
-        self.without_a_message_id += other.without_a_message_id;
-        self.past_the_id_cap += other.past_the_id_cap;
-        self.tokens += other.tokens;
+        self.without_a_message_id = self
+            .without_a_message_id
+            .saturating_add(other.without_a_message_id);
+        self.past_the_id_cap = self.past_the_id_cap.saturating_add(other.past_the_id_cap);
+        self.tokens = self.tokens.saturating_add(other.tokens);
     }
 }
 
@@ -270,11 +317,31 @@ pub fn fold_cost(
     artifact_set_version: u16,
     reader: impl BufRead,
 ) -> Result<CostFold, UnsupportedVersion> {
+    fold_cost_tracking(
+        source,
+        artifact_set_version,
+        reader,
+        MAX_TRACKED_MESSAGE_IDS,
+    )
+}
+
+/// The fold itself, with the message-id cap as a parameter.
+///
+/// The cap is a parameter for one reason: so that a test can exercise **this** code path at a
+/// size a test can build. A cap of 100,000 is not reachable by a fixture, and a test that
+/// re-implemented the branch at a smaller size would keep passing while the real one rotted —
+/// which is precisely what an earlier draft of the cap test did.
+fn fold_cost_tracking(
+    source: Source,
+    artifact_set_version: u16,
+    reader: impl BufRead,
+    tracked_message_ids: usize,
+) -> Result<CostFold, UnsupportedVersion> {
     let stream = TranscriptStream::new(source, artifact_set_version, reader)?;
     let mut fold = CostFold::default();
     let mut seen: HashSet<String> = HashSet::new();
     for item in stream {
-        fold.records_read += 1;
+        fold.records_read = fold.records_read.saturating_add(1);
         let Ok(record) = &item else { continue };
         let Some(meta) = &record.assistant_meta else {
             continue;
@@ -285,20 +352,28 @@ pub fn fold_cost(
         // and adding them again is the 2.6x inflation the module docs describe.
         match &meta.message_id {
             Some(id) if seen.contains(id) => {
-                fold.duplicate_records += 1;
+                fold.duplicate_records = fold.duplicate_records.saturating_add(1);
                 continue;
             }
-            Some(id) if seen.len() < MAX_TRACKED_MESSAGE_IDS => {
+            Some(id) if seen.len() < tracked_message_ids => {
                 seen.insert(id.clone());
-                fold.messages += 1;
+                fold.messages = fold.messages.saturating_add(1);
             }
             Some(_) => {
-                fold.undeduplicatable.past_the_id_cap += 1;
-                fold.undeduplicatable.tokens += tokens_of(usage);
+                fold.undeduplicatable.past_the_id_cap =
+                    fold.undeduplicatable.past_the_id_cap.saturating_add(1);
+                fold.undeduplicatable.tokens = fold
+                    .undeduplicatable
+                    .tokens
+                    .saturating_add(tokens_of(usage));
             }
             None => {
-                fold.undeduplicatable.without_a_message_id += 1;
-                fold.undeduplicatable.tokens += tokens_of(usage);
+                fold.undeduplicatable.without_a_message_id =
+                    fold.undeduplicatable.without_a_message_id.saturating_add(1);
+                fold.undeduplicatable.tokens = fold
+                    .undeduplicatable
+                    .tokens
+                    .saturating_add(tokens_of(usage));
             }
         }
         fold.usage
@@ -466,14 +541,6 @@ impl CostTotals {
     fn absorb_priceable(&mut self, session: &SessionCost) {
         self.priceable_sessions += 1;
         for (key, tally) in &session.fold.usage {
-            // Untiered cache writes are flagged wherever they occur — including inside otherwise
-            // perfectly priced usage, which is the whole point: the rest of the message is priced
-            // and this part of it is not, and the report says so rather than rounding the
-            // difference into the total.
-            if tally.cache_write_untiered > 0 {
-                self.flagged.untiered_cache_writes += tally.cache_write_untiered;
-                self.flagged.untiered_cache_write_messages += tally.messages;
-            }
             match pricing::price_for(
                 key.model.as_deref(),
                 key.speed.as_deref(),
@@ -511,6 +578,21 @@ impl CostTotals {
                         .entry(session.repository.clone())
                         .or_default()
                         .absorb(&priced);
+                    // Flagged only for usage that was *otherwise* priced, which is the whole
+                    // point of the line: the rest of these messages is in the total and this part
+                    // of them is not. Usage that went unpriced for some other reason already has
+                    // its own flagged line covering every token in it, and counting it here as
+                    // well would list the same tokens twice under two different explanations.
+                    if tally.cache_write_untiered > 0 {
+                        self.flagged.untiered_cache_writes = self
+                            .flagged
+                            .untiered_cache_writes
+                            .saturating_add(tally.cache_write_untiered);
+                        self.flagged.untiered_cache_write_messages = self
+                            .flagged
+                            .untiered_cache_write_messages
+                            .saturating_add(tally.cache_write_untiered_messages);
+                    }
                 }
                 Price::Unbilled => self.flagged.synthetic.absorb(tally),
                 Price::Unpriced(reason) => self
@@ -696,6 +778,73 @@ mod tests {
         );
     }
 
+    /// The shape an earlier draft dropped on the floor: buckets *present and both zero* beside a
+    /// non-zero total. An empty split prices nothing, so trusting it would have billed 40,960 real
+    /// cache-write tokens at $0 and raised no flag at all — a silent loss, which is worse than
+    /// either an over-charge or a stated gap. Present-and-zero says no more about the tier than
+    /// absent does, so it is treated identically.
+    #[test]
+    fn a_zero_split_beside_a_non_zero_total_is_untiered_rather_than_free() {
+        let zero_split = r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"x"}],"usage":{"cache_creation_input_tokens":40960,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}"#;
+        let tally = *fold_claude(zero_split)
+            .usage
+            .values()
+            .next()
+            .expect("one key");
+        assert_eq!(tally.cache_write_untiered, 40_960);
+        assert_eq!(tally.cache_write_priceable(), 0);
+
+        let totals = CostTotals::fold(&[session(fold_claude(zero_split), None)]);
+        assert_eq!(totals.flagged.untiered_cache_writes, 40_960);
+        assert_eq!(totals.flagged.untiered_cache_write_messages, 1);
+        assert_eq!(totals.priced.dollars, 0.0, "nothing here has a rate");
+        assert!(totals.flagged.any(), "and the gap is stated, not swallowed");
+    }
+
+    /// The flagged line counts the messages *carrying* an untiered write, not every message that
+    /// happened to bill under the same key. Three messages, one of them writing an untiered
+    /// cache: the report must say one.
+    #[test]
+    fn the_untiered_write_flag_counts_the_messages_that_carry_one() {
+        let plain = |id: &str| {
+            claude_record(
+                id,
+                "claude-opus-5",
+                r#"{"input_tokens":10,"output_tokens":5}"#,
+            )
+        };
+        let carrying = claude_record(
+            "msg_3",
+            "claude-opus-5",
+            r#"{"input_tokens":10,"cache_creation_input_tokens":4096}"#,
+        );
+        let fold = fold_claude(&[plain("msg_1"), plain("msg_2"), carrying].join("\n"));
+        let tally = *fold.usage.values().next().expect("one billing key");
+        assert_eq!(tally.messages, 3);
+        assert_eq!(tally.cache_write_untiered_messages, 1);
+
+        let totals = CostTotals::fold(&[session(fold, None)]);
+        assert_eq!(totals.flagged.untiered_cache_write_messages, 1);
+        assert_eq!(totals.flagged.untiered_cache_writes, 4_096);
+    }
+
+    /// Usage that went unpriced for some other reason already has a flagged line covering every
+    /// token in it, so its untiered writes are not listed a second time under a different
+    /// explanation. The tokens are reported once, not twice.
+    #[test]
+    fn an_unpriced_keys_untiered_write_is_not_listed_twice() {
+        let unknown_model = r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"assistant","id":"msg_1","model":"claude-opus-9","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":4096}}}"#;
+        let totals = CostTotals::fold(&[session(fold_claude(unknown_model), None)]);
+        assert_eq!(
+            totals.flagged.untiered_cache_writes, 0,
+            "the unpriced-model line already accounts for these tokens",
+        );
+        assert_eq!(
+            totals.flagged.unpriced[&Unpriced::UnknownModel("claude-opus-9".to_owned())].total(),
+            4_106,
+        );
+    }
+
     /// A zero total with no buckets is not an unpriced write — there is nothing to price.
     #[test]
     fn a_zero_cache_write_raises_no_flag() {
@@ -852,27 +1001,70 @@ mod tests {
     /// The cap under-claims deduplication rather than dropping spend: once the id set is full a
     /// new id cannot be tracked, so its record is summed per record and flagged, exactly like a
     /// record with no id at all.
+    ///
+    /// Driven through [`fold_cost_tracking`] at a cap of two rather than re-implementing the
+    /// branch beside it. A test that rebuilt the logic would keep passing while the real one
+    /// rotted, which is the whole failure mode a bound like this invites: it is unreachable by any
+    /// fixture at its shipped size, so the only way to pin it is to shrink it.
     #[test]
     fn the_message_id_cap_flags_rather_than_drops() {
-        let mut fold = CostFold::default();
-        let mut seen: HashSet<String> = HashSet::new();
-        // The cap is exercised through the same branch the fold uses, at a size a test can build.
-        for index in 0..3 {
-            let id = format!("msg_{index}");
-            if seen.len() < 2 && !seen.contains(&id) {
-                seen.insert(id);
-                fold.messages += 1;
-            } else {
-                fold.undeduplicatable.past_the_id_cap += 1;
-            }
-        }
-        assert_eq!(fold.messages, 2);
-        assert_eq!(fold.undeduplicatable.past_the_id_cap, 1);
+        let transcript = [
+            claude_record("msg_1", "claude-opus-5", &usage(0, 10, 0, 0)),
+            claude_record("msg_2", "claude-opus-5", &usage(0, 20, 0, 0)),
+            // The set is full: this id can never be remembered, so its record cannot be
+            // deduplicated against anything.
+            claude_record("msg_3", "claude-opus-5", &usage(0, 40, 0, 0)),
+            // Nor can its repeat, which is therefore counted a second time rather than dropped.
+            claude_record("msg_3", "claude-opus-5", &usage(0, 40, 0, 0)),
+            // An id already in the set still deduplicates normally past the cap.
+            claude_record("msg_1", "claude-opus-5", &usage(0, 10, 0, 0)),
+        ]
+        .join("\n");
+        let fold = fold_cost_tracking(Source::ClaudeCode, 2, transcript.as_bytes(), 2)
+            .expect("v2 is supported");
+
+        assert_eq!(fold.records_read, 5);
+        assert_eq!(fold.messages, 2, "only two ids fit");
+        assert_eq!(
+            fold.duplicate_records, 1,
+            "the tracked id's repeat is still dropped",
+        );
+        assert_eq!(fold.undeduplicatable.past_the_id_cap, 2);
+        assert_eq!(fold.undeduplicatable.without_a_message_id, 0);
+        assert_eq!(fold.undeduplicatable.tokens, 80);
         assert!(fold.undeduplicatable.any());
+        // 10 + 20 for the tracked ids, then 40 twice for the one that could not be tracked: the
+        // over-count is real, and it is exactly what the flag above is warning about.
+        assert_eq!(fold.usage.values().next().unwrap().output, 110);
+
+        // The same transcript under the shipped cap deduplicates everything and flags nothing.
+        let uncapped = fold_claude(&transcript);
+        assert_eq!(uncapped.messages, 3);
+        assert_eq!(uncapped.duplicate_records, 2);
+        assert!(!uncapped.undeduplicatable.any());
+        assert_eq!(uncapped.usage.values().next().unwrap().output, 70);
 
         // And the real cap is far above any session the archive holds — 29,591 message ids
         // across all 623 of them, measured 2026-08-23.
         const { assert!(MAX_TRACKED_MESSAGE_IDS >= 29_591) };
+    }
+
+    /// Token sums saturate rather than wrapping: these are counts read from somebody else's file,
+    /// and an absurd number a reader can see beats a small one they cannot.
+    #[test]
+    fn token_sums_saturate_rather_than_wrapping() {
+        let mut tally = TokenTally {
+            output: u64::MAX - 1,
+            ..TokenTally::default()
+        };
+        tally.absorb(&TokenTally {
+            output: 10,
+            input: 5,
+            ..TokenTally::default()
+        });
+        assert_eq!(tally.output, u64::MAX);
+        assert_eq!(tally.input, 5);
+        assert_eq!(tally.total(), u64::MAX);
     }
 
     /// Thinking tokens are already inside `output`, so they are reported and never added.

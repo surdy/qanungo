@@ -397,8 +397,12 @@ impl ReadClient {
             )));
         }
         if !matches!(compression.as_str(), "identity" | "zstd") {
+            // Clamped for the same reason `error.code` is: this string is a response header the
+            // peer chose, and it travels into a skip reason and out through both lanes' Gaps
+            // section.
             return Err(PatwariError::Protocol(format!(
-                "unknown compression `{compression}`"
+                "unknown compression `{}`",
+                crate::format::identifier(&compression),
             )));
         }
 
@@ -809,8 +813,12 @@ mod tests {
         assert_eq!(meter.count, 0);
     }
 
-    /// `error.code` is the only upstream string that reaches a rendered report, so the clamp on
-    /// it is a redaction control, not tidiness.
+    /// `error.code` is the only string this client lifts out of a body it did not ask to parse,
+    /// and it reaches a rendered report through a skip reason, so the clamp on it is a redaction
+    /// control rather than tidiness. It is not the only upstream string a report renders — the
+    /// harness label and the cost lane's model and repository identifiers are clamped by
+    /// [`crate::format::identifier`] on the same reasoning — but it is the only one recovered
+    /// from an error body, and the shape rule here is stricter because a `code` is a token.
     #[test]
     fn an_error_code_is_rendered_only_when_it_is_shaped_like_one() {
         let code = |body: &str| error_code(body.as_bytes());

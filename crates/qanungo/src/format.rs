@@ -3,10 +3,49 @@
 //! Findings and the report body must agree on how a duration, a rate, or a byte count reads, and
 //! these are the only strings a redacted report contains besides tool names and digests — so
 //! they live in one place rather than being re-improvised per call site.
+//!
+//! [`identifier`] is the exception that proves the rule: it is not a rendering of a number but the
+//! single clamp every *archive-stated* string passes through on its way into a document, and it
+//! lives here for the same reason — one rule, one place, applied by both lanes.
 
 use std::time::Duration;
 
 use chrono::TimeDelta;
+
+/// Longest archive-stated identifier a report will render before replacing it wholesale.
+/// Comfortably over any real model id, harness label, or repository name, and far under anything
+/// that could turn a table cell or a Gaps line into a paragraph.
+pub const MAX_IDENTIFIER_CHARS: usize = 64;
+
+/// Stands in for an archive-stated identifier that is not shaped like one.
+pub const INVALID_IDENTIFIER: &str = "invalid-identifier";
+
+/// An archive-stated identifier — a model id, a billing modifier, a harness label, a repository
+/// name — rendered only when it is shaped like one.
+///
+/// These are the only strings a report lifts out of somebody else's data, and they end up in a
+/// document sworn to carry no upstream free text, so they are clamped on the same reasoning that
+/// clamps Patwari's `error.code` (see [`crate::patwari`]): a peer that is confused, compromised,
+/// or not the archive at all does not get to choose characters in a report. A value carrying a
+/// control character, a newline, a table pipe, or a backtick — or one longer than
+/// [`MAX_IDENTIFIER_CHARS`] — is replaced wholesale rather than truncated, because a prefix of
+/// arbitrary text is still arbitrary text.
+///
+/// Deliberately permissive about everything else, including non-ASCII: `<synthetic>` and a
+/// repository named in a script other than Latin are both real identifiers, and the point of the
+/// clamp is the rendering surface, not the alphabet.
+pub fn identifier(value: &str) -> String {
+    let usable = !value.is_empty()
+        && value.chars().count() <= MAX_IDENTIFIER_CHARS
+        && value
+            .chars()
+            .all(|character| !character.is_control() && !"|`".contains(character));
+    if usable {
+        value.to_owned()
+    } else {
+        INVALID_IDENTIFIER.to_owned()
+    }
+}
 
 /// A wall-clock span as `6h 12m`, `47m`, or `38s`. Coarse on purpose: a coaching report is not
 /// a profiler, and a span rendered to the second invites reading precision into a number whose
@@ -90,7 +129,11 @@ fn grouped(digits: &str) -> String {
 pub fn tokens(count: u64) -> String {
     const UNITS: [(u64, &str); 3] = [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")];
     for (scale, suffix) in UNITS {
-        if count >= scale {
+        // A unit is chosen by what the value will *round* to, not by the raw scale. Rounding to a
+        // tenth can carry a count up into the next unit — 999,950 tokens is "1000.0k" to the
+        // arithmetic and 1.0M to a reader — and a four-digit mantissa beside a unit prefix reads
+        // as a bug. The boundary is therefore `0.99995 * scale`, which is `scale - scale/20000`.
+        if count as f64 >= scale as f64 - scale as f64 / 20_000.0 {
             return format!("{:.1}{suffix}", count as f64 / scale as f64);
         }
     }
@@ -154,6 +197,47 @@ mod tests {
         assert_eq!(tokens(1_500), "1.5k");
         assert_eq!(tokens(26_200_000), "26.2M");
         assert_eq!(tokens(1_400_000_000), "1.4B");
+    }
+
+    /// A count that rounds up into the next unit is promoted rather than printed with a
+    /// four-digit mantissa — `1000.0k` is a rendering bug wearing a plausible face.
+    #[test]
+    fn a_count_that_rounds_into_the_next_unit_is_promoted() {
+        assert_eq!(tokens(999_949), "999.9k");
+        assert_eq!(tokens(999_950), "1.0M");
+        assert_eq!(tokens(1_000_000), "1.0M");
+        assert_eq!(tokens(999), "999");
+        assert_eq!(tokens(1_000), "1.0k");
+        assert_eq!(tokens(999_949_999), "999.9M");
+        assert_eq!(tokens(999_950_000), "1.0B");
+    }
+
+    /// The clamp is a redaction control, not tidiness: it is the only place a peer's bytes reach a
+    /// rendered document, in either lane.
+    #[test]
+    fn an_archive_stated_identifier_is_rendered_only_when_it_is_shaped_like_one() {
+        for good in [
+            "claude-opus-5",
+            "<synthetic>",
+            "surdy/qanungo",
+            "claude-opus-4.8",
+            "copilot-cli",
+            "ansh/परियोजना",
+        ] {
+            assert_eq!(identifier(good), good);
+        }
+        for hostile in [
+            "",
+            "pipes | break | tables",
+            "back`tick",
+            "new\nline",
+            "null\0byte",
+            &"a".repeat(MAX_IDENTIFIER_CHARS + 1),
+        ] {
+            assert_eq!(identifier(hostile), INVALID_IDENTIFIER, "{hostile:?}");
+        }
+        let at_the_limit = "a".repeat(MAX_IDENTIFIER_CHARS);
+        assert_eq!(identifier(&at_the_limit), at_the_limit);
     }
 
     #[test]

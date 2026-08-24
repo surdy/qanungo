@@ -37,6 +37,7 @@ use crate::cache::BlobCache;
 use crate::cli::{ArchiveArgs, CostArgs, ReportArgs, Window};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
+use crate::format;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
 use crate::report::{Instrumentation, Report, SkippedNote};
@@ -339,17 +340,27 @@ impl<'a> Placement<'a> {
 }
 
 /// Groups skips by reason so a systematic gap reads as one line.
+///
+/// The harness label is the archive's string, not this build's — a snapshot manifest states
+/// whatever `session.source_agent` it likes, and an unrecognized one is precisely the case that
+/// reaches [`SkipReason::UnknownAgent`] — so it goes through [`format::identifier`] before it is
+/// interpolated. Both lanes print these lines verbatim in their Gaps section, so clamping here
+/// rather than at either rendering site is what keeps the two from drifting apart, and is why the
+/// coaching report's own claim to render "aggregates, tool names, and `source_hash` references"
+/// survives contact with a hostile archive.
 fn summarize(skipped: &[Skip], unplaceable: usize) -> Vec<SkippedNote> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for skip in skipped {
+        let agent = format::identifier(&skip.source_agent);
         let reason = match &skip.reason {
             SkipReason::NoTranscript => {
-                format!("{}: snapshot has no transcript artifact", skip.source_agent)
+                format!("{agent}: snapshot has no transcript artifact")
             }
-            SkipReason::UnknownAgent(agent) => {
-                format!("{agent}: no interpreter for this harness in this build")
-            }
-            SkipReason::Unreadable(detail) => format!("{}: {detail}", skip.source_agent),
+            SkipReason::UnknownAgent(named) => format!(
+                "{}: no interpreter for this harness in this build",
+                format::identifier(named),
+            ),
+            SkipReason::Unreadable(detail) => format!("{agent}: {detail}"),
         };
         *counts.entry(reason).or_default() += 1;
     }
@@ -391,6 +402,54 @@ mod tests {
         assert_eq!(notes[0].count, 2);
         assert!(notes[0].reason.contains("no transcript artifact"));
         assert_eq!(notes[1].count, 1);
+    }
+
+    /// A skip line names a harness the *archive* named, so a manifest can put anything it likes
+    /// in it — and both lanes print these lines verbatim in their Gaps section. The clamp is
+    /// therefore a redaction control on the coaching report as much as on the cost one, which is
+    /// why it lives here rather than at either rendering site.
+    #[test]
+    fn a_hostile_harness_label_cannot_break_out_of_a_gaps_line() {
+        let hostile = |agent: &str, reason: SkipReason| Skip {
+            source_agent: agent.to_owned(),
+            reason,
+        };
+        let notes = summarize(
+            &[
+                hostile("claude-code | evil", SkipReason::NoTranscript),
+                hostile(
+                    "fine",
+                    SkipReason::UnknownAgent("newline\ninjected".to_owned()),
+                ),
+                hostile(
+                    "back`tick",
+                    SkipReason::Unreadable("cache read failed".to_owned()),
+                ),
+            ],
+            0,
+        );
+        let rendered = notes
+            .iter()
+            .map(|note| note.reason.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for hostile in ["claude-code | evil", "newline\ninjected", "back`tick"] {
+            assert!(
+                !rendered.contains(hostile),
+                "{hostile:?} survived: {rendered}"
+            );
+        }
+        assert_eq!(
+            rendered.matches(format::INVALID_IDENTIFIER).count(),
+            3,
+            "each of the three is replaced wholesale, not truncated: {rendered}",
+        );
+        // An ordinary label is untouched, so the clamp costs the common case nothing.
+        let ordinary = summarize(&[hostile("claude-code", SkipReason::NoTranscript)], 0);
+        assert_eq!(
+            ordinary[0].reason,
+            "claude-code: snapshot has no transcript artifact",
+        );
     }
 
     fn at(value: &str) -> DateTime<Utc> {

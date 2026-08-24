@@ -36,8 +36,13 @@
 //! - `speed` — fast mode bills the same model at a distinct, higher tier ([`Rates::fast`]). A
 //!   `fast` reading on a model with no fast row, or any spelling neither this build nor the
 //!   research file recognizes, leaves the usage unpriced rather than priced at the base rate.
-//! - `inference_geo` — `us` is a flat [`US_GEO_MULTIPLIER`] on every category. Any other region
-//!   this build has no multiplier for leaves the usage unpriced.
+//! - `inference_geo` — `us` is a flat [`US_GEO_MULTIPLIER`] on every category, **but only for the
+//!   models the research file scopes it to** (it records the premium as "Claude 4.6+"). It is
+//!   therefore a per-row property, [`PriceRow::us_geo_multiplier`], and not a global constant:
+//!   this table holds a pre-4.6 model, and charging Haiku 4.5 a premium the source never
+//!   documents would be inventing a rate — the one thing this module exists not to do. A row with
+//!   no multiplier for the region, and any region this build does not recognize at all, leaves
+//!   the usage unpriced.
 //! - `service_tier` — anything other than `standard` (or absent) is priced by a different
 //!   schedule (batch at 0.5x, priority at a premium), and this table holds none of them, so such
 //!   usage is unpriced.
@@ -67,8 +72,12 @@ pub const STANDARD_SERVICE_TIER: &str = "standard";
 /// The `inference_geo` reading that carries [`US_GEO_MULTIPLIER`].
 pub const US_INFERENCE_GEO: &str = "us";
 
-/// US-only inference bills 1.1x on every token category (research file §1, "Other modifiers").
-/// A multiplier rather than a second set of rows because it is documented as exactly that.
+/// US-only inference bills 1.1x on every token category, **for Claude 4.6 and later** (research
+/// file §1, "Other modifiers": `inference_geo "us" = 1.1x (Claude 4.6+)`).
+///
+/// A multiplier rather than a second set of rows because the source documents it as exactly that.
+/// Which rows may carry it is [`PriceRow::us_geo_multiplier`]'s business, because the qualifier in
+/// that source line is part of the fact and not decoration.
 pub const US_GEO_MULTIPLIER: f64 = 1.1;
 
 /// Tokens per unit of the published rates. Anthropic quotes dollars per million tokens (MTok),
@@ -114,6 +123,16 @@ pub struct PriceRow {
     /// for the model — usage recording `speed = "fast"` against it is then unpriced rather than
     /// priced at [`PriceRow::rates`], because fast mode demonstrably bills more.
     pub fast: Option<Rates>,
+    /// The US-only inference premium, for the models the research file documents it for.
+    ///
+    /// `Some(`[`US_GEO_MULTIPLIER`]`)` on every Claude 4.6+ row; `None` on Haiku 4.5, which
+    /// predates the qualifier the source attaches to that figure. A `None` row that meets
+    /// `inference_geo = "us"` yields [`Unpriced::InferenceGeo`] rather than being priced at the
+    /// base rate *or* at a premium nobody published: both of those would be a claim about a bill
+    /// that this table's provenance does not support, and the second would be the more expensive
+    /// mistake. If a source is later found that settles the pre-4.6 case, it becomes a value here
+    /// and a line in the research file, not a code change.
+    pub us_geo_multiplier: Option<f64>,
 }
 
 impl PriceRow {
@@ -163,6 +182,9 @@ pub const PRICES: &[PriceRow] = &[
             cache_read: 0.10,
         },
         fast: None,
+        // Pre-4.6, and the research file scopes the US premium to "Claude 4.6+". No source, no
+        // multiplier: `inference_geo = "us"` against this row is flagged, not charged.
+        us_geo_multiplier: None,
     },
     // Claude Opus 4.8, launched 2026-05-28 at $5/$25, with a fast tier (research file §1).
     PriceRow {
@@ -176,6 +198,7 @@ pub const PRICES: &[PriceRow] = &[
             cache_read: 0.50,
         },
         fast: Some(OPUS_FAST),
+        us_geo_multiplier: Some(US_GEO_MULTIPLIER),
     },
     // Claude Fable 5, launched 2026-06-09 at $10/$50 (research file §1). The 2026-06-12 →
     // 2026-06-30 availability gap was an export-control review, not a price change, so it is not
@@ -191,6 +214,7 @@ pub const PRICES: &[PriceRow] = &[
             cache_read: 1.00,
         },
         fast: None,
+        us_geo_multiplier: Some(US_GEO_MULTIPLIER),
     },
     // Claude Sonnet 5, launched 2026-06-30 at $2/$10 (research file §1). The introductory price
     // was made permanent on 2026-08-10, so one row covers all of its usage, past and future.
@@ -205,6 +229,7 @@ pub const PRICES: &[PriceRow] = &[
             cache_read: 0.20,
         },
         fast: None,
+        us_geo_multiplier: Some(US_GEO_MULTIPLIER),
     },
     // Claude Opus 5, launched 2026-07-24 at $5/$25, with the same fast tier as Opus 4.8
     // (research file §1).
@@ -219,6 +244,7 @@ pub const PRICES: &[PriceRow] = &[
             cache_read: 0.50,
         },
         fast: Some(OPUS_FAST),
+        us_geo_multiplier: Some(US_GEO_MULTIPLIER),
     },
 ];
 
@@ -336,9 +362,15 @@ pub fn price_for(
         },
         Some(other) => return Price::Unpriced(Unpriced::Speed(other.to_owned())),
     };
+    // The region premium is the row's to grant: the research file records it for Claude 4.6+, so
+    // a row predating that qualifier has no documented rate for US-only inference at all, and
+    // neither the base rate nor an undocumented premium would be an honest answer for it.
     let multiplier = match inference_geo {
         None => 1.0,
-        Some(US_INFERENCE_GEO) => US_GEO_MULTIPLIER,
+        Some(US_INFERENCE_GEO) => match row.us_geo_multiplier {
+            Some(multiplier) => multiplier,
+            None => return Price::Unpriced(Unpriced::InferenceGeo(US_INFERENCE_GEO.to_owned())),
+        },
         Some(other) => return Price::Unpriced(Unpriced::InferenceGeo(other.to_owned())),
     };
     Price::Priced {
@@ -458,6 +490,7 @@ mod tests {
                     cache_read: 0.1,
                 },
                 fast: None,
+                us_geo_multiplier: None,
             },
             PriceRow {
                 model: "example",
@@ -470,6 +503,7 @@ mod tests {
                     cache_read: 0.3,
                 },
                 fast: None,
+                us_geo_multiplier: None,
             },
         ];
         assert_eq!(latest(&repriced, at("2026-03-01T00:00:00Z")), Some(1.0));
@@ -548,6 +582,39 @@ mod tests {
             ),
             Price::Unpriced(Unpriced::InferenceGeo("moon".to_owned())),
         );
+    }
+
+    /// The premium is scoped by its own source line — "Claude 4.6+" — so the one pre-4.6 row in
+    /// this table does not get it. Neither the base rate nor an undocumented 1.1x is an honest
+    /// answer for US-only inference on Haiku 4.5, so it is flagged instead, and the same model
+    /// with no region recorded still prices normally.
+    #[test]
+    fn a_model_the_research_does_not_scope_the_region_premium_to_is_not_charged_one() {
+        let haiku = "claude-haiku-4-5-20251001";
+        let when = Some(at("2026-08-01T00:00:00Z"));
+        assert_eq!(
+            price_for(Some(haiku), None, None, Some(US_INFERENCE_GEO), when),
+            Price::Unpriced(Unpriced::InferenceGeo(US_INFERENCE_GEO.to_owned())),
+        );
+        assert!(
+            matches!(
+                price_for(Some(haiku), None, None, None, when),
+                Price::Priced { multiplier, .. } if multiplier == 1.0,
+            ),
+            "a row with no region premium still prices ordinary usage",
+        );
+
+        // The scoping is a property of the row, not of this test: exactly the rows the research
+        // file calls 4.6+ carry the multiplier.
+        for row in PRICES {
+            let expected = row.model != haiku;
+            assert_eq!(
+                row.us_geo_multiplier.is_some(),
+                expected,
+                "{} carries the wrong region-premium scoping",
+                row.model,
+            );
+        }
     }
 
     /// `<synthetic>` is claude-code's own placeholder, not a model: its tokens are reported and
