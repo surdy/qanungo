@@ -1605,6 +1605,49 @@ fn the_report_command_runs_end_to_end_against_the_archive() {
     assert!(markdown.contains("Nothing crossed a rule threshold"));
 }
 
+/// The standup lane through the binary: a real archive shape in, a real document out, with the
+/// redaction flags doing what the footer says they did.
+#[test]
+fn the_standup_command_runs_end_to_end_against_the_archive() {
+    let session = ArchivedSession::claude(11, TRANSCRIPT, "zstd").with_summary(SUMMARY);
+    let (base, _requests) = spawn_archive(vec![session]);
+    let directory = tempfile::tempdir().unwrap();
+
+    let run = |flags: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_qanungo"))
+            .args(["standup", "--last", "30d", "--patwari-url", &base])
+            .args(flags)
+            .arg("--cache-dir")
+            .arg(directory.path().join("qanungo"))
+            .env_remove("PATWARI_URL")
+            .output()
+            .expect("the binary runs");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let markdown = run(&[]);
+    assert!(markdown.starts_with("# Standup — last 30d"));
+    assert!(markdown.contains("**1 sessions across 1 repository**"));
+    assert!(markdown.contains("## surdy/qanungo"));
+    assert!(markdown.contains("### Ship the scoring lane behind a rule pack stamp"));
+    assert!(markdown.contains("## Decisions"));
+    assert!(markdown.contains("## Open items"));
+    assert!(markdown.contains("scrubbed for secrets"));
+    assert!(markdown.contains("_Instrumentation —"));
+    // The summary was fetched, not the transcript beside it: one miss, and the second run below
+    // is a hit against the same cache directory.
+    assert!(markdown.contains("cache 0 hits / 1 misses"));
+
+    let again = run(&["--no-redact"]);
+    assert!(again.contains("cache 1 hits / 0 misses"));
+    assert!(again.contains("**not scrubbed for secrets** (`--no-redact`)"));
+}
+
 /// The context Patwari projects onto a session row is the only place the cost lane can learn
 /// which repository the money was spent in, so it has to survive the mirror rather than being
 /// re-derived from a snapshot that may not be the one the window selected.

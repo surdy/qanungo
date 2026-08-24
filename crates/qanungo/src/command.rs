@@ -1,11 +1,11 @@
-//! The commands: the vertical slice's spine, and the second lane over the same spine.
+//! The commands: the vertical slice's spine, and the lanes over the same spine.
 //!
 //! sync → fold → emit, in one pass, with the fold timed separately from the network so the
 //! instrumentation footer measures what it claims to measure. [`report`] evaluates rules and
-//! scores between the fold and the emit; [`cost`] prices instead. Everything before that fork —
-//! opening the cache, listing the window, mirroring an artifact per session, cutting the result
-//! into the reported and comparison windows — is [`Prepared`] and is shared, so the lanes cannot
-//! come to disagree about what "the last 30 days" selected.
+//! scores between the fold and the emit; [`cost`] prices instead; [`standup`] renders what the
+//! sessions said about themselves. Everything before that fork — opening the cache, listing the
+//! window, mirroring an artifact per session, cutting the result into windows — is [`Prepared`]
+//! and is shared, so the lanes cannot come to disagree about what "the last 30 days" selected.
 //!
 //! # Two windows, one pass
 //!
@@ -26,6 +26,9 @@
 //! Archive time is also the clock the cost lane selects a **price row** as of, so a window
 //! spanning a price change reports each session at what it cost when it was taken.
 //!
+//! The standup lane asks for one window rather than two ([`Reach`]). A narrative has no trend
+//! arrow to draw, so the second window would be a doubling of the listing, the fetching, and the
+//! cache traffic to produce nothing the document renders.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Write};
@@ -35,7 +38,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::cache::BlobCache;
-use crate::cli::{ArchiveArgs, CostArgs, ReportArgs, Window};
+use crate::cli::{ArchiveArgs, CostArgs, ReportArgs, StandupArgs, Window};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
 use crate::format;
@@ -44,6 +47,8 @@ use crate::patwari::{PatwariError, ReadClient};
 use crate::report::{Instrumentation, Report, SkippedNote};
 use crate::rules;
 use crate::scoring::RulePack;
+use crate::standup::{Gap, ReadSummary, Standup};
+use crate::standup_report::{StandupInstrumentation, StandupReport};
 use crate::sync::{self, Artifact, Mirror, MirroredSession, Skip, SkipReason};
 
 #[derive(Debug, Error)]
@@ -67,7 +72,12 @@ pub enum CommandError {
 /// Returns an error when the cache is unusable, the archive window cannot be listed, or the
 /// report cannot be written. A single unreadable session is a reported gap, not a failure.
 pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(&args.archive, &args.last, Artifact::Transcript)?;
+    let prepared = Prepared::mirror(
+        &args.archive,
+        &args.last,
+        Artifact::Transcript,
+        Reach::WindowPair,
+    )?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -131,7 +141,12 @@ pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandErro
 /// Returns an error on the same three conditions [`report`] does, and for the same reason: a
 /// single unreadable session is a gap the document states, never a failed run.
 pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(&args.archive, &args.last, Artifact::Transcript)?;
+    let prepared = Prepared::mirror(
+        &args.archive,
+        &args.last,
+        Artifact::Transcript,
+        Reach::WindowPair,
+    )?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -186,6 +201,72 @@ pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
         .map_err(CommandError::Output)
 }
 
+/// Runs `qanungo standup`, writing Markdown to `out`.
+///
+/// The same mirror and the same window machinery, pointed at each session's `summary.md` instead
+/// of its transcript, and the first lane whose document renders text somebody typed into a
+/// terminal. Everything it renders is scrubbed by [`Standup::fold`] before the renderer sees it,
+/// with the redactor the flags asked for and secrets on unless `--no-redact` said otherwise; the
+/// footer states which passes ran and what they fired.
+///
+/// # Errors
+///
+/// Returns an error on the same three conditions the other lanes do. A session with no summary, an
+/// unparseable one, and a placeholder are each a stated gap, never a failed run.
+pub fn standup(args: &StandupArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let prepared = Prepared::mirror(
+        &args.archive,
+        &args.last,
+        Artifact::Summary,
+        Reach::WindowOnly,
+    )?;
+
+    let fold_started = Instant::now();
+    let placed = prepared.placement();
+    let mut gaps: Vec<Gap> = prepared.mirror.skipped.iter().map(Gap::from_skip).collect();
+    let mut read: Vec<ReadSummary> = Vec::with_capacity(placed.reported.len());
+    for session in &placed.reported {
+        match crate::standup::read_summary(&prepared.cache, session) {
+            Ok(summary) => read.push(summary),
+            Err(reason) => gaps.push(Gap {
+                source_agent: session.source_agent.clone(),
+                reason,
+            }),
+        }
+    }
+    let folded = Standup::fold(&read, &gaps, placed.unplaceable, &args.redaction.redactor());
+    let fold_elapsed = fold_started.elapsed();
+
+    let instrumentation = StandupInstrumentation {
+        sync: prepared.mirror.stats.clone(),
+        fold_elapsed,
+        redactor: args.redaction.redactor(),
+        patwari_url: prepared.patwari_url.clone(),
+        cache_root: prepared.cache.root().to_path_buf(),
+    };
+    let markdown = StandupReport {
+        window: &args.last,
+        generated_at: prepared.generated_at,
+        standup: &folded,
+        instrumentation: &instrumentation,
+    }
+    .render();
+
+    out.write_all(markdown.as_bytes())
+        .map_err(CommandError::Output)
+}
+
+/// How much history a lane asks the mirror for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The reported window and the equal-length one before it — what a trend arrow costs, paid by
+    /// the two lanes that draw one.
+    WindowPair,
+    /// The reported window alone. A standup narrates one window; there is no arrow to draw, so
+    /// mirroring a second window would double the listing and the transfers to render nothing.
+    WindowOnly,
+}
+
 /// Everything a lane does before it decides what to fold: the cache, the mirrored window pair,
 /// and the three instants both halves are cut on.
 ///
@@ -207,6 +288,7 @@ impl Prepared {
         archive: &ArchiveArgs,
         window: &Window,
         artifact: Artifact,
+        reach: Reach,
     ) -> Result<Self, CommandError> {
         let cache = match &archive.cache_dir {
             Some(dir) => BlobCache::open(dir),
@@ -222,7 +304,13 @@ impl Prepared {
 
         let generated_at = Utc::now();
         let opens_at = window.opens_at(generated_at);
-        let comparison_opens_at = window.comparison_opens_at(generated_at);
+        // A lane that draws no comparison has none, which is the same state a window too long to
+        // double is already in: `placement` then puts anything older in neither half, and the
+        // listing never asked for it in the first place.
+        let comparison_opens_at = match reach {
+            Reach::WindowPair => window.comparison_opens_at(generated_at),
+            Reach::WindowOnly => None,
+        };
         // The mirror is asked for both windows at once when there is a comparison window to ask
         // for.
         let activity_from = comparison_opens_at

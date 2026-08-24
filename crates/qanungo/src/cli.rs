@@ -10,11 +10,11 @@
 //! into each of them, so a flag means the same thing wherever it is typed and a third lane
 //! inherits it by declaring one field.
 //!
-//! [`RedactionArgs`] is the same idea one lane early. Neither command here renders transcript
-//! content, so neither flattens it (see [`crate::redaction`] for why attaching it anyway would be
-//! decoration); it is defined now so that the first lane that *does* render content — `qanungo
-//! standup`, qanungo #9 — inherits the flag surface rather than inventing one, and so that the
-//! spelling of `--no-redact` is settled before anything depends on it.
+//! [`RedactionArgs`] was defined one lane early for the same reason and is now live: `qanungo
+//! standup` (qanungo #9) is the first command that renders archived prose, so it is the first —
+//! and so far only — command to flatten it. `report` and `cost` still do not, and attaching it to
+//! them would be decoration over documents that carry no content at all (see
+//! [`crate::redaction`]).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -28,6 +28,16 @@ use crate::redaction::{FILTER_PROFANITY_BY_DEFAULT, REDACT_SECRETS_BY_DEFAULT, R
 /// archive's own subnet). Same name session-recall uses. Overridable for a tunnel, a
 /// laptop-local server, or a second archive.
 pub const DEFAULT_PATWARI_URL: &str = "https://patwari.clusterfault.com";
+
+/// How far back a standup reaches when nobody says otherwise.
+///
+/// **A tunable, not a decision.** A week is what "what have I been up to" usually means and what
+/// a Monday standup covers, and it is short enough that the document stays readable when every
+/// session in it is rendered in full — which is the property that separates this lane from
+/// `report` and `cost`, whose output is a fixed size however long the window. The issue's own
+/// text says `30d`; that produces a document nobody reads to the end of, so the default is a week
+/// and `--last 30d` still says exactly what the issue asked for.
+pub const DEFAULT_STANDUP_WINDOW: &str = "7d";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,6 +56,8 @@ pub enum Command {
     Report(ReportArgs),
     /// Fold recent archived sessions into a Markdown token/cost breakdown on stdout.
     Cost(CostArgs),
+    /// Narrate recent archived sessions from their own summaries, as Markdown on stdout.
+    Standup(StandupArgs),
 }
 
 /// How to reach the archive, shared by every lane. Flattened rather than repeated so
@@ -123,6 +135,24 @@ pub struct CostArgs {
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
+}
+
+/// The standup lane, and the first command to flatten [`RedactionArgs`].
+///
+/// Three flattened groups rather than three sets of near-identical flags: `--patwari-url` means
+/// what it means in every other lane, and `--no-redact` will mean what it means in every lane
+/// after this one.
+#[derive(Debug, Args)]
+pub struct StandupArgs {
+    /// How far back to narrate, as `<count><unit>` with unit `h`, `d`, or `w`.
+    #[arg(long = "last", default_value = DEFAULT_STANDUP_WINDOW, value_parser = parse_window)]
+    pub last: Window,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
+
+    #[command(flatten)]
+    pub redaction: RedactionArgs,
 }
 
 /// A report window, kept in the spelling the operator typed so the report can echo it back.
@@ -256,7 +286,7 @@ mod tests {
         for bad in ["0", "9", "64", "-1", "many"] {
             assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
         }
-        for command in ["report", "cost"] {
+        for command in ["report", "cost", "standup"] {
             assert!(Cli::try_parse_from(["qanungo", command, "--concurrency", "64"]).is_err());
         }
     }
@@ -287,33 +317,63 @@ mod tests {
         assert!(Cli::try_parse_from(["qanungo", "cost", "--last", "3m"]).is_err());
     }
 
-    /// Both lanes reach the archive through the same flattened arguments, so a flag means the
+    /// The standup lane narrates one window a person can read to the end of. The issue's `30d` is
+    /// still typeable; it is simply not what a run with no flags means.
+    #[test]
+    fn standup_defaults_to_a_week_of_the_lan_archive() {
+        let Command::Standup(args) = Cli::parse_from(["qanungo", "standup"]).command else {
+            panic!("`standup` parses as the standup command");
+        };
+        assert_eq!(args.last.to_string(), DEFAULT_STANDUP_WINDOW);
+        assert_eq!(args.last.delta(), TimeDelta::days(7));
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
+        assert!(args.archive.cache_dir.is_none());
+
+        let Command::Standup(month) =
+            Cli::parse_from(["qanungo", "standup", "--last", "30d"]).command
+        else {
+            panic!("`standup` parses as the standup command");
+        };
+        assert_eq!(month.last.delta(), TimeDelta::days(30));
+    }
+
+    /// Every lane reaches the archive through the same flattened arguments, so a flag means the
     /// same thing wherever it is typed.
     #[test]
     fn every_lane_takes_the_same_archive_arguments() {
         let arguments = ["--patwari-url", "http://127.0.0.1:9", "--concurrency", "2"];
-        let report = Cli::parse_from(
-            ["qanungo", "report"]
-                .into_iter()
-                .chain(arguments)
-                .collect::<Vec<_>>(),
-        );
-        let cost = Cli::parse_from(
-            ["qanungo", "cost"]
-                .into_iter()
-                .chain(arguments)
-                .collect::<Vec<_>>(),
-        );
-        let (Command::Report(report), Command::Cost(cost)) = (report.command, cost.command) else {
+        let parse = |command: &str| {
+            Cli::parse_from(
+                ["qanungo", command]
+                    .into_iter()
+                    .chain(arguments)
+                    .collect::<Vec<_>>(),
+            )
+            .command
+        };
+        let (Command::Report(report), Command::Cost(cost), Command::Standup(standup)) =
+            (parse("report"), parse("cost"), parse("standup"))
+        else {
             panic!("each subcommand parses as itself");
         };
-        assert_eq!(report.archive.patwari_url, cost.archive.patwari_url);
-        assert_eq!(report.archive.concurrency, cost.archive.concurrency);
+        for archive in [&cost.archive, &standup.archive] {
+            assert_eq!(report.archive.patwari_url, archive.patwari_url);
+            assert_eq!(report.archive.concurrency, archive.concurrency);
+        }
     }
 
-    /// [`RedactionArgs`] is flattened by no command yet — qanungo #9 is the first lane that
-    /// renders transcript content — so its flag surface is parsed here through a stand-in the way
-    /// a real lane will, which keeps the spelling and the defaults pinned in the meantime.
+    /// The redaction flags go live on `standup` and nowhere else: `report` and `cost` render no
+    /// archived prose, so a `--no-redact` on either would be a switch over nothing.
+    #[test]
+    fn only_the_lane_that_renders_prose_takes_the_redaction_flags() {
+        assert!(Cli::try_parse_from(["qanungo", "standup", "--no-redact"]).is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
+    }
+
+    /// [`RedactionArgs`] is exercised through the same stand-in the redaction lane pinned it with,
+    /// so the flag surface stays pinned independently of which commands happen to flatten it.
     #[derive(Debug, Parser)]
     struct RenderingLane {
         #[command(flatten)]
@@ -323,6 +383,30 @@ mod tests {
     #[test]
     fn the_redaction_flags_are_well_formed() {
         RenderingLane::command().debug_assert();
+    }
+
+    /// What `standup` builds out of the flags is the same redactor the stand-in builds out of
+    /// them: typing nothing scrubs secrets and leaves swearing alone.
+    #[test]
+    fn the_standup_lane_redacts_by_default_and_stops_only_when_told_to() {
+        let redactor = |flags: &[&str]| {
+            let Command::Standup(args) = Cli::parse_from(
+                ["qanungo", "standup"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+            .command
+            else {
+                panic!("`standup` parses as the standup command");
+            };
+            args.redaction.redactor()
+        };
+        assert_eq!(redactor(&[]), crate::redaction::Redactor::new());
+        assert!(redactor(&[]).redacts_secrets());
+        assert!(!redactor(&[]).filters_profanity());
+        assert!(!redactor(&["--no-redact"]).redacts_secrets());
+        assert!(redactor(&["--filter-profanity"]).filters_profanity());
     }
 
     /// Typing nothing must be the safe reading: secrets scrubbed, profanity left alone.

@@ -75,6 +75,32 @@
 //!
 //! The issue's other half — `0o600`/`0o700` on the blob cache — was already true and already
 //! tested before this lane; see [`cache`].
+//!
+//! # The standup lane (qanungo #9)
+//!
+//! ```text
+//! qanungo standup --last 7d
+//! ```
+//!
+//! is the third lane and the first that renders prose. It reads the `summary.md` every snapshot
+//! carries (munshi ADR 0009/0010) rather than the transcript beside it, parses it with the
+//! promoted `munshi-transcript` parser, and emits the sessions grouped by repository, newest first,
+//! with the window's decisions and open items rolled up beneath them ([`standup`],
+//! [`standup_report`]). Four properties are what make it honest:
+//!
+//! - **The archive's own words.** No model, no reconstruction; the summary was written by the
+//!   harness that was in the session. Qanungo selects, orders, groups, and deduplicates.
+//! - **The redactor, on the way in.** This is the standing rule's first consumer: every string the
+//!   document renders is scrubbed inside the fold, so the renderer has no unscrubbed copy to leak
+//!   by accident, and the footer stamps the pattern revision, the passes that ran, and what fired
+//!   as counts per pattern id.
+//! - **No signal, no claim.** A session with no summary anywhere, an unparseable one, and munshi's
+//!   own placeholder each land in Gaps with the reason, and never in the narrative.
+//! - **Its own bounds.** A `summary.md` is kilobytes where a transcript is megabytes, so the
+//!   download that fetches one believes a ceiling three orders of magnitude lower
+//!   ([`patwari::MAX_DECLARED_SUMMARY_BYTES`]) — and the *same* mirror, cache, and sibling-fallback
+//!   discipline otherwise, because a lane that selected its window differently would be describing
+//!   a different week.
 
 pub mod cache;
 pub mod cli;
@@ -90,4 +116,6 @@ pub mod redaction;
 pub mod report;
 pub mod rules;
 pub mod scoring;
+pub mod standup;
+pub mod standup_report;
 pub mod sync;

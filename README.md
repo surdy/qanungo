@@ -83,21 +83,51 @@ because a transcript cannot say which of Copilot's two billing regimes the accou
 by-machine cut the issue asks for is deferred rather than faked: Patwari's session projection
 carries `repository` and no hostname.
 
+**The redaction layer** ([#8](https://github.com/surdy/qanungo/issues/8)) shipped ahead of the first
+surface that needed it: a scrub with two independently switched passes — secrets **on** by default,
+profanity off — anchored on structure (a vendor prefix, a length class, a charset, a key name)
+rather than on entropy, with every pattern's provenance dated and committed beside it
+([`docs/redaction-patterns-2026-08-24.md`](docs/redaction-patterns-2026-08-24.md)). Its report
+carries counts per pattern id and *nothing about what it matched* — no offset, no excerpt, not even
+in `Debug` — because the thing that ends up in a footer or a panic message must not be the leak.
+`report` and `cost` are deliberately not wired to it: a filter over a document that carries no
+transcript content can only be decoration, and decoration in a security control invites the reader
+to trust it.
+
+**The standup lane** ([#9](https://github.com/surdy/qanungo/issues/9)) is the third lane and the
+first that renders prose. `qanungo standup` reads the `summary.md` every snapshot already carries —
+munshi's own curated record of the session, written when it was captured (munshi ADR 0009/0010) —
+rather than the transcript beside it, and emits sessions grouped by repository (busiest first,
+sessions newest first), then the window's decisions and open items rolled up across every repository
+with exact repeats dropped. **No model reconstructs anything**: qanungo selects, orders, groups, and
+deduplicates the archive's own words, which is what makes it cheaper and better-grounded than an LLM
+chronicle over raw sessions. It is #8's first consumer, and the wiring is structural — the scrub
+happens in the fold, so the renderer holds no unscrubbed copy of a field to leak by accident, and
+the footer states which passes ran, what they fired as counts per pattern id, and the pattern
+revision they fired from. A session with no summary anywhere, one this build cannot parse, and
+munshi's own placeholder each land in **Gaps** with the reason, never in the narrative and never
+silently dropped.
+
 ```sh
 cargo run -- report --last 30d                       # the production archive on the LAN
 cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
 cargo run -- cost --last 12w                         # a quarter, in the units the grammar has
+cargo run -- standup --last 7d                       # a week you can read to the end of
+cargo run -- standup --last 30d --no-redact          # secrets unscrubbed, and the footer says so
 ```
 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
 minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default.
 
-`--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the transcript cache, which
-otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` /
-`0o600`. Both flags work on either lane. The coaching report renders **aggregates, tool names, and
-content hashes only**, and the cost report adds exactly the model, billing-modifier, and repository
-identifiers the archive itself recorded, each clamped on the way out — never transcript content, in
-either. Rule thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
+`--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the blob cache, which otherwise
+lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
+flags work on every lane. The coaching report renders **aggregates, tool names, and content hashes
+only**, and the cost report adds exactly the model, billing-modifier, and repository identifiers the
+archive itself recorded, each clamped on the way out — never transcript content, in either. The
+standup is the one document that does render archived prose, and it is the one that takes
+`--no-redact` and `--filter-profanity`; there is no `--redact`, because losing the scrub should be
+something a reader of the command line, and of the document's own footer, can see happened. Rule
+thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
 constants in `crates/qanungo/src/scoring.rs` are the same kind of knob — all explicitly arbitrary
 until the footer's fold-cost and rule-firing data say otherwise. The prices in
 `crates/qanungo/src/pricing.rs` are the opposite kind of number: not a knob at all, but a sourced

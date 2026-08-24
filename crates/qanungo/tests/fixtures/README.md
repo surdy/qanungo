@@ -75,3 +75,35 @@ envelope keys, and a redaction test renders a full cost report and asserts that 
 survives. That test is a stronger claim here than in `rules/`: the cost fold never reads a
 record's classification at all, so the canaries have no path to the document even in principle,
 and the test exists to keep it that way.
+
+## `standup/`
+
+Synthesized here for the standup lane (qanungo #9), because nothing above is a `summary.md` at
+all — every other fixture in this tree is a transcript, and this lane never reads one.
+
+Each file is a real munshi archive record: YAML frontmatter plus the headed Markdown body
+`munshi_transcript::parse_archive_markdown` reads back, with the cursor fields consistent enough to
+pass the parser's own cross-checks (`source_prefix_hash == source_hash`,
+`source_cursor_records == source_cursor`, `source_cursor_bytes == source_bytes`). They are stored
+into a real `BlobCache` under their own content hash by `tests/standup.rs`, so the cache read, the
+UTF-8 check, the parse, and the placeholder verdict all run for real.
+
+| File | Shape | Pins |
+| --- | --- | --- |
+| `qanungo-scoring.md` | `surdy/qanungo`, branch `main`, two decisions, one open item | grouping, the rollup's reading order |
+| `qanungo-cost.md` | the same repository, archived later, on a different branch | newest-first ordering, the rollup's exact-duplicate drop (it repeats one of the scoring summary's decisions verbatim) |
+| `munshi-tombstone.md` | `surdy/munshi`, one session, `copilot-cli` | the second repository group, and that a group's order is by session count |
+| `no-repository.md` | names no `repository` and no `branch` | the labelled unattributed bucket, and that it sorts last |
+| `placeholder.md` | carries `summary_placeholder: true` and the `munshi-placeholder-summary` tag | the placeholder gap — its stand-in prose must never reach the document |
+| `not-an-archive.md` | plain Markdown, no frontmatter | the unparseable gap |
+
+`qanungo-cost.md` additionally carries three planted, live-*shaped* credentials — a GitHub classic
+token, an Anthropic key, and an AWS access key id — one in a work item, one in a decision, one in an
+open item. They are the load-bearing fixture of the whole lane: a rendered standup must contain
+none of them and three `[REDACTED:…]` markers instead, `--no-redact` must bring all three back, and
+the sentences around them must be untouched. None of these strings has ever been a real credential;
+each is a shape with `CANARY` spelled through its body.
+
+`munshi-tombstone.md` is `copilot-cli` on purpose. A `summary.md` is munshi's own format whatever
+harness produced the session, so the standup lane asks nothing about interpreters — and a fixture
+under a second harness is what keeps that from silently becoming untrue.
