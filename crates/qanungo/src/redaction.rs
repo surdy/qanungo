@@ -467,22 +467,37 @@ fn marker_end(bytes: &[u8], at: usize) -> Option<usize> {
 /// in a sentence about token prefixes while accepting every real one.
 const GITHUB_CLASSIC_BODY_CHARS: usize = 36;
 
-/// Extends a token through a dot-separated base64url tail, if it has one.
+/// Dot-separated segments a tail must have before it is taken as a JWT's. A JWT is `x.y.z`, so
+/// after a word-byte run has swallowed the header there are exactly **two** left.
+const JWT_TAIL_SEGMENTS: usize = 2;
+
+/// Extends a `ghs_` token through the dot-separated tail of a stateless installation token.
 ///
 /// GitHub began issuing **stateless** installation tokens shaped `ghs_<app id>_<JWT>` in April
 /// 2026, warning integrators that installation tokens are no longer 40 characters. A JWT is
 /// dot-separated, and a run of word bytes stops dead at the first dot — which would replace the
-/// `ghs_` prefix and leave the payload and signature on the screen. Nothing else this pattern
-/// meets has a dotted base64url tail, so extending through one costs no precision.
-fn dotted_tail(bytes: &[u8], mut end: usize) -> usize {
-    while bytes.get(end) == Some(&b'.') {
-        let segment = run(bytes, end + 1, is_base64url);
+/// `ghs_` prefix and leave the payload and signature on the screen.
+///
+/// Two guards keep that from eating prose, and both were review findings. It runs for `ghs_`
+/// alone, because that is the only prefix GitHub gave a dotted format to; and it demands the
+/// [`JWT_TAIL_SEGMENTS`] a JWT actually has, because one dot and one word is a sentence —
+/// `ghp_…456.Then restart` must keep its `.Then`.
+fn stateless_tail(bytes: &[u8], end: usize) -> usize {
+    let mut extended = end;
+    let mut segments = 0;
+    while bytes.get(extended) == Some(&b'.') {
+        let segment = run(bytes, extended + 1, is_base64url);
         if segment == 0 {
             break;
         }
-        end += 1 + segment;
+        extended += 1 + segment;
+        segments += 1;
     }
-    end
+    if segments >= JWT_TAIL_SEGMENTS {
+        extended
+    } else {
+        end
+    }
 }
 /// Body length a `github_pat_` token must reach. The fine-grained format is 82 word characters
 /// after the prefix; 40 is the floor kept here so a future length change does not silently stop
@@ -500,7 +515,12 @@ fn github_token(bytes: &[u8], at: usize) -> Option<Hit> {
             // The length floor is measured over the tail as well, because the stateless format
             // spends most of its length there: `ghs_<app id>_<JWT>` is only twenty-odd characters
             // before its first dot.
-            let end = dotted_tail(bytes, body_at + run(bytes, body_at, is_word_byte));
+            let word = body_at + run(bytes, body_at, is_word_byte);
+            let end = if prefix == b"ghs_" {
+                stateless_tail(bytes, word)
+            } else {
+                word
+            };
             if end - body_at >= GITHUB_CLASSIC_BODY_CHARS {
                 return Some(Hit {
                     id: PatternId::GithubToken,
@@ -605,19 +625,30 @@ fn aws_access_key_id(bytes: &[u8], at: usize) -> Option<Hit> {
     None
 }
 
-/// Body length a Slack token must reach after `xox?-`.
+/// Body length a Slack token must reach after its prefix.
 const SLACK_BODY_CHARS: usize = 10;
 
+/// The prefixes Slack issues, spelled out rather than derived from `xox` plus a letter class.
+///
+/// The letter class was a review finding: it carried an `o`, which the cited ruleset
+/// (`xox[baprs]`) does not, and `xoxo-mom-and-dad-love-you` was redacting as a bot token. The
+/// standing rule in the provenance file is that a pattern is never widened without a source, and
+/// a class is a widening nobody has to notice. A list of literals cannot drift that way.
+///
+/// `xoxe-` (refresh) and `xapp-` (app-level) are current formats in the same ruleset, added here
+/// with the same footing as the rest.
+const SLACK_PREFIXES: [&[u8]; 7] = [
+    b"xoxb-", b"xoxa-", b"xoxp-", b"xoxr-", b"xoxs-", b"xoxe-", b"xapp-",
+];
+
 fn slack_token(bytes: &[u8], at: usize) -> Option<Hit> {
-    if !boundary_before(bytes, at) || !bytes[at..].starts_with(b"xox") {
+    if !boundary_before(bytes, at) {
         return None;
     }
-    let kind = *bytes.get(at + 3)?;
-    if !matches!(kind, b'b' | b'p' | b'o' | b'a' | b's' | b'r') || bytes.get(at + 4) != Some(&b'-')
-    {
-        return None;
-    }
-    let body_at = at + 5;
+    let prefix = SLACK_PREFIXES
+        .into_iter()
+        .find(|prefix| bytes[at..].starts_with(prefix))?;
+    let body_at = at + prefix.len();
     let body = run(bytes, body_at, |byte| {
         byte.is_ascii_alphanumeric() || byte == b'-'
     });
@@ -753,11 +784,31 @@ fn private_key_block(bytes: &[u8], at: usize) -> Option<Hit> {
 
 const AUTHORIZATION: &[u8] = b"authorization";
 
+/// Shortest credential this will believe in. Sixteen characters is the base64 of the shortest
+/// `Basic` pair anybody really uses (`admin:admin` encodes to exactly that), and it is comfortably
+/// under any bearer token.
+const MIN_CREDENTIAL_CHARS: usize = 16;
+
 /// Keeps the header name and the scheme word and replaces only the credential, because
 /// `Authorization: Bearer [REDACTED:authorization-header]` tells a reader what happened and
 /// `[REDACTED:authorization-header]` alone does not.
 ///
 /// `token` joins `Bearer` and `Basic` because that is the scheme GitHub's own documentation uses.
+///
+/// # The word after the scheme is not automatically a credential
+///
+/// A review found this pattern reading three ordinary sentences as headers: `Set the
+/// Authorization: Bearer token header on every request`, `Authorization: Bearer <token> is the
+/// required format`, and `authorization: basic understanding of the protocol helps`. Prose is
+/// exactly what follows a colon in a coaching report, so the credential itself has to be shaped
+/// like one: at least [`MIN_CREDENTIAL_CHARS`] long, and carrying a digit or one of the base64
+/// characters `= + /`. Every real credential is base62, base64, or a JWT, and all of those do;
+/// `token`, `<token>`, and `understanding` do none of it, and the angle brackets of a placeholder
+/// are no longer in the charset at all.
+///
+/// **Recall cost, named:** a short all-letter base64 `Basic` credential — `dXNlcjpwYXNz` — is not
+/// matched. It is twelve characters of no digits and no padding, which is indistinguishable from
+/// the next word of a sentence, and this pattern is not willing to eat sentences to catch it.
 fn authorization_header(bytes: &[u8], at: usize) -> Option<Hit> {
     if !boundary_before(bytes, at) || !starts_with_ignore_case(bytes, at, AUTHORIZATION) {
         return None;
@@ -785,7 +836,13 @@ fn authorization_header(bytes: &[u8], at: usize) -> Option<Hit> {
     }
     cursor += blanks;
     let credential = run(bytes, cursor, is_credential_byte);
-    (credential > 0).then_some(Hit {
+    if credential < MIN_CREDENTIAL_CHARS {
+        return None;
+    }
+    let shaped = bytes[cursor..cursor + credential]
+        .iter()
+        .any(|byte| byte.is_ascii_digit() || matches!(byte, b'=' | b'+' | b'/'));
+    shaped.then_some(Hit {
         id: PatternId::AuthorizationHeader,
         start: cursor,
         end: cursor + credential,
@@ -926,11 +983,7 @@ fn secret_assignment(bytes: &[u8], at: usize) -> Option<Hit> {
     let (value_at, value_end, quoted) = match bytes.get(cursor) {
         Some(&quote @ (b'"' | b'\'')) => {
             let value_at = cursor + 1;
-            let value = run(bytes, value_at, |byte| byte != quote && byte != b'\n');
-            if bytes.get(value_at + value) != Some(&quote) {
-                return None;
-            }
-            (value_at, value_at + value, true)
+            (value_at, quoted_value_end(bytes, value_at, quote)?, true)
         }
         _ => {
             let value = run(bytes, cursor, is_bare_value_byte);
@@ -965,6 +1018,43 @@ fn secret_assignment(bytes: &[u8], at: usize) -> Option<Hit> {
         start: value_at,
         end: value_end,
     })
+}
+
+/// Longest quoted value this will scan for a closing quote. A value longer than this is a pasted
+/// document, not a credential, and the scan gives up rather than running to the end of a
+/// two-megabyte record looking for a quote that is not coming.
+const MAX_QUOTED_VALUE_CHARS: usize = 4096;
+
+/// Where a quoted value ends: the offset of its closing `quote`, with `\`-escaped bytes skipped.
+///
+/// **A review finding, and the invariant it establishes is that a quoted value is never
+/// *partially* redacted.** The naive run stopped at the first `"`, escaped or not, so
+/// `{"password": "abc\"def123XYZ"}` matched `abc\` and left `def123XYZ` sitting beside a marker
+/// claiming the value had been scrubbed — the worst outcome this module has, because it is a
+/// visible secret wearing the reassurance of a redaction. Munshi transcripts are JSONL, so an
+/// escaped quote inside a value is not an edge case, it is the normal encoding.
+///
+/// `None` — no match at all, rather than a short one — when the value runs past a newline, past
+/// [`MAX_QUOTED_VALUE_CHARS`], or past the end of the text. Refusing to match leaves the bare
+/// charset to decide, which under-claims; matching short would over-claim, and over-claiming is
+/// the failure that matters.
+fn quoted_value_end(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
+    let mut cursor = from;
+    let limit = (from + MAX_QUOTED_VALUE_CHARS).min(bytes.len());
+    while cursor < limit {
+        match bytes[cursor] {
+            b'\n' => return None,
+            // An escape covers whatever follows it, the quote included — unless what follows is a
+            // line ending or nothing at all, which is a broken value rather than an escaped one.
+            b'\\' => match bytes.get(cursor + 1) {
+                None | Some(b'\n') => return None,
+                Some(_) => cursor += 2,
+            },
+            byte if byte == quote => return Some(cursor),
+            _ => cursor += 1,
+        }
+    }
+    None
 }
 
 /// The key lowercased with `_`, `-`, and `.` dropped, in a stack buffer plus its length. `None`
@@ -1026,7 +1116,7 @@ fn is_credential_byte(byte: u8) -> bool {
     byte.is_ascii_graphic()
         && !matches!(
             byte,
-            b',' | b';' | b'"' | b'\'' | b'`' | b'[' | b']' | b'{' | b'}'
+            b',' | b';' | b'"' | b'\'' | b'`' | b'[' | b']' | b'{' | b'}' | b'<' | b'>'
         )
 }
 
@@ -1178,7 +1268,7 @@ mod tests {
     /// One planted canary per secret pattern. Every value is obviously fake — the bodies are
     /// keyboard filler of the right shape — and every one is a *complete* example, because a
     /// pattern set tested only on the prefix would pass while redacting nothing real.
-    const CANARIES: [(PatternId, &str); 17] = [
+    const CANARIES: [(PatternId, &str); 19] = [
         (
             PatternId::GithubToken,
             "the classic one is ghp_FAKEfake0123456789ABCDEFabcdef012345 in the log",
@@ -1216,6 +1306,17 @@ mod tests {
         (
             PatternId::SlackToken,
             "xoxb-000000000000-111111111111-FAKEfakeFAKEfakeFAKEfake",
+        ),
+        (
+            // Refresh and app-level tokens: current formats in the ruleset the rest came from,
+            // and — like the AWS and npm shapes — zero-firing on this archive, which is exactly
+            // why they need a canary rather than a production sighting.
+            PatternId::SlackToken,
+            "xoxe-1-FAKEfakeFAKEfakeFAKEfake",
+        ),
+        (
+            PatternId::SlackToken,
+            "xapp-1-A0FAKEFAKE-000000000000-FAKEfakeFAKEfake",
         ),
         (
             PatternId::GitlabToken,
@@ -1484,6 +1585,100 @@ mod tests {
             let scrubbed = secrets().scrub(text);
             assert_eq!(scrubbed.report.count(expected), 1, "missed {text:?}");
         }
+    }
+
+    /// The worst outcome this module has is a *partial* redaction: a marker claiming a value was
+    /// scrubbed with half of it still on the screen beside it. A review found the quoted-value
+    /// run stopping at the first `"` whether or not it was escaped — and munshi transcripts are
+    /// JSONL, so an escaped quote inside a value is the normal encoding, not an edge case.
+    #[test]
+    fn an_escaped_quote_inside_a_value_does_not_split_the_redaction() {
+        let scrubbed = secrets().scrub(r#"{"password": "abc\"def123XYZ"}"#);
+        assert_eq!(
+            scrubbed.text,
+            r#"{"password": "[REDACTED:secret-assignment]"}"#
+        );
+        assert!(
+            !scrubbed.text.contains("def123XYZ"),
+            "half the value survived: {:?}",
+            scrubbed.text
+        );
+        // Several escapes, and an escaped backslash immediately before the real closing quote —
+        // the case where miscounting escapes runs the value on past its own end.
+        let scrubbed = secrets().scrub(r#"{"api_key": "a\"b\\c123\"d\\"}"#);
+        assert_eq!(
+            scrubbed.text,
+            r#"{"api_key": "[REDACTED:secret-assignment]"}"#
+        );
+        // A quote that never closes is refused outright rather than matched short.
+        for unterminated in [
+            "{\"password\": \"abc\\\"def123XYZ\n",
+            "{\"password\": \"abc\\",
+        ] {
+            let scrubbed = secrets().scrub(unterminated);
+            assert_eq!(scrubbed.text, unterminated, "matched an unterminated value");
+        }
+    }
+
+    /// The word after a scheme is not automatically a credential. All three of these are ordinary
+    /// sentences a coaching report could quote, and all three were being redacted before review.
+    #[test]
+    fn a_sentence_after_the_scheme_word_is_not_a_credential() {
+        const PROSE: [&str; 4] = [
+            "Set the Authorization: Bearer token header on every request",
+            "Authorization: Bearer <token> is the required format",
+            "authorization: basic understanding of the protocol helps",
+            "Authorization: Basic auth is what the endpoint wants",
+        ];
+        for text in PROSE {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, text, "redacted a sentence: {text:?}");
+        }
+        // A credential still is one: long enough, and carrying base64's own characters.
+        for text in [
+            "Authorization: Bearer FAKEfake0123456789ABCDEFabcdef",
+            "Authorization: Basic YWRtaW46YWRtaW4=",
+        ] {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.report.count(PatternId::AuthorizationHeader),
+                1,
+                "missed {text:?}"
+            );
+        }
+    }
+
+    /// `xox` plus a letter class was a widening nobody sourced: the cited ruleset has no `o`, and
+    /// `xoxo-…` is a sign-off, not a bot token.
+    #[test]
+    fn the_slack_prefixes_are_the_sourced_ones_and_no_others() {
+        let scrubbed = secrets().scrub("xoxo-mom-and-dad-love-you");
+        assert_eq!(scrubbed.text, "xoxo-mom-and-dad-love-you");
+        assert!(scrubbed.report.is_empty());
+        for prefix in ["xoxb", "xoxa", "xoxp", "xoxr", "xoxs", "xoxe", "xapp"] {
+            let text = format!("{prefix}-FAKEfake0123456789");
+            assert_eq!(
+                secrets().scrub(&text).report.count(PatternId::SlackToken),
+                1,
+                "missed {text}"
+            );
+        }
+    }
+
+    /// The stateless-token tail is `ghs_`-only and wants the two dot segments a JWT actually has.
+    /// One dot and one word is a sentence, and it was eating `.Then`.
+    #[test]
+    fn the_stateless_token_tail_does_not_eat_the_next_sentence() {
+        let scrubbed = secrets().scrub("ghp_FAKEfake0123456789ABCDEFabcdef012345.Then restart");
+        assert_eq!(scrubbed.text, "[REDACTED:github-token].Then restart");
+
+        // A `ghs_` stateless token goes whole, JWT tail included.
+        let stateless = "ghs_123456_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJGQUtFIn0.FAKEfakeSIGNATURE";
+        let scrubbed = secrets().scrub(stateless);
+        assert_eq!(scrubbed.text, "[REDACTED:github-token]");
+        // And a `ghs_` followed by one dotted word keeps the word.
+        let scrubbed = secrets().scrub("ghs_FAKEfake0123456789ABCDEFabcdef012345.Then restart");
+        assert_eq!(scrubbed.text, "[REDACTED:github-token].Then restart");
     }
 
     /// A quoted value is structure rather than a sentence, so it skips the prose guards that a

@@ -43,7 +43,7 @@ de-facto community reference for these regexes.
 | `anthropic-key` | `sk-ant-` + body | 16 chars | gitleaks: `sk-ant-api03-[a-zA-Z0-9_\-]{93}AA`. The floor is far below 93 on purpose — the `sk-ant-` prefix is unambiguous (no English word, no identifier convention produces it), so the floor only has to refuse a document *talking about* the prefix. |
 | `openai-key` | `sk-` not followed by `ant-`, + body | 20 chars **and** at least one uppercase **and** at least one digit | `sk-` alone is a weak anchor: `sk-forward-compatibility-shim` is an ordinary kebab-case identifier of the right charset and length. The discriminator is **charset class, not entropy** — OpenAI keys are base62, so they carry both an uppercase letter and a digit; kebab-case prose carries neither. |
 | `aws-access-key-id` | `AKIA` / `ASIA` + exactly 16 `[A-Z0-9]` | exactly 16 | gitleaks: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`. Only the two *credential* prefixes are taken: `AKIA` (long-lived key id) and `ASIA` (STS temporary). The rest identify users, groups, and roles — they are not secrets, and redacting an IAM role id out of a coaching report would be a false positive with no upside. **Exactly** 16, so a longer `SHOUTING_IDENTIFIER` starting with those four letters is not eaten. |
-| `slack-token` | `xox[bpoasr]-` + body | 10 chars | gitleaks matches on `xox[baprs]-`. Lowercase only — the prefix is issued lowercase. |
+| `slack-token` | `xoxb-` `xoxa-` `xoxp-` `xoxr-` `xoxs-` `xoxe-` `xapp-` + body | 10 chars | gitleaks matches on `xox[baprs]-`, and carries `xoxe-` (refresh) and `xapp-` (app-level) as current formats alongside it. Lowercase only — the prefixes are issued lowercase. **Spelled as literals, not as `xox` plus a letter class.** The class was how an unsourced `o` got in, and `xoxo-mom-and-dad-love-you` was redacting as a bot token; a character class is a widening nobody has to notice, and §0's rule is that a pattern is never widened without a source. `xoxe-` and `xapp-` fire zero times on this archive — like the AWS, npm, and Anthropic shapes, they carry fixture canaries rather than a production sighting. |
 | `gitlab-token` | `glpat-` + body | 20 chars | Classic GitLab PATs are 20 base64url characters. GitLab's newer *routable* tokens are longer and carry a dotted checksum suffix (`glpat-<27..300>.<2><7>`); the secret material is matched, the trailing routing suffix is left visible, which is correct — it is a checksum, not key material. |
 | `npm-token` | `npm_` + body | 36 chars | npm automation/access tokens are `npm_` plus 36 base62 characters. |
 | `google-api-key` | `AIza` + body | 35 chars | Google API keys are `AIza` plus 35 base64url characters — a fixed 39-character total, which is why this pattern needs no other guard. |
@@ -54,10 +54,15 @@ GitHub began a staged rollout of a **stateless** installation-token format, `ghs
 on 2026-04-27, warning integrators that installation tokens are no longer exactly 40 characters
 (docs.github.com, "About authentication to GitHub", retrieved 2026-08-24). A JWT is dot-separated,
 and a run of word characters stops dead at the first dot — which would have replaced the `ghs_`
-prefix and the app id and left the payload and signature on the screen. The classic branch
-therefore extends through a dot-separated base64url tail, and measures its length floor over the
-tail as well, because the stateless format is only twenty-odd characters before its first dot.
-Nothing else these prefixes meet has a dotted base64url tail, so the extension costs no precision.
+prefix and the app id and left the payload and signature on the screen. The pattern therefore
+extends through a dot-separated base64url tail, and measures its length floor over the tail as
+well, because the stateless format is only twenty-odd characters before its first dot.
+
+Two guards on that extension, both review findings: it runs for **`ghs_` alone**, because that is
+the only prefix GitHub gave a dotted format to, and it requires the **two** dot segments a JWT
+actually has (`x.y.z`, with the header already swallowed by the word run). Applied to all five
+prefixes with a one-segment threshold, it ate ordinary sentences — `ghp_…456.Then restart` lost its
+`.Then`.
 
 ## 2. Structural patterns (no vendor prefix)
 
@@ -67,6 +72,25 @@ Nothing else these prefixes meet has a dotted base64url tail, so the extension c
 | `private-key-block` | `-----BEGIN … PRIVATE KEY-----` through the matching `-----END … -----` | The only multi-line pattern, and the only one that redacts a span rather than a token. `PRIVATE KEY-----` must appear on the same line as `-----BEGIN`, within 40 bytes, which is what keeps `-----BEGIN CERTIFICATE-----` (a public object) out. A **truncated** block — a transcript cut mid-paste — is redacted to the end of the text: a private key missing its footer is still a private key. |
 | `authorization-header` | the credential after `Authorization: Bearer|Basic|token` | Redacts the credential only, keeping the header name and the scheme word, because `Authorization: Bearer [REDACTED:authorization-header]` tells a reader what happened and a bare marker does not. Accepts the JSON spelling (`"Authorization": "Bearer …"`) as well as the wire one. `token` joins `Bearer` and `Basic` because that is the scheme GitHub's own API documentation uses. `authorization is a topic, not a header` does not match — there is no `:`. |
 | `url-credentials` | the `user:pass` of `scheme://user:pass@host` | **The colon is required.** Matching any userinfo would redact `ssh://git@github.com/surdy/munshi.git`, which is in this repository's own `Cargo.toml`. The *whole* userinfo goes, not just the password: `https://oauth2:x@…` and `https://ghp_…@…` both put the credential in the part a naive reading calls the username. |
+
+### The word after the scheme is not automatically a credential
+
+Review caught `authorization-header` reading three ordinary sentences as headers: *Set the
+Authorization: Bearer **token** header on every request*, *Authorization: Bearer **&lt;token&gt;** is the
+required format*, and *authorization: basic **understanding** of the protocol helps*. Prose is
+exactly what follows a colon in a coaching report, so the credential has to be shaped like one:
+**at least 16 characters**, and carrying **a digit or one of `= + /`**. Every real credential is
+base62, base64, or a JWT and satisfies both; `token`, `<token>`, and `understanding` satisfy
+neither. Angle brackets also left the credential charset, so a `<placeholder>` cannot be a match at
+all. Sixteen is the base64 length of the shortest `Basic` pair anyone really uses — `admin:admin`
+encodes to exactly that.
+
+**Recall cost, named:** a short all-letter base64 `Basic` credential (`dXNlcjpwYXNz`) is not
+matched. Twelve characters of no digits and no padding is indistinguishable from the next word of
+a sentence, and this pattern will not eat sentences to catch it.
+
+On the archive this was the difference between **224 hits and 24** — 200 of the original hits were
+prose.
 
 ## 3. The generic assignment — and what the archive did to it
 
@@ -112,6 +136,19 @@ Two tightenings followed. Both are structural, and neither is entropy.
    **Recall cost, named:** a bare, digitless, short password (`password: letmein`) is not redacted.
    Quoting it brings it back.
 
+### A quoted value is never *partially* redacted
+
+The naive quoted-value scan stopped at the first `"`, escaped or not. Review's repro:
+`{"password": "abc\"def123XYZ"}` matched `abc\` and left `def123XYZ` sitting beside a marker
+claiming the value had been scrubbed. That is the worst outcome this module has — a visible secret
+wearing the reassurance of a redaction — and it is not an edge case, because munshi transcripts are
+JSONL and an escaped quote inside a value is simply how JSON writes one.
+
+The scan now skips `\`-escaped bytes, so the value ends at its *real* closing quote. When there is
+no real closing quote — the value runs past a newline, past 4096 characters, or past the end of the
+text — the pattern **refuses to match at all** rather than matching short. Under-claiming leaves
+the bare charset to decide; over-claiming is the failure that matters.
+
 Also refused before either test runs: an empty value, a bare value under 6 characters, a bare value
 that is entirely digits (this archive records `"input_tokens": 61184` tens of thousands of times),
 a value opening a bracket or brace, and `==`, which is a comparison rather than an assignment.
@@ -120,6 +157,32 @@ a value opening a bracket or brace, and `==`, which is a comparison rather than 
 surviving key names are what a credential assignment actually looks like: `cloudflare_api_token`,
 `tunnel_token`, `ts_authkey`, `github_token`, `immich_api_key`, `secret_key`, `access_token`,
 `mcp_access_key`, `refreshToken`.
+
+## 3a. Where the whole set stands on the archive
+
+Same corpus each time — 723 blobs, 681,684 records, 3.15 GiB — scanned before review, and again
+after the four review fixes. Counts only; the scan cannot report anything else.
+
+| id | first run | after §3 tightening | after review fixes |
+|---|---:|---:|---:|
+| `secret-assignment` | 17,302 | 1,231 | 1,231 |
+| `authorization-header` | 224 | 224 | **24** |
+| `url-credentials` | 67 | 67 | 67 |
+| `google-api-key` | 14 | 14 | 14 |
+| `jwt` | 11 | 11 | 11 |
+| `private-key-block` | 6 | 6 | 6 |
+| `github-token` | 4 | 4 | 4 |
+| **total** | **17,628** | **1,557** | **1,357** |
+| sessions firing anything | 282 / 723 | 88 / 723 | **73 / 723** |
+
+`anthropic-key`, `openai-key`, `aws-access-key-id`, `aws-secret-key`, `slack-token`, `gitlab-token`,
+and `npm-token` fire zero times on this archive. They are held to the fixture canaries instead,
+which is the whole reason every pattern class has one.
+
+`PATTERN_REVISION` stays `2026-08-24`. The set's semantics did change under review — four patterns
+now match differently — but the revision is a *date*, the changes landed on the same day as the
+research, and nothing has been published under the old reading. A revision that moved would be
+claiming two incomparable pattern sets where there has only ever been one released.
 
 ## 4. Profanity
 
@@ -182,8 +245,10 @@ masking their own words back at them is noise. A shared dashboard is a different
   checksum suffix)
 - RFC 3986 §3.2.1 (URL userinfo), RFC 7519 §3 (JWT's three dot-separated segments), RFC 7617 and
   RFC 6750 (`Authorization: Basic` and `Bearer`)
+- https://api.slack.com/authentication/token-types (official — `xoxb`/`xoxp`/`xoxe` and the
+  app-level `xapp` prefix)
 - The local mirror itself, scanned 2026-08-24: 723 blobs, 681,684 records, 3.15 GiB — the
-  measurement in §3, reproducible with
+  measurements in §3 and §3a, reproducible with
   `cargo test --release --test redaction_scan -- --ignored --nocapture`.
 
 All retrieved 2026-08-24.
