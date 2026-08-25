@@ -36,6 +36,7 @@
 //! archive held none of the signal it reads — until munshi#77 typed the `command` field and the
 //! live fold confirmed the proxy's numbers. Both rounds are written down beside it.
 
+use crate::evidence::{EventAnchor, EvidenceKind};
 use crate::format;
 use crate::metrics::{SessionMetrics, ToolTally};
 
@@ -167,6 +168,27 @@ impl RuleId {
         }
     }
 
+    /// Where this rule's evidence can honestly come from (qanungo #5).
+    ///
+    /// A rule that counted **events** can point at them: the failures, the repeated runs. A rule
+    /// that measured a **shape** cannot, and an excerpt minted for one would misrepresent what it
+    /// did — Marathon read a stretch of clock, Heavily-resumed read a dilution, Babysitting read a
+    /// ratio, and not one of the three looked at an utterance. Those get timestamps and counts.
+    ///
+    /// Fire-and-forget is honestly `Mixed`: its ratio component is a shape, and its error component
+    /// counts concrete failing events, so it offers both.
+    ///
+    /// This decides nothing about firing. It is a statement about what a fired rule may *show*.
+    pub const fn evidence_kind(self) -> EvidenceKind {
+        match self {
+            Self::HighToolErrorRate | Self::RetryLoop => EvidenceKind::Event,
+            Self::MarathonSession | Self::ResumedSession | Self::Babysitting => {
+                EvidenceKind::Structural
+            }
+            Self::FireAndForget => EvidenceKind::Mixed,
+        }
+    }
+
     /// Whether this rule's trigger held for one session — or `None` when the session carries no
     /// signal this rule can read.
     ///
@@ -243,12 +265,21 @@ fn fired(rule: RuleId) -> impl Fn(&&SessionMetrics) -> bool {
 ///
 /// The `source_hash` is the whole point — a human who wants the detail this report refuses to
 /// print pulls the transcript themselves and reads it in full.
+///
+/// Since qanungo #5 it also carries **anchors**: where, inside that transcript, the events this
+/// rule counted are. They are additive in the strongest sense — nothing in [`RuleId::verdict`],
+/// [`crate::scoring`], or [`crate::report`] reads one, and the Markdown a report writes is what it
+/// was before they existed. A rule whose evidence is structural
+/// ([`RuleId::evidence_kind`]) carries none, because it counted no event to anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
     /// Bare lowercase sha256 hex of the transcript, as Patwari serves it.
     pub source_hash: String,
     /// Aggregates and tool names only. Never transcript content.
     pub detail: String,
+    /// Bounded locators for the counted events, in file order. Empty for a session-shaped rule,
+    /// and empty for an event-shaped one whose session filled the fold's anchor caps.
+    pub anchors: Vec<EventAnchor>,
 }
 
 /// One rule's verdict over the window.
@@ -290,6 +321,11 @@ fn high_tool_error_rate(sessions: &[SessionMetrics]) -> Option<Finding> {
         .map(|session| Evidence {
             source_hash: session.source_hash.clone(),
             detail: error_rate_reasons(session).join("; "),
+            // The counted signal is the failing call, so the evidence is failing calls — and
+            // preferentially the ones belonging to the tools this session was *named* for, rather
+            // than whichever ten failed first. A session over the line only session-wide names no
+            // tool, and every failure is then a candidate.
+            anchors: session.anchors.errors_for(&over_threshold_tools(session)),
         })
         .collect();
     (!evidence.is_empty()).then(|| Finding {
@@ -334,6 +370,30 @@ fn error_rate_reasons(session: &SessionMetrics) -> Vec<String> {
     reasons
 }
 
+/// The tools this session was named for, if any — the same `over_rate` test [`error_rate_reasons`]
+/// applies, asked for the names rather than for the sentences.
+///
+/// A separate walk rather than a second return value from the function above, deliberately: those
+/// sentences are rendered verbatim by the report and by the dashboard, and a refactor that touched
+/// them to collect a name is a refactor that can change a document. Empty means the session-wide
+/// trigger is the only one that fired.
+fn over_threshold_tools(session: &SessionMetrics) -> Vec<&str> {
+    session
+        .tools
+        .by_tool
+        .iter()
+        .filter(|(_, tally)| {
+            over_rate(
+                tally,
+                thresholds::MIN_TOOL_ATTEMPTS,
+                thresholds::TOOL_ERROR_RATE,
+            )
+            .is_some()
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
 /// Formats a tally that is over threshold, or `None` when it is not — including when too few
 /// calls reported an outcome for the rate to mean anything.
 fn over_rate(tally: &ToolTally, min_attempts: u64, threshold: f64) -> Option<String> {
@@ -367,6 +427,10 @@ fn retry_loop(sessions: &[SessionMetrics]) -> Option<Finding> {
             let churn = &session.commands;
             Evidence {
                 source_hash: session.source_hash.clone(),
+                // The runs of the busiest value — the events the trigger counted, and not the
+                // session's other repetition, which the detail line reports as context and the
+                // rule does not decide on.
+                anchors: session.anchors.command_runs.clone(),
                 detail: format!(
                     "one command run {} times; {} of {} command-bearing calls were repeats \
                      ({}), across {} repeated commands",
@@ -417,6 +481,9 @@ fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
         .filter(fired(RuleId::MarathonSession))
         .map(|session| Evidence {
             source_hash: session.source_hash.clone(),
+            // Structural: this rule measured a stretch of clock, so its evidence is that stretch
+            // (see [`RuleId::evidence_kind`]) and never an utterance from inside it.
+            anchors: Vec::new(),
             detail: format!(
                 "longest sitting {} within a {} span across {} sittings, {} user requests, \
                  {} tool activities",
@@ -467,6 +534,8 @@ fn resumed_session(sessions: &[SessionMetrics]) -> Option<Finding> {
         .filter(fired(RuleId::ResumedSession))
         .map(|session| Evidence {
             source_hash: session.source_hash.clone(),
+            // Structural, per [`RuleId::evidence_kind`]: a dilution has no event in it.
+            anchors: Vec::new(),
             detail: format!(
                 "active {} across {} sittings, span {} ({})",
                 session
@@ -517,6 +586,9 @@ fn babysitting(sessions: &[SessionMetrics]) -> Option<Finding> {
         .filter(fired(RuleId::Babysitting))
         .map(|session| Evidence {
             source_hash: session.source_hash.clone(),
+            // Structural, per [`RuleId::evidence_kind`]: the rule read a ratio of counts. Quoting
+            // one of the small asks would be quoting an example of the pattern, not the pattern.
+            anchors: Vec::new(),
             detail: format!(
                 "{} user requests, {} tool activities ({} per request)",
                 session.summary.user_requests,
@@ -553,6 +625,11 @@ fn fire_and_forget(sessions: &[SessionMetrics]) -> Option<Finding> {
         .filter(fired(RuleId::FireAndForget))
         .map(|session| Evidence {
             source_hash: session.source_hash.clone(),
+            // Split honestly (see [`RuleId::evidence_kind`]): the *ratio* half of this trigger is a
+            // shape and gets structural evidence, while the `errors > 0` half counts concrete
+            // failing calls — so those are anchored. No tool was named by this rule, so every
+            // failure in the session is a candidate, in file order.
+            anchors: session.anchors.errors_for(&[]),
             detail: format!(
                 "1 user request, {} tool activities ({} per request), {} of {} calls failed",
                 session.summary.tool_activities,
@@ -589,6 +666,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
+    use crate::evidence::SessionAnchors;
     use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
@@ -625,6 +703,8 @@ mod tests {
         SessionMetrics {
             source_hash: format!("{hash:02x}").repeat(32),
             source_agent: "claude-code".to_owned(),
+            artifact_set_version: 2,
+            anchors: SessionAnchors::default(),
             summary: SessionSummary {
                 user_requests,
                 tool_activities,

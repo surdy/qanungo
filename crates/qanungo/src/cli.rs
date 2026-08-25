@@ -17,11 +17,11 @@
 //! [`crate::redaction`]).
 //!
 //! `qanungo dashboard` (qanungo #5) is the fourth lane and the first that is not a document: it
-//! flattens [`ArchiveArgs`] like the rest and adds only what a served surface needs — where to
-//! listen, and how often to recompute. It does not flatten [`RedactionArgs`] either, on the same
-//! reasoning as `report`: its V1 payload carries scores, rule ids, counts, and content hashes, and
-//! nothing that ever held a transcript string. See [`DashboardArgs`] for what changes when the
-//! evidence-excerpt slice lands.
+//! flattens [`ArchiveArgs`] like the rest and adds what a served surface needs — where to listen,
+//! and how often to recompute. Since the evidence-excerpt slice it flattens [`RedactionArgs`] too,
+//! because its excerpt route renders the text of the events a rule counted. The flag is read
+//! **once, at launch**, and belongs to the process rather than to a request: see
+//! [`DashboardArgs`].
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -202,13 +202,13 @@ pub struct StandupArgs {
 /// a different presentation and a `--patwari-url` that meant something else here would be a
 /// dashboard describing a different archive from the report beside it.
 ///
-/// It deliberately does **not** flatten [`RedactionArgs`]. V1 renders zero verbatim — lane scores,
-/// rule ids, counts, and content hashes — so the P0 exemption in [`crate::report`] applies
-/// unchanged, and a redaction switch over a payload with no content in it would be decoration on a
-/// security control, which is the argument `report` and `cost` already refuse it on. When the
-/// evidence-excerpt slice lands, the flag arrives with it and is **launch-time only**: a
-/// per-request toggle a browser could flip is not a redaction control, it is a redaction bypass
-/// with a query string.
+/// It flattens [`RedactionArgs`] as of the evidence-excerpt slice, and the flag is **launch-time
+/// only**. That is not an implementation convenience, it is the control: a per-request toggle a
+/// browser could flip is not a redaction control, it is a redaction bypass with a query string, and
+/// this surface is meant to be `--bind`-exposed to an unauthenticated tailnet. Every reader of a
+/// given process gets the same scrub, the served payload states which one
+/// ([`crate::dashboard`]), and startup says so out loud — loudly indeed when `--no-redact` meets a
+/// routable address (see [`crate::dashboard_server::posture_line`]).
 #[derive(Debug, Args)]
 pub struct DashboardArgs {
     /// How far back to score, as `<count><unit>` with unit `h`, `d`, or `w`. The comparison window
@@ -230,6 +230,9 @@ pub struct DashboardArgs {
     /// or `h`.
     #[arg(long, default_value = DEFAULT_DASHBOARD_REFRESH, value_parser = parse_refresh)]
     pub refresh: Refresh,
+
+    #[command(flatten)]
+    pub redaction: RedactionArgs,
 }
 
 /// A background refresh interval, kept in the spelling the operator typed so the provenance footer
@@ -503,18 +506,42 @@ mod tests {
         }
     }
 
-    /// The redaction flags go live on `standup` and nowhere else: `report`, `cost`, and the
-    /// dashboard render no archived prose, so a `--no-redact` on any of them would be a switch
-    /// over nothing. The dashboard is the one that matters most — a redaction flag on a *served*
-    /// surface that carried no content would invite a reader to trust a control that is not doing
-    /// anything.
+    /// The redaction flags go live on exactly the lanes that render transcript content: `standup`,
+    /// which prints archived prose, and `dashboard`, which serves evidence excerpts. `report` and
+    /// `cost` still refuse them, and that refusal is the point — a redaction flag on a document
+    /// carrying no content would invite a reader to trust a control that is not doing anything.
     #[test]
-    fn only_the_lane_that_renders_prose_takes_the_redaction_flags() {
+    fn only_the_lanes_that_render_content_take_the_redaction_flags() {
         assert!(Cli::try_parse_from(["qanungo", "standup", "--no-redact"]).is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--no-redact"]).is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--filter-profanity"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
         assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--no-redact"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--filter-profanity"]).is_err());
+    }
+
+    /// The dashboard's scrub is decided once, on the command line, and typing nothing is the safe
+    /// reading here exactly as it is for `standup`. There is no `--redact`, and — pinned in
+    /// `tests/dashboard.rs` over the wire — no query string that means one.
+    #[test]
+    fn the_dashboard_redacts_by_default_and_stops_only_when_told_to() {
+        let redactor = |flags: &[&str]| {
+            let Command::Dashboard(args) = Cli::parse_from(
+                ["qanungo", "dashboard"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+            .command
+            else {
+                panic!("`dashboard` parses as the dashboard command");
+            };
+            args.redaction.redactor()
+        };
+        assert_eq!(redactor(&[]), crate::redaction::Redactor::new());
+        assert!(redactor(&[]).redacts_secrets());
+        assert!(!redactor(&[]).filters_profanity());
+        assert!(!redactor(&["--no-redact"]).redacts_secrets());
+        assert!(redactor(&["--filter-profanity"]).filters_profanity());
     }
 
     /// A run with no flags serves the loopback default over thirty days, refreshing on the named

@@ -4,8 +4,26 @@
 //! It is the server counterpart of this crate's minimal HTTP client (munshi ADR 0006) and mirrors
 //! munshi-dashboard's shape deliberately: one request per connection, `Connection: close`, an
 //! explicit `Content-Length`, no keep-alive bookkeeping, an embedded single-file page, and no state
-//! of its own on disk. Three routes exist — the page, the JSON snapshot, and the event stream —
-//! and everything else is 404.
+//! of its own on disk. Four routes exist — the page, the JSON snapshot, the event stream, and one
+//! evidence excerpt — and everything else is 404.
+//!
+//! # The excerpt route, and the three things that bound it
+//!
+//! `GET /api/evidence/<source_hash>/<locator>` answers with the single event a rule counted,
+//! scrubbed. Three rules hold it in place, and each one is a refusal rather than a check:
+//!
+//! 1. **Only what the payload named.** The current payload's [`EvidenceIndex`] is the entire
+//!    servable set. A perfectly well-formed locator against a perfectly well-cached transcript is a
+//!    404 unless a finding on the page offered exactly that anchor. Without this the route is a
+//!    transcript-browsing API — walk the locators, read the session — which is the disclosure the
+//!    2026-08-24 grilling refused when it took the Patwari deep-links off this page.
+//! 2. **Never a fetch.** The blob must already be in the local cache, which the fold put there. A
+//!    cache miss is a 404 saying so. A browser — any peer on the tailnet — must not be able to make
+//!    this process talk to the archive; if it could, an unauthenticated surface would be a remote
+//!    control for somebody else's bandwidth and for what lands on this disk.
+//! 3. **The scrub is the process's, not the request's.** The redactor is built once from the
+//!    command line and every reader gets it. There is no query parameter, and the router discards
+//!    query strings before it decides anything.
 //!
 //! # Where it differs from munshi-dashboard, and why
 //!
@@ -29,9 +47,10 @@
 //!
 //! **Nothing here authenticates a caller.** On loopback that is the machine's own boundary; on a
 //! tailnet address the tailnet is the boundary and there is no second one. What limits the blast
-//! radius is not access control but *what the payload contains*: lane scores, rule ids, counts,
-//! and content hashes, with no transcript text and no link into Patwari, which serves unredacted
-//! blobs. See [`crate::dashboard`] for how that line is held.
+//! radius is not access control but *what this process will say*: lane scores, rule ids, counts,
+//! content hashes, and — only for the anchors a finding on the page named — one scrubbed event
+//! apiece, with no link into Patwari, which serves unredacted blobs. See [`crate::dashboard`] and
+//! [`crate::evidence`] for how each half of that line is held.
 //!
 //! # Blocking until the first fold
 //!
@@ -50,12 +69,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use thiserror::Error;
 
+use crate::cache::{self, BlobCache};
 use crate::cli::{ArchiveArgs, DashboardArgs, Refresh, Window};
 use crate::command::{self, CommandError, Folded};
 use crate::dashboard::{self, Refreshed};
+use crate::evidence::{self, EvidenceIndex};
 use crate::format;
+use crate::metrics;
+use crate::redaction::Redactor;
+use crate::report::stamp;
 
 /// The single-file page, embedded so the binary is the whole deployment. No asset route exists,
 /// and none can be added without also inventing a filesystem the server reads from.
@@ -97,6 +122,8 @@ pub enum DashboardError {
         #[source]
         source: io::Error,
     },
+    #[error("could not open the transcript cache: {0}")]
+    Cache(#[source] io::Error),
     #[error(transparent)]
     Fold(#[from] CommandError),
 }
@@ -147,19 +174,37 @@ impl Dashboard {
             source,
         })?;
         let address = listener.local_addr().unwrap_or(args.bind);
+        let redactor = args.redaction.redactor();
         eprintln!("qanungo dashboard: listening on http://{address}");
-        eprintln!("qanungo dashboard: {}", posture_line(address));
+        eprintln!("qanungo dashboard: {}", posture_line(address, &redactor));
+        if let Some(line) = redaction_posture_line(address, &redactor) {
+            eprintln!("qanungo dashboard: {line}");
+        }
 
-        let service = Arc::new(Service::new(fold_and_publish(
-            &args.archive,
-            &args.last,
-            &args.refresh,
-            Refreshed {
-                generation: 1,
-                at: Utc::now(),
-                stale_since: None,
-            },
-        )?));
+        // Opened once, at launch, and held for the life of the process: the excerpt route reads
+        // the same blobs the fold already mirrored, and opening a cache per request would be a
+        // directory creation on a path a peer's request drove.
+        let cache = match &args.archive.cache_dir {
+            Some(dir) => BlobCache::open(dir),
+            None => BlobCache::open_default(),
+        }
+        .map_err(DashboardError::Cache)?;
+
+        let service = Arc::new(Service::new(
+            fold_and_publish(
+                &args.archive,
+                &args.last,
+                &args.refresh,
+                Refreshed {
+                    generation: 1,
+                    at: Utc::now(),
+                    stale_since: None,
+                },
+                &redactor,
+            )?,
+            cache,
+            redactor,
+        ));
         Ok(Self {
             listener,
             service,
@@ -188,9 +233,10 @@ impl Dashboard {
         let archive = self.archive.clone();
         let window = self.window.clone();
         let refresh = self.refresh.clone();
+        let redactor = self.service.redactor;
         if let Err(error) = thread::Builder::new()
             .name("dashboard-refresh".to_owned())
-            .spawn(move || refresh_loop(&refreshing, &archive, &window, &refresh))
+            .spawn(move || refresh_loop(&refreshing, &archive, &window, &refresh, &redactor))
         {
             // Serving the one payload already folded is strictly better than refusing to serve at
             // all, so this is reported and survived rather than propagated.
@@ -208,19 +254,51 @@ impl Dashboard {
 /// the honesty has to come from saying what it costs rather than from refusing it. The line names
 /// the two facts a reader needs: that nothing authenticates, and that the tailnet is therefore the
 /// entire boundary.
-pub fn posture_line(address: SocketAddr) -> String {
+pub fn posture_line(address: SocketAddr, redactor: &Redactor) -> String {
+    let excerpts = if redactor.redacts_secrets() {
+        "redacted evidence excerpts"
+    } else {
+        "UNREDACTED evidence excerpts"
+    };
     if address.ip().is_loopback() {
         format!(
             "{address} is loopback — only this machine can reach the page; nothing here \
-             authenticates a caller",
+             authenticates a caller, and it serves {excerpts} of the events a rule counted",
         )
     } else {
         format!(
             "{address} is NOT loopback — this page is UNAUTHENTICATED and the tailnet is the only \
-             boundary in front of it; it serves scores, rule ids, counts and content hashes, never \
-             transcript text and never a link into the archive",
+             boundary in front of it; it serves scores, rule ids, counts, content hashes and \
+             {excerpts} of the events a rule counted, never a whole transcript and never a link \
+             into the archive",
         )
     }
+}
+
+/// The second posture line, printed only when `--no-redact` was typed.
+///
+/// Split from [`posture_line`] rather than folded into it because it is a different kind of
+/// statement: the first says what binding *here* means and is always true of a run, while this one
+/// says a person turned a default-on security control off and is true only when they did. Nothing
+/// is refused — `--no-redact` on a trusted terminal is a legitimate choice the redaction lane
+/// already blessed — but on a routable address it is that choice applied to every device on the
+/// tailnet, so the sentence is as loud as the situation.
+pub fn redaction_posture_line(address: SocketAddr, redactor: &Redactor) -> Option<String> {
+    if redactor.redacts_secrets() {
+        return None;
+    }
+    Some(if address.ip().is_loopback() {
+        format!(
+            "--no-redact: excerpts are served RAW, secrets included, to callers on {address} \
+             (loopback)",
+        )
+    } else {
+        format!(
+            "!! --no-redact ON A NON-LOOPBACK BIND !! every device that can reach {address} can \
+             read UNREDACTED transcript excerpts — live credentials included — from this \
+             unauthenticated page. Drop the flag or bind loopback.",
+        )
+    })
 }
 
 /// The payload every request is answered from.
@@ -230,6 +308,13 @@ struct Served {
     refreshed_at: DateTime<Utc>,
     /// Serialized once per refresh rather than once per request, so open tabs cost nothing.
     body: Vec<u8>,
+    /// The anchors this body names — the whole servable set while it is the current payload.
+    ///
+    /// It lives *inside* the served payload rather than beside it so the two can never disagree: a
+    /// refresh swaps the document and the set of things it will expand in one move, and a reader
+    /// holding an anchor from the previous refresh simply gets a 404 rather than an excerpt from a
+    /// finding that is no longer on the page.
+    evidence: EvidenceIndex,
 }
 
 impl Served {
@@ -250,14 +335,22 @@ struct Service {
     served: Mutex<Arc<Served>>,
     changed: Condvar,
     streams: AtomicUsize,
+    /// The blobs the fold already mirrored. **Read-only on this path, and never a fetch**: an
+    /// excerpt request that misses is answered, not filled.
+    cache: BlobCache,
+    /// The scrub every excerpt goes through, fixed at launch. `Copy`, so a request path never
+    /// takes a lock to find out what the redaction posture is.
+    redactor: Redactor,
 }
 
 impl Service {
-    fn new(served: Served) -> Self {
+    fn new(served: Served, cache: BlobCache, redactor: Redactor) -> Self {
         Self {
             served: Mutex::new(Arc::new(served)),
             changed: Condvar::new(),
             streams: AtomicUsize::new(0),
+            cache,
+            redactor,
         }
     }
 
@@ -301,6 +394,7 @@ fn fold_and_publish(
     window: &Window,
     refresh: &Refresh,
     refreshed: Refreshed,
+    redactor: &Redactor,
 ) -> Result<Served, CommandError> {
     eprintln!(
         "qanungo dashboard: folding the last {window} and the window before it from {} — a warm \
@@ -309,19 +403,25 @@ fn fold_and_publish(
     );
     let started = Instant::now();
     let folded = command::fold_coaching(archive, window)?;
-    let body = serde_json::to_vec(&dashboard::payload(window, refresh, &folded, refreshed))
-        .unwrap_or_else(|_| b"{}".to_vec());
+    let evidence = dashboard::evidence_index(&folded);
+    let body = serde_json::to_vec(&dashboard::payload(
+        window, refresh, &folded, refreshed, redactor,
+    ))
+    .unwrap_or_else(|_| b"{}".to_vec());
     eprintln!(
-        "qanungo dashboard: refresh {} — {} · payload {} · {}",
+        "qanungo dashboard: refresh {} — {} · payload {} · {} anchors over {} sessions · {}",
         refreshed.generation,
         instrumentation_line(&folded),
         format::bytes(body.len() as u64),
+        evidence.anchors(),
+        evidence.sessions(),
         format::elapsed(started.elapsed()),
     );
     Ok(Served {
         generation: refreshed.generation,
         refreshed_at: refreshed.at,
         body,
+        evidence,
     })
 }
 
@@ -353,7 +453,13 @@ fn instrumentation_line(folded: &Folded) -> String {
 /// than blanking the page or serving nothing: the numbers are still true of the window they were
 /// taken over, and the honest correction is to date them, not to hide them. The republish bumps the
 /// generation on purpose — a page's numbers becoming stale is a change worth pushing.
-fn refresh_loop(service: &Service, archive: &ArchiveArgs, window: &Window, refresh: &Refresh) {
+fn refresh_loop(
+    service: &Service,
+    archive: &ArchiveArgs,
+    window: &Window,
+    refresh: &Refresh,
+    redactor: &Redactor,
+) {
     let mut generation = 1;
     let mut stale_since: Option<DateTime<Utc>> = None;
     loop {
@@ -369,6 +475,7 @@ fn refresh_loop(service: &Service, archive: &ArchiveArgs, window: &Window, refre
                 at,
                 stale_since: None,
             },
+            redactor,
         ) {
             Ok(served) => {
                 stale_since = None;
@@ -408,6 +515,9 @@ fn republish_as_stale(service: &Service, generation: u64, since: DateTime<Utc>) 
         generation,
         refreshed_at: current.refreshed_at,
         body,
+        // The same anchors: this is the same fold, re-stamped. A stale page that can still expand
+        // its own findings is the point of keeping the numbers at all.
+        evidence: current.evidence.clone(),
     });
 }
 
@@ -500,6 +610,14 @@ fn handle(mut stream: TcpStream, service: &Service) {
             service.streams.fetch_sub(1, Ordering::Relaxed);
             eprintln!("qanungo dashboard: {peer} - event stream closed");
         }
+        Route::Evidence {
+            source_hash,
+            locator,
+        } => {
+            let (status, body) = evidence_response(service, &source_hash, locator);
+            eprintln!("qanungo dashboard: {peer} - {request} {status}");
+            let _ = write_response(&mut stream, status, "application/json", &body);
+        }
         Route::NotFound => {
             eprintln!("qanungo dashboard: {peer} - {request} 404");
             let _ = write_response(
@@ -510,6 +628,160 @@ fn handle(mut stream: TcpStream, service: &Service) {
             );
         }
     }
+}
+
+/// Answers one excerpt request: the anchored event, scrubbed — or a 404 that says which of the
+/// route's refusals stopped it.
+///
+/// The order matters and is the security argument, not an optimization. **What the payload named**
+/// is checked before anything touches a disk, so an unanchored locator cannot even probe whether a
+/// hash is cached. **The cache** is checked next and answered rather than filled, so no request can
+/// make this process reach for the archive. Only then is a blob opened, re-parsed, and scrubbed.
+///
+/// Every refusal is a 404 with a reason rather than a 403 or a 400: the caller is unauthenticated
+/// and the honest thing to tell them is that there is no such evidence here, while the *reason*
+/// exists for the operator reading a log or a developer reading a response — and none of the four
+/// reasons discloses anything the payload did not already say.
+fn evidence_response(
+    service: &Service,
+    source_hash: &str,
+    locator: u64,
+) -> (&'static str, Vec<u8>) {
+    let served = service.snapshot();
+    let Some(session) = served.evidence.servable(source_hash, locator) else {
+        return not_evidence(
+            source_hash,
+            locator,
+            "not-anchored",
+            "no finding in the current payload offers this anchor; this route serves the events \
+             the page names and is not a way to read a transcript",
+        );
+    };
+    if !service.cache.contains(source_hash) {
+        return not_evidence(
+            source_hash,
+            locator,
+            "cache-miss",
+            "this transcript is not in the local cache; the dashboard never fetches from the \
+             archive to answer a request, so this waits for the next refresh to mirror it",
+        );
+    }
+    let Some(source) = metrics::source_for_agent(&session.source_agent) else {
+        return not_evidence(
+            source_hash,
+            locator,
+            "unknown-harness",
+            "no interpreter for this harness in this build",
+        );
+    };
+    let blob = match service.cache.open_blob(source_hash) {
+        Ok(blob) => blob,
+        Err(error) => {
+            // The cache said it had it a moment ago, so this is a real local failure rather than a
+            // caller's mistake, and it is the operator's to fix.
+            eprintln!("qanungo dashboard: cached blob unreadable: {error}");
+            return (
+                "500 Internal Server Error",
+                serialize(&json!({
+                    "error": "the cached transcript could not be read",
+                    "source_hash": source_hash,
+                    "locator": locator,
+                })),
+            );
+        }
+    };
+    let extracted = evidence::extract(
+        source,
+        session.artifact_set_version,
+        io::BufReader::new(blob),
+        locator,
+    );
+    match extracted {
+        Ok(Some(raw)) => {
+            let excerpt = raw.redacted(&service.redactor);
+            (
+                "200 OK",
+                serialize(&excerpt_value(source_hash, &excerpt, &service.redactor)),
+            )
+        }
+        Ok(None) => not_evidence(
+            source_hash,
+            locator,
+            "no-such-event",
+            "the cached transcript has no event at this locator",
+        ),
+        Err(error) => not_evidence(
+            source_hash,
+            locator,
+            "unreadable-contract",
+            &error.to_string(),
+        ),
+    }
+}
+
+/// One refusal, as JSON. The hash and the locator are echoed back because both have already been
+/// validated to their grammars — 64 lowercase hex and a bounded integer — so neither can carry a
+/// byte the caller chose.
+fn not_evidence(
+    source_hash: &str,
+    locator: u64,
+    reason: &str,
+    detail: &str,
+) -> (&'static str, Vec<u8>) {
+    (
+        "404 Not Found",
+        serialize(&json!({
+            "error": "no such evidence",
+            "reason": reason,
+            "detail": detail,
+            "source_hash": source_hash,
+            "locator": locator,
+        })),
+    )
+}
+
+/// One excerpt, as JSON: the counted event and the account of what scrubbing it cost.
+///
+/// The redaction block is not decoration. A reader looking at an excerpt with no markers in it
+/// needs to know whether that means "nothing matched" or "the scrub was off", and those are very
+/// different sentences — so every excerpt carries the posture and the fired counts, and the counts
+/// come from [`crate::redaction::RedactionReport`], which cannot carry what it matched.
+fn excerpt_value(
+    source_hash: &str,
+    excerpt: &crate::evidence::Excerpt,
+    redactor: &Redactor,
+) -> serde_json::Value {
+    json!({
+        "source_hash": source_hash,
+        "locator": excerpt.locator,
+        "record": excerpt.record,
+        "line": excerpt.line,
+        "at": excerpt.at.map(stamp),
+        "tool": excerpt.tool,
+        "event": excerpt.event,
+        "outcome": excerpt.outcome,
+        "command": excerpt.command,
+        "error": excerpt.error,
+        "output": excerpt.output,
+        "truncated": excerpt.truncated,
+        "redaction": {
+            "secrets": redactor.redacts_secrets(),
+            "profanity": redactor.filters_profanity(),
+            "pattern_revision": crate::redaction::PATTERN_REVISION,
+            "total": excerpt.report.total(),
+            "fired": excerpt
+                .report
+                .fired()
+                .map(|(pattern, count)| json!({ "pattern": pattern.as_str(), "count": count }))
+                .collect::<Vec<_>>(),
+        },
+    })
+}
+
+/// Serializes a response body, falling back to a bare error object rather than panicking: this is
+/// on a request path, and every value above is built from numbers and validated strings.
+fn serialize(value: &serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_else(|_| br#"{"error":"unserializable"}"#.to_vec())
 }
 
 /// Holds one event stream open, writing a refresh notice on every swap and a comment between them.
@@ -577,7 +849,7 @@ fn logged_request(method: &str, target: &str) -> String {
     request
 }
 
-/// Which of the three routes a request is for.
+/// Which of the four routes a request is for.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
     /// The embedded page.
@@ -586,6 +858,12 @@ enum Route {
     Data,
     /// The refresh event stream.
     Events,
+    /// One anchored event, scrubbed. Parsed here rather than in the handler so that a target which
+    /// is not *exactly* a hash and a locator never becomes a lookup at all.
+    Evidence {
+        source_hash: String,
+        locator: u64,
+    },
     NotFound,
 }
 
@@ -594,15 +872,44 @@ enum Route {
 /// There is no 405: a non-`GET` request to this surface is not a method mismatch worth negotiating,
 /// it is a caller who has the wrong server. Nothing is read from the filesystem, so path traversal
 /// has nothing to traverse to — an unmatched target is simply not a route.
+///
+/// The evidence target is **strictly validated before it is anything**: 64 lowercase hex characters
+/// — the same [`cache::is_sha256_hex`] the blob cache checks a digest with, so the route and the
+/// store cannot come to disagree about what a hash is — and a bare bounded positive integer. A
+/// target with a trailing slash, an extra segment, an uppercase hex digit, or a locator with a sign
+/// is not a repairable request; it is not this route.
 fn route(method: &str, target: &str) -> Route {
     if method != "GET" {
         return Route::NotFound;
     }
-    match target.split('?').next().unwrap_or(target) {
+    let path = target.split('?').next().unwrap_or(target);
+    match path {
         "/" | "/index.html" => Route::Page,
         "/api/data" => Route::Data,
         "/api/events" => Route::Events,
-        _ => Route::NotFound,
+        _ => evidence_route(path),
+    }
+}
+
+/// `/api/evidence/<64 hex>/<locator>`, or nothing.
+fn evidence_route(path: &str) -> Route {
+    let Some(rest) = path.strip_prefix("/api/evidence/") else {
+        return Route::NotFound;
+    };
+    // Exactly two segments: `split_once` plus a check that the tail carries no further slash, so
+    // `/api/evidence/<hash>/1/2` and `/api/evidence/<hash>/1/` are both simply not this route.
+    let Some((source_hash, locator)) = rest.split_once('/') else {
+        return Route::NotFound;
+    };
+    if !cache::is_sha256_hex(source_hash) {
+        return Route::NotFound;
+    }
+    match evidence::parse_locator(locator) {
+        Some(locator) => Route::Evidence {
+            source_hash: source_hash.to_owned(),
+            locator,
+        },
+        None => Route::NotFound,
     }
 }
 
@@ -661,11 +968,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_three_routes_are_the_only_routes() {
+    fn the_four_routes_are_the_only_routes() {
         assert_eq!(route("GET", "/"), Route::Page);
         assert_eq!(route("GET", "/index.html"), Route::Page);
         assert_eq!(route("GET", "/api/data"), Route::Data);
         assert_eq!(route("GET", "/api/events"), Route::Events);
+        assert_eq!(
+            route("GET", &format!("/api/evidence/{}/12", "a".repeat(64))),
+            Route::Evidence {
+                source_hash: "a".repeat(64),
+                locator: 12,
+            },
+        );
         for target in [
             "/api",
             "/api/data/",
@@ -673,8 +987,62 @@ mod tests {
             "/assets/dashboard.html",
             "/../../etc/passwd",
             "/api/v1/artifacts/abc/content",
+            "/api/evidence",
+            "/api/evidence/",
         ] {
             assert_eq!(route("GET", target), Route::NotFound, "{target}");
+        }
+    }
+
+    /// The evidence target is a grammar, not a suggestion. Everything here is refused *at the
+    /// router*, before anything is looked up, so a malformed target never becomes a question about
+    /// what this process has on disk.
+    #[test]
+    fn an_evidence_target_is_a_hash_and_a_bounded_integer_or_it_is_not_a_route() {
+        let hash = "0123456789abcdef".repeat(4);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            route("GET", &format!("/api/evidence/{hash}/1")),
+            Route::Evidence {
+                source_hash: hash.clone(),
+                locator: 1,
+            },
+        );
+        // A query string is a caller's business here as everywhere else on this surface.
+        assert_eq!(
+            route("GET", &format!("/api/evidence/{hash}/1?raw=1")),
+            Route::Evidence {
+                source_hash: hash.clone(),
+                locator: 1,
+            },
+        );
+        for target in [
+            format!("/api/evidence/{hash}"),
+            format!("/api/evidence/{hash}/"),
+            format!("/api/evidence/{hash}/1/"),
+            format!("/api/evidence/{hash}/1/2"),
+            // Uppercase hex is not how a digest is spelled here, and a route that accepted both
+            // spellings would be a second definition of "is a digest".
+            format!("/api/evidence/{}/1", hash.to_uppercase()),
+            format!("/api/evidence/{}/1", &hash[..63]),
+            format!("/api/evidence/{}0/1", hash),
+            format!("/api/evidence/{}/1", "g".repeat(64)),
+            format!("/api/evidence/{hash}/0"),
+            format!("/api/evidence/{hash}/007"),
+            format!("/api/evidence/{hash}/-1"),
+            format!("/api/evidence/{hash}/ 1"),
+            format!("/api/evidence/{hash}/1234567890"),
+            format!("/api/evidence/{hash}/../../etc/passwd"),
+            format!("/api/evidence/../{hash}/1"),
+        ] {
+            assert_eq!(route("GET", &target), Route::NotFound, "{target}");
+        }
+        for method in ["POST", "PUT", "DELETE", "HEAD", "get"] {
+            assert_eq!(
+                route(method, &format!("/api/evidence/{hash}/1")),
+                Route::NotFound,
+                "{method}",
+            );
         }
     }
 
@@ -799,6 +1167,7 @@ mod tests {
     #[test]
     fn a_refresh_notice_is_one_line_of_parseable_json() {
         let served = Served {
+            evidence: EvidenceIndex::default(),
             generation: 7,
             refreshed_at: DateTime::parse_from_rfc3339("2026-08-24T09:30:00Z")
                 .unwrap()
@@ -861,20 +1230,60 @@ mod tests {
     /// honesty is in the sentence rather than in a refusal.
     #[test]
     fn a_non_loopback_bind_states_its_posture() {
+        let redactor = Redactor::new();
         for routable in ["0.0.0.0:8878", "100.64.0.7:8878", "[::]:8878"] {
-            let line = posture_line(routable.parse().expect("a socket address"));
+            let line = posture_line(routable.parse().expect("a socket address"), &redactor);
             assert!(line.contains("NOT loopback"), "{line}");
             assert!(line.contains("UNAUTHENTICATED"), "{line}");
             assert!(line.contains("tailnet"), "{line}");
-            assert!(line.contains("never transcript text"), "{line}");
+            // The claim changed with the slice and the sentence had to change with it: this page
+            // now serves excerpts, so "never transcript text" would be false. What is still true —
+            // and is what a reader needs — is that they are redacted, bounded to the events a rule
+            // counted, and that there is no route into the archive.
+            assert!(line.contains("redacted evidence excerpts"), "{line}");
+            assert!(line.contains("never a whole transcript"), "{line}");
+            assert!(line.contains("never a link into the archive"), "{line}");
             assert!(!line.contains('\n'), "the posture is one line: {line}");
         }
         for local in ["127.0.0.1:8878", "127.0.0.53:1", "[::1]:8878"] {
-            let line = posture_line(local.parse().expect("a socket address"));
+            let line = posture_line(local.parse().expect("a socket address"), &redactor);
             assert!(line.contains("is loopback"), "{line}");
             assert!(line.contains("only this machine"), "{line}");
             assert!(!line.contains('\n'), "the posture is one line: {line}");
         }
+    }
+
+    /// `--no-redact` is allowed — it is a documented choice the redaction lane already blessed —
+    /// and on a routable address it is that choice made on behalf of every device on the tailnet,
+    /// so it gets a second line and that line shouts.
+    #[test]
+    fn turning_redaction_off_says_so_and_says_it_loudest_where_it_costs_most() {
+        let raw = Redactor::new().with_secrets(false);
+        let routable: SocketAddr = "100.64.0.7:8878".parse().expect("a socket address");
+        let local: SocketAddr = "127.0.0.1:8878".parse().expect("a socket address");
+
+        // The default posture prints one line and nothing else.
+        assert_eq!(redaction_posture_line(routable, &Redactor::new()), None);
+        assert_eq!(redaction_posture_line(local, &Redactor::new()), None);
+
+        // With the scrub off, the first line stops calling the excerpts redacted...
+        let posture = posture_line(routable, &raw);
+        assert!(
+            posture.contains("UNREDACTED evidence excerpts"),
+            "{posture}"
+        );
+
+        // ...and the second one names the cost in the loudest terms the lane has.
+        let loud = redaction_posture_line(routable, &raw).expect("a second line");
+        assert!(loud.contains("NON-LOOPBACK"), "{loud}");
+        assert!(loud.contains("UNREDACTED"), "{loud}");
+        assert!(loud.contains("credentials"), "{loud}");
+        assert!(!loud.contains('\n'), "the posture is one line: {loud}");
+
+        let quiet = redaction_posture_line(local, &raw).expect("a second line");
+        assert!(quiet.contains("RAW"), "{quiet}");
+        assert!(quiet.contains("loopback"), "{quiet}");
+        assert!(!quiet.contains("NON-LOOPBACK"), "{quiet}");
     }
 
     /// A guard that the embedded asset is the page this server thinks it is serving, and that the
@@ -906,11 +1315,17 @@ mod tests {
     /// generation is woken with the new one.
     #[test]
     fn publishing_swaps_the_payload_and_wakes_the_waiters() {
-        let service = Arc::new(Service::new(Served {
-            generation: 1,
-            refreshed_at: Utc::now(),
-            body: br#"{"generation":1,"stale_since":null}"#.to_vec(),
-        }));
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let service = Arc::new(Service::new(
+            Served {
+                generation: 1,
+                refreshed_at: Utc::now(),
+                body: br#"{"generation":1,"stale_since":null}"#.to_vec(),
+                evidence: EvidenceIndex::default(),
+            },
+            BlobCache::open(scratch.path()).expect("a scratch cache"),
+            Redactor::new(),
+        ));
         assert_eq!(service.snapshot().generation, 1);
         // Already past the generation being waited on: no wait at all.
         assert_eq!(
@@ -938,6 +1353,7 @@ mod tests {
             generation: 2,
             refreshed_at: Utc::now(),
             body: br#"{"generation":2,"stale_since":null}"#.to_vec(),
+            evidence: EvidenceIndex::default(),
         });
         assert_eq!(waiter.join().expect("the waiter did not panic"), Some(2));
         assert_eq!(service.snapshot().generation, 2);
@@ -950,11 +1366,17 @@ mod tests {
         let taken_at = DateTime::parse_from_rfc3339("2026-08-24T09:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let service = Service::new(Served {
-            generation: 4,
-            refreshed_at: taken_at,
-            body: br#"{"provenance":{"sessions_folded":703,"stale_since":null}}"#.to_vec(),
-        });
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let service = Service::new(
+            Served {
+                generation: 4,
+                refreshed_at: taken_at,
+                body: br#"{"provenance":{"sessions_folded":703,"stale_since":null}}"#.to_vec(),
+                evidence: EvidenceIndex::default(),
+            },
+            BlobCache::open(scratch.path()).expect("a scratch cache"),
+            Redactor::new(),
+        );
         let since = DateTime::parse_from_rfc3339("2026-08-24T09:05:00Z")
             .unwrap()
             .with_timezone(&Utc);

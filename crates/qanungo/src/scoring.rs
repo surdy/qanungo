@@ -820,6 +820,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
+    use crate::evidence::SessionAnchors;
     use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
 
     fn at(value: &str) -> DateTime<Utc> {
@@ -841,6 +842,8 @@ mod tests {
         SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: source_agent.to_owned(),
+            artifact_set_version: 2,
+            anchors: SessionAnchors::default(),
             summary: SessionSummary {
                 user_requests: 4,
                 tool_activities: 20,

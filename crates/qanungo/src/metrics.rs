@@ -55,6 +55,18 @@
 //! flattering zero. Post-promotion that is the honest minority: on the 2026-08-18 mirror,
 //! 408 of 623 sessions carry at least one command, and the rest — sessions that ran no shell —
 //! claim nothing.
+//!
+//! # Where the events were (qanungo #5)
+//!
+//! The fold also records **evidence anchors** — bounded per-session locators for the events a rule
+//! will count, so a finding can point at them instead of only counting them. They are strictly
+//! additive: not one number above is computed from an anchor, and the same fold with anchors
+//! stripped produces the same verdicts, the same scores, and the same report. See
+//! [`crate::evidence`].
+//!
+//! The one thing anchors do change is the fold's *memory*, and every list of them is capped for
+//! the same reason the maps above are: a transcript is somebody else's data, and its shape must
+//! not decide this process's footprint.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -65,20 +77,32 @@ use munshi_transcript::{
     Classification, Event, SessionSummary, Source, ToolEvent, TranscriptStream, UnsupportedVersion,
 };
 
+use crate::evidence::{
+    EventAnchor, MAX_ANCHORED_COMMANDS, MAX_ANCHORS_PER_FINDING, SessionAnchors,
+};
 use crate::rules::thresholds::IDLE_GAP;
 
 /// Upper bound on remembered call-id -> tool-name pairs per session. A transcript is one
 /// conversation, so this is orders of magnitude above any real session; it exists so a
 /// pathological or adversarial transcript cannot make the fold's memory grow without bound.
-const MAX_CORRELATED_CALLS: usize = 100_000;
+pub(crate) const MAX_CORRELATED_CALLS: usize = 100_000;
 
-/// Upper bound on distinct command values remembered per session, on the same reasoning as
-/// [`MAX_CORRELATED_CALLS`]: a real session runs commands in the hundreds, and the fold must not
+/// Sitting boundaries one session keeps for the structural evidence a session-shaped rule renders
+/// (qanungo #5). **A tunable, not a decision.**
+///
+/// The archive's median session is multi-sitting and its tail runs to dozens; a dashboard row shows
+/// a reader the shape of the work, not an inventory of it. The count of sittings is exact whatever
+/// this is — [`Activity::sittings`] counts breaks, not remembered spans — so a session past the cap
+/// renders the first twelve and says how many it did not.
+pub const MAX_STRUCTURAL_SITTINGS: usize = 12;
+
+/// Upper bound on distinct command values remembered per session, on the same reasoning as the
+/// call-id cap above: a real session runs commands in the hundreds, and the fold must not
 /// let a pathological transcript — thousands of never-repeated one-off commands — grow its memory
 /// without bound. Lower than the call-id cap because the keys here are whole command lines rather
 /// than short ids. Its effect when reached is an under-claim, never an over-claim: see
 /// [`CommandChurn::untracked_events`].
-const MAX_DISTINCT_COMMANDS: usize = 20_000;
+pub const MAX_DISTINCT_COMMANDS: usize = 20_000;
 
 /// Attempts and failures for one tool, or for a whole session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -187,47 +211,94 @@ impl CommandChurn {
     }
 }
 
+/// What one exact command value did inside one session: how often it ran, and — for the first
+/// [`MAX_ANCHORED_COMMANDS`] values a session records — where.
+#[derive(Debug, Default)]
+struct CommandValue {
+    runs: u64,
+    /// Bounded at [`MAX_ANCHORS_PER_FINDING`]: the retry-loop finding offers at most that many, so
+    /// keeping more would be memory spent on evidence nothing will ask for. Empty for a value the
+    /// anchor cap refused, which costs the finding its excerpts and costs its *count* nothing.
+    anchors: Vec<EventAnchor>,
+}
+
 /// The fold's scratch memory for [`CommandChurn`]: the only place a command string exists in this
 /// crate, and it is dropped when the transcript ends.
 #[derive(Debug, Default)]
 struct CommandRuns {
     /// Run count per exact command value, capped at [`MAX_DISTINCT_COMMANDS`] keys.
-    runs: HashMap<String, u64>,
+    runs: HashMap<String, CommandValue>,
     /// Every command-bearing event, tracked or not.
     events: u64,
     /// Events the cap refused a key for.
     untracked: u64,
+    /// Distinct values that have been given an anchor list, capped at [`MAX_ANCHORED_COMMANDS`].
+    anchored: usize,
 }
 
 impl CommandRuns {
-    /// Folds one command-bearing tool event.
-    fn observe(&mut self, command: &str) {
+    /// Folds one command-bearing tool event, remembering where it was.
+    fn observe(&mut self, command: &str, anchor: EventAnchor) {
         self.events += 1;
-        if let Some(runs) = self.runs.get_mut(command) {
-            *runs += 1;
+        if let Some(value) = self.runs.get_mut(command) {
+            value.runs += 1;
+            if value.anchors.len() < MAX_ANCHORS_PER_FINDING {
+                value.anchors.push(anchor);
+            }
         } else if self.runs.len() < MAX_DISTINCT_COMMANDS {
-            self.runs.insert(command.to_owned(), 1);
+            // Anchors stop at their own cap while counting goes on to the larger one: the churn
+            // numbers a rule decides on are unaffected by how much evidence this session can offer.
+            let anchors = if self.anchored < MAX_ANCHORED_COMMANDS {
+                self.anchored += 1;
+                vec![anchor]
+            } else {
+                Vec::new()
+            };
+            self.runs
+                .insert(command.to_owned(), CommandValue { runs: 1, anchors });
         } else {
             self.untracked += 1;
         }
     }
 
-    /// Reduces the run counts to the countable summary, dropping every string.
-    fn finish(self) -> CommandChurn {
+    /// Reduces the run counts to the countable summary, dropping every string, and hands back the
+    /// busiest value's anchors alongside it — the events the retry-loop rule counts.
+    ///
+    /// The busiest value is chosen by run count and, when two values tie, by whichever ran
+    /// **first**. The tie-break is not cosmetic: a `HashMap`'s iteration order varies between runs
+    /// of the same process, so without it two folds of one transcript could offer different
+    /// evidence for the same finding.
+    fn finish(self) -> (CommandChurn, Vec<EventAnchor>) {
         let mut churn = CommandChurn {
             command_events: self.events,
             distinct_commands: self.runs.len(),
             untracked_events: self.untracked,
             ..CommandChurn::default()
         };
-        for runs in self.runs.into_values() {
-            churn.repeats += runs - 1;
-            churn.busiest_command_runs = churn.busiest_command_runs.max(runs);
-            if runs >= 2 {
+        let mut busiest: Option<(u64, u64, Vec<EventAnchor>)> = None;
+        for value in self.runs.into_values() {
+            churn.repeats += value.runs - 1;
+            churn.busiest_command_runs = churn.busiest_command_runs.max(value.runs);
+            if value.runs >= 2 {
                 churn.repeated_commands += 1;
             }
+            // A value with no anchors sorts last among its equals rather than winning a tie and
+            // offering nothing.
+            let first = value
+                .anchors
+                .first()
+                .map_or(u64::MAX, |anchor| anchor.locator);
+            let better = busiest.as_ref().is_none_or(|(runs, earliest, _)| {
+                value.runs > *runs || (value.runs == *runs && first < *earliest)
+            });
+            if better {
+                busiest = Some((value.runs, first, value.anchors));
+            }
         }
-        churn
+        (
+            churn,
+            busiest.map(|(_, _, anchors)| anchors).unwrap_or_default(),
+        )
     }
 }
 
@@ -272,7 +343,15 @@ impl CommandRuns {
 /// Every reading is `None` for a session with fewer than two dated records: with no adjacency
 /// there is no gap, and a lone record's activity is undefined rather than zero — the same
 /// discipline [`SessionMetrics::span`] already applies.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// # The boundaries, and why they are here (qanungo #5)
+///
+/// The same fold also remembers *when* the first [`MAX_STRUCTURAL_SITTINGS`] sittings ran. That is
+/// the structural evidence a session-shaped rule offers instead of an excerpt: a marathon did not
+/// count an utterance, it measured a stretch of clock, so what it shows a reader is that stretch.
+/// The list is bounded and the counts are not — [`Activity::sittings`] still counts every break —
+/// so a fifty-sitting transcript renders twelve boundaries and says it has thirty-eight more.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Activity {
     /// Records that carried a parseable timestamp. Two are needed before anything is defined.
     dated_records: u64,
@@ -284,8 +363,31 @@ pub struct Activity {
     current_sitting: TimeDelta,
     /// Gaps over [`IDLE_GAP`], each of which ended a sitting.
     breaks: u64,
-    /// The carried previous timestamp — the fold's entire memory.
+    /// The carried previous timestamp — the fold's entire memory of the *numbers*.
     previous: Option<DateTime<Utc>>,
+    /// When the run currently being accumulated started.
+    current_start: Option<DateTime<Utc>>,
+    /// The first [`MAX_STRUCTURAL_SITTINGS`] *finished* sittings; the run in progress is appended
+    /// on read, exactly as its span is.
+    finished_sittings: Vec<Sitting>,
+}
+
+/// One continuous stretch of work: two timestamps, and nothing else.
+///
+/// A sitting of a single record has `from == to`, which is a real shape — a lone record after a
+/// long break — and not a missing reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sitting {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+impl Sitting {
+    /// How long the sitting ran, as the clock saw it. Never negative: the fold clamps inversions
+    /// before a boundary is ever closed.
+    pub fn span(&self) -> TimeDelta {
+        (self.to - self.from).max(TimeDelta::zero())
+    }
 }
 
 impl Activity {
@@ -308,9 +410,19 @@ impl Activity {
             } else {
                 self.longest_finished_sitting =
                     self.longest_finished_sitting.max(self.current_sitting);
+                // The sitting that just ended ran from where it started to the record *before*
+                // this one; this record opens the next one.
+                if let Some(from) = self.current_start
+                    && self.finished_sittings.len() < MAX_STRUCTURAL_SITTINGS
+                {
+                    self.finished_sittings.push(Sitting { from, to: previous });
+                }
                 self.current_sitting = TimeDelta::zero();
+                self.current_start = Some(at);
                 self.breaks += 1;
             }
+        } else {
+            self.current_start = Some(at);
         }
         self.previous = Some(at);
         self.dated_records += 1;
@@ -340,6 +452,33 @@ impl Activity {
                 .saturating_add(1)
         })
     }
+
+    /// The first [`MAX_STRUCTURAL_SITTINGS`] sittings, in file order, with the one still in
+    /// progress folded in — exactly as [`Activity::longest_sitting`] folds its span in.
+    ///
+    /// Empty for a session with nothing to put a gap in, on the same discipline as every other
+    /// reading here: no adjacency, no sitting.
+    pub fn sitting_boundaries(&self) -> Vec<Sitting> {
+        if !self.measurable() {
+            return Vec::new();
+        }
+        let mut boundaries = self.finished_sittings.clone();
+        if let (Some(from), Some(to)) = (self.current_start, self.previous)
+            && boundaries.len() < MAX_STRUCTURAL_SITTINGS
+        {
+            boundaries.push(Sitting { from, to });
+        }
+        boundaries
+    }
+
+    /// Sittings the cap kept out of [`Activity::sitting_boundaries`]. Reported rather than hidden:
+    /// a bar chart of twelve sittings drawn for a session that had fifty would be a lie about the
+    /// shape of the work.
+    pub fn sittings_elided(&self) -> usize {
+        self.sittings()
+            .unwrap_or_default()
+            .saturating_sub(self.sitting_boundaries().len())
+    }
 }
 
 /// The metrics folded out of one session's transcript, plus the evidence needed to cite it.
@@ -349,6 +488,9 @@ pub struct SessionMetrics {
     pub source_hash: String,
     /// The harness that produced the transcript (`claude-code`, `copilot-cli`, `codex-cli`).
     pub source_agent: String,
+    /// The artifact-set contract the snapshot declared, carried so an anchored event can be read
+    /// back out of the cached blob with the same interpreter the fold used. Nothing scores it.
+    pub artifact_set_version: u16,
     /// The counting fold `munshi-transcript` already defines, restated over the same stream.
     pub summary: SessionSummary,
     pub tools: ToolOutcomes,
@@ -356,6 +498,8 @@ pub struct SessionMetrics {
     pub activity: Activity,
     /// Repeated-command churn, undefined for a harness that records no command field.
     pub commands: CommandChurn,
+    /// Where the events a rule will count were. Strictly additive — see [`crate::evidence`].
+    pub anchors: SessionAnchors,
     /// Transcript bytes read, for the fold-cost footer.
     pub bytes_folded: u64,
 }
@@ -421,6 +565,7 @@ pub struct Fold {
     pub tools: ToolOutcomes,
     pub activity: Activity,
     pub commands: CommandChurn,
+    pub anchors: SessionAnchors,
 }
 
 /// Folds one transcript, streaming: one pass, no buffering of records, memory bounded by the
@@ -440,6 +585,11 @@ pub fn fold_transcript(
     let mut fold = Fold::default();
     let mut names: HashMap<String, String> = HashMap::new();
     let mut commands = CommandRuns::default();
+    // The locator every anchor is keyed by: the tool event's ordinal in file order. It is counted
+    // here, beside the events, rather than read off `summary.tool_activities` — the two are the
+    // same number today and one of them is a locator, which is a contract, and the other is a
+    // metric, which is not.
+    let mut tool_events = 0_u64;
     for item in stream {
         fold.summary.observe(&item);
         let Ok(record) = &item else { continue };
@@ -451,25 +601,45 @@ pub fn fold_transcript(
         if let Classification::Content { events } = &record.classification {
             for event in events {
                 if let Event::Tool(tool) = event {
-                    observe_tool(&mut fold.tools, &mut names, tool);
+                    tool_events += 1;
+                    let anchor = |tool_name: Option<&str>| EventAnchor {
+                        locator: tool_events,
+                        record: record.record,
+                        line: record.line,
+                        at: record.timestamp,
+                        tool: tool_name.map(ToOwned::to_owned),
+                    };
+                    observe_tool(
+                        &mut fold.tools,
+                        &mut fold.anchors,
+                        &mut names,
+                        tool,
+                        &anchor,
+                    );
                     // Compared in memory, counted, and dropped: the value never leaves this
-                    // function, and nothing downstream of the fold can render it.
+                    // function, and nothing downstream of the fold can render it. What survives is
+                    // the anchor — where the run was, never what it ran.
                     if let Some(command) = tool.fields.get("command") {
-                        commands.observe(command);
+                        commands.observe(command, anchor(tool.name()));
                     }
                 }
             }
         }
     }
-    fold.commands = commands.finish();
+    let (churn, busiest_runs) = commands.finish();
+    fold.commands = churn;
+    fold.anchors.command_runs = busiest_runs;
     Ok(fold)
 }
 
-/// Folds one tool event: remember what it names, then count what it reports.
+/// Folds one tool event: remember what it names, then count what it reports — and, when what it
+/// reports is a failure, remember where it was.
 fn observe_tool(
     outcomes: &mut ToolOutcomes,
+    anchors: &mut SessionAnchors,
     names: &mut HashMap<String, String>,
     tool: &ToolEvent,
+    anchor: &impl Fn(Option<&str>) -> EventAnchor,
 ) {
     if let (Some(call_id), Some(name)) = (tool.call_id(), tool.name())
         && names.len() < MAX_CORRELATED_CALLS
@@ -484,6 +654,9 @@ fn observe_tool(
         tool.call_id()
             .and_then(|call_id| names.get(call_id).cloned())
     });
+    if !succeeded {
+        anchors.observe_error(name.as_deref(), anchor(name.as_deref()));
+    }
     match name {
         Some(name) => outcomes.by_tool.entry(name).or_default().observe(succeeded),
         None => outcomes.unattributed += 1,
@@ -492,7 +665,11 @@ fn observe_tool(
 
 /// Whether this event reports a tool outcome, and whether that outcome succeeded. See the module
 /// docs for why only these two shapes count.
-fn outcome(tool: &ToolEvent) -> Option<bool> {
+///
+/// Visible to the crate because [`crate::evidence`] answers the same question when it serves an
+/// excerpt, and an excerpt that called an event a failure on rules the fold does not use would be a
+/// second definition of "failed".
+pub(crate) fn outcome(tool: &ToolEvent) -> Option<bool> {
     if let Some(success) = tool.fields.get("success") {
         return Some(success == "true");
     }
@@ -726,10 +903,12 @@ mod tests {
         SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
+            artifact_set_version: 2,
             summary: fold.summary,
             tools: fold.tools,
             activity: fold.activity,
             commands: fold.commands,
+            anchors: fold.anchors,
             bytes_folded: 0,
         }
     }
@@ -738,6 +917,18 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    /// A stand-in anchor at one locator, for the scratch-memory tests: what the churn fold does
+    /// with an anchor is bound it, and none of these tests is about where an event was.
+    fn locator(locator: u64) -> EventAnchor {
+        EventAnchor {
+            locator,
+            record: locator,
+            line: locator,
+            at: None,
+            tool: None,
+        }
     }
 
     /// An activity folded from a start time plus the gaps, in minutes, between records.
@@ -985,14 +1176,19 @@ mod tests {
     /// reported churn is a floor.
     #[test]
     fn the_distinct_command_cap_under_claims_rather_than_guesses() {
+        let mut at = 0;
+        let mut ran = |runs: &mut CommandRuns, command: &str| {
+            at += 1;
+            runs.observe(command, locator(at));
+        };
         let mut runs = CommandRuns::default();
         for command in ["a", "b", "c", "a"] {
-            runs.observe(command);
+            ran(&mut runs, command);
         }
         // Four values, one of them a repeat, all inside the real cap.
-        runs.observe("d");
-        runs.observe("d");
-        let churn = runs.finish();
+        ran(&mut runs, "d");
+        ran(&mut runs, "d");
+        let (churn, _) = runs.finish();
         assert_eq!(churn.command_events, 6);
         assert_eq!(churn.distinct_commands, 4);
         assert_eq!(churn.untracked_events, 0);
@@ -1000,13 +1196,13 @@ mod tests {
         // Now the same stream against a map that is already full.
         let mut capped = CommandRuns::default();
         for index in 0..MAX_DISTINCT_COMMANDS {
-            capped.observe(&format!("command-{index}"));
+            ran(&mut capped, &format!("command-{index}"));
         }
         assert_eq!(capped.runs.len(), MAX_DISTINCT_COMMANDS);
-        capped.observe("command-0");
-        capped.observe("beyond-the-cap");
-        capped.observe("beyond-the-cap");
-        let churn = capped.finish();
+        ran(&mut capped, "command-0");
+        ran(&mut capped, "beyond-the-cap");
+        ran(&mut capped, "beyond-the-cap");
+        let (churn, _) = capped.finish();
         assert_eq!(churn.distinct_commands, MAX_DISTINCT_COMMANDS);
         assert_eq!(
             churn.command_events,
@@ -1055,6 +1251,7 @@ mod tests {
         let day = |date: &str, span_minutes: i64, gaps: &[i64]| SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
+            artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(at(date)),
                 last_timestamp: Some(at(date) + TimeDelta::minutes(span_minutes)),
@@ -1063,6 +1260,7 @@ mod tests {
             tools: ToolOutcomes::default(),
             activity: activity(gaps),
             commands: CommandChurn::default(),
+            anchors: SessionAnchors::default(),
             bytes_folded: 0,
         };
         let sessions = vec![
@@ -1147,6 +1345,7 @@ mod tests {
         let session = SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
+            artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(start),
                 last_timestamp: Some(start + TimeDelta::hours(9)),
@@ -1155,6 +1354,7 @@ mod tests {
             tools: ToolOutcomes::default(),
             activity: Activity::over([start, start + TimeDelta::milliseconds(900)]),
             commands: CommandChurn::default(),
+            anchors: SessionAnchors::default(),
             bytes_folded: 0,
         };
         assert_eq!(
@@ -1246,6 +1446,122 @@ mod tests {
         let blind = Totals::fold(&sessions[2..]).churn;
         assert_eq!(blind, ChurnTotals::default());
         assert_eq!(blind.repeat_share(), None);
+    }
+
+    /// Anchors are bounded and counts are not, which is the whole shape of the trade: a session
+    /// that failed forty calls still *reports* forty, and offers ten places to look.
+    #[test]
+    fn the_anchor_cap_bounds_the_evidence_and_never_the_count() {
+        let fold = fold_claude(&claude_tool_transcript("Bash", 40, 40));
+        assert_eq!(fold.tools.total.attempts, 40);
+        assert_eq!(fold.tools.total.errors, 40, "every call is still counted");
+        assert_eq!(
+            fold.anchors.tool_errors["Bash"].len(),
+            MAX_ANCHORS_PER_FINDING,
+        );
+        // The ones kept are the first, in file order — a session's evidence should start where the
+        // trouble started, not wherever the fold happened to stop.
+        let locators: Vec<u64> = fold.anchors.tool_errors["Bash"]
+            .iter()
+            .map(|anchor| anchor.locator)
+            .collect();
+        assert_eq!(
+            locators,
+            (1..=MAX_ANCHORS_PER_FINDING)
+                .map(|n| n as u64 * 2)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The locator is the tool event's ordinal in file order, and it has to mean the same thing to
+    /// the fold that mints it and to the reader that resolves it — so this pins it against the two
+    /// events of each call rather than against a record number.
+    #[test]
+    fn an_anchor_locator_is_the_tool_events_ordinal_in_file_order() {
+        let fold = fold_claude(&claude_tool_transcript("Bash", 3, 3));
+        let locators: Vec<u64> = fold.anchors.tool_errors["Bash"]
+            .iter()
+            .map(|anchor| anchor.locator)
+            .collect();
+        // Invocation, result, invocation, result, ...: the failures are the even ordinals.
+        assert_eq!(locators, vec![2, 4, 6]);
+        // And the records they name are the result records, which are every second record after
+        // the opening user message.
+        let records: Vec<u64> = fold.anchors.tool_errors["Bash"]
+            .iter()
+            .map(|anchor| anchor.record)
+            .collect();
+        assert_eq!(records, vec![3, 5, 7]);
+    }
+
+    /// A failure the fold could not attribute is anchored without a name rather than filed under a
+    /// tool that did not run it — the same discipline `unattributed` already holds for the count.
+    #[test]
+    fn an_unattributable_failure_is_anchored_under_no_tool() {
+        let transcript = r#"{"type":"user","uuid":"r1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_orphan","content":"result","is_error":true}]}}"#;
+        let fold = fold_claude(transcript);
+        assert_eq!(fold.tools.unattributed, 1);
+        assert!(fold.anchors.tool_errors.is_empty());
+        assert_eq!(fold.anchors.unattributed_errors.len(), 1);
+        assert_eq!(fold.anchors.unattributed_errors[0].tool, None);
+    }
+
+    /// Sitting boundaries are the same machinery the durations come from, read out rather than
+    /// re-derived: three sittings of work with two long breaks between them.
+    #[test]
+    fn sitting_boundaries_are_the_sittings_the_gap_fold_counted() {
+        let session = activity(&[10, 5, 180, 12, 10, 240, 10, 5]);
+        assert_eq!(session.sittings(), Some(3));
+        let boundaries = session.sitting_boundaries();
+        assert_eq!(boundaries.len(), 3);
+        assert_eq!(boundaries[0].span(), TimeDelta::minutes(15));
+        assert_eq!(boundaries[1].span(), TimeDelta::minutes(22));
+        assert_eq!(boundaries[2].span(), TimeDelta::minutes(15));
+        assert_eq!(
+            boundaries.iter().map(Sitting::span).sum::<TimeDelta>(),
+            session.active_time().unwrap(),
+            "the drawn sittings account for exactly the active time",
+        );
+        // Adjacent and non-overlapping, in file order.
+        assert!(boundaries[0].to < boundaries[1].from);
+        assert!(boundaries[1].to < boundaries[2].from);
+        assert_eq!(session.sittings_elided(), 0);
+    }
+
+    /// Past the cap the boundaries stop and the *counts* do not: a fifty-sitting transcript draws
+    /// twelve and says how many it did not draw.
+    #[test]
+    fn the_boundary_cap_elides_rather_than_misrepresenting_the_shape() {
+        // Each sitting is one 10-minute gap, separated by an hour away from the keyboard.
+        let mut gaps = Vec::new();
+        for sitting in 0..MAX_STRUCTURAL_SITTINGS + 8 {
+            if sitting > 0 {
+                gaps.push(60);
+            }
+            gaps.push(10);
+        }
+        let session = activity(&gaps);
+        assert_eq!(session.sittings(), Some(MAX_STRUCTURAL_SITTINGS + 8));
+        assert_eq!(session.sitting_boundaries().len(), MAX_STRUCTURAL_SITTINGS);
+        assert_eq!(session.sittings_elided(), 8);
+        assert_eq!(
+            session.active_time(),
+            Some(TimeDelta::minutes(
+                10 * (MAX_STRUCTURAL_SITTINGS as i64 + 8)
+            )),
+            "the duration is over every sitting, drawn or not",
+        );
+    }
+
+    /// A session with no adjacency has no sitting to draw, exactly as it has no duration to state.
+    #[test]
+    fn a_session_with_one_record_draws_no_sitting() {
+        assert!(Activity::default().sitting_boundaries().is_empty());
+        assert!(
+            Activity::over([at("2026-08-01T09:00:00Z")])
+                .sitting_boundaries()
+                .is_empty()
+        );
     }
 
     #[test]

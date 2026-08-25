@@ -3,20 +3,26 @@
 //! # The redaction line (hard), restated for a served surface
 //!
 //! This payload carries **lane scores, rule ids, counts, rendered aggregates, archive-stated
-//! identifiers, and `sha256` content hashes — nothing else**. No transcript text, no summary
-//! prose, no command strings, no error text, no file paths, not truncated and not in evidence.
+//! identifiers, tool names, evidence anchors, and `sha256` content hashes — nothing else**. No
+//! transcript text, no summary prose, no command strings, no error text, no file paths, not
+//! truncated and not in evidence.
 //!
 //! It is the same line [`crate::report`] holds and it is held the same way: by *construction*.
 //! Every field below is read off a [`Folded`](crate::command::Folded), whose types have already
-//! reduced a transcript to counts, timestamps, and a digest — the fold drops content before this
-//! module can see it, so there is no string here to filter. The P0 exemption from qanungo #8
-//! therefore applies unchanged, which is why the dashboard flattens no redaction flag: a scrub
-//! over a payload with no content in it would be decoration on a security control.
+//! reduced a transcript to counts, timestamps, locators, and a digest — the fold drops content
+//! before this module can see it, so there is no string here to filter.
 //!
-//! Two things make that stronger than a promise. The payload states it about itself —
-//! `provenance.renders_verbatim` is `false` — and a fixture archive stuffed with canary strings is
-//! serialized through this module in `tests/dashboard.rs`, so a field that started carrying
-//! transcript text fails a test rather than reaching a browser.
+//! An **anchor is not content**: a locator, a record number, a line number, a timestamp, and a tool
+//! name, which is schema metadata and the one verbatim string every surface here may already
+//! render. What an anchor *resolves to* is content, and that resolution is a separate on-demand
+//! route with the redactor wired into it — see [`crate::evidence`] and
+//! [`crate::dashboard_server`]. This is why `provenance.renders_verbatim` is now **`true`**: the
+//! payload still carries none, but the surface it belongs to does, and a page that claimed
+//! otherwise would be inviting a reader to trust a control it had stopped exercising.
+//!
+//! A fixture archive stuffed with canary strings is serialized through this module in
+//! `tests/dashboard.rs`, so a field that started carrying transcript text fails a test rather than
+//! reaching a browser.
 //!
 //! **No raw Patwari links, anywhere.** Patwari serves unredacted blobs and never redacts, so a
 //! deep link from this page to an artifact would hand any tailnet device the whole transcript —
@@ -34,12 +40,12 @@
 //! is [`Trend::between`] and a fleet trend is [`Blend::comparable`](crate::scoring::Blend::comparable),
 //! the same two functions the Markdown table draws its `▲` from.
 //!
-//! # What V1 leaves out
+//! # What this slice leaves out
 //!
-//! Redacted evidence excerpts (qanungo #8's own surface), the standup and cost views over folds
-//! that already ship, scope selection by repository and harness, the timeline, and the 7×24 heatmap
-//! — the last blocked on munshi#77's local-offset pull, because UTC misplaces every late-night
-//! claim the view exists to make. Each is a later slice over this same payload, not a change to it.
+//! The standup and cost views over folds that already ship, scope selection by repository and
+//! harness, the timeline, and the 7×24 heatmap — the last blocked on munshi#77's local-offset pull,
+//! because UTC misplaces every late-night claim the view exists to make. Each is a later slice over
+//! this same payload, not a change to it.
 
 use std::collections::BTreeMap;
 
@@ -48,9 +54,10 @@ use serde_json::{Value, json};
 
 use crate::cli::{Refresh, Window};
 use crate::command::Folded;
+use crate::evidence::{EventAnchor, EvidenceIndex};
 use crate::format;
-use crate::metrics::Totals;
-use crate::redaction::PATTERN_REVISION;
+use crate::metrics::{SessionMetrics, Totals};
+use crate::redaction::{PATTERN_REVISION, Redactor};
 use crate::report::{self, stamp};
 use crate::rules::Finding;
 use crate::scoring::{Lane, LaneScore, Scorecard, Trend};
@@ -73,11 +80,57 @@ pub struct Refreshed {
     pub stale_since: Option<DateTime<Utc>>,
 }
 
+/// The set of anchors this payload names, and therefore the entire set of excerpts the process will
+/// resolve while this payload is the current one.
+///
+/// Built from the findings rather than from the fold: a session can be anchored and not be *cited*
+/// — the rule it was anchored for may not have fired on it — and only what a reader can see on the
+/// page is something they may ask to expand. See [`crate::evidence::EvidenceIndex`] for why that
+/// boundary is what keeps this from becoming a transcript-browsing API.
+pub fn evidence_index(folded: &Folded) -> EvidenceIndex {
+    let by_hash: BTreeMap<&str, &SessionMetrics> = folded
+        .sessions
+        .iter()
+        .map(|session| (session.source_hash.as_str(), session))
+        .collect();
+    let mut index = EvidenceIndex::default();
+    for finding in &folded.findings {
+        for evidence in &finding.evidence {
+            // A finding whose session is not in this window's fold cannot happen — the findings
+            // were evaluated over exactly these sessions — and if it ever did, the honest answer is
+            // to offer nothing rather than to guess at an interpreter.
+            let Some(session) = by_hash.get(evidence.source_hash.as_str()) else {
+                continue;
+            };
+            for anchor in &evidence.anchors {
+                index.offer(
+                    &evidence.source_hash,
+                    &session.source_agent,
+                    session.artifact_set_version,
+                    anchor.locator,
+                );
+            }
+        }
+    }
+    index
+}
+
 /// Builds the served JSON document.
 ///
 /// One call per refresh, never per request: the body is serialized once and handed to every reader
 /// as bytes, so a hundred open tabs cost one fold and one serialization between them.
-pub fn payload(window: &Window, refresh: &Refresh, folded: &Folded, refreshed: Refreshed) -> Value {
+///
+/// The `redactor` is not used to build anything here — this document has nothing to scrub. It is
+/// *stated* in the provenance block, because a page that offers to expand evidence has to say
+/// which scrub stands behind the expansion, and the answer is fixed at launch and identical for
+/// every reader.
+pub fn payload(
+    window: &Window,
+    refresh: &Refresh,
+    folded: &Folded,
+    refreshed: Refreshed,
+    redactor: &Redactor,
+) -> Value {
     // The same two questions the report asks in the same order: is there a comparison window at
     // all, and if so what did it score? A window too long to place an equal-length one before it
     // has no `before`, and therefore no arrow anywhere on the page.
@@ -88,6 +141,11 @@ pub fn payload(window: &Window, refresh: &Refresh, folded: &Folded, refreshed: R
     let now = Scorecard::fold(&folded.sessions);
     let before = comparison_opens_at.map(|_| Scorecard::fold(&folded.previous));
     let columns = report::harness_columns(&now, before.as_ref());
+    let by_hash: BTreeMap<&str, &SessionMetrics> = folded
+        .sessions
+        .iter()
+        .map(|session| (session.source_hash.as_str(), session))
+        .collect();
 
     json!({
         "window": {
@@ -102,8 +160,12 @@ pub fn payload(window: &Window, refresh: &Refresh, folded: &Folded, refreshed: R
             .iter()
             .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns))
             .collect::<Vec<_>>(),
-        "findings": folded.findings.iter().map(finding_value).collect::<Vec<_>>(),
-        "provenance": provenance_value(window, refresh, folded, refreshed),
+        "findings": folded
+            .findings
+            .iter()
+            .map(|finding| finding_value(finding, &by_hash))
+            .collect::<Vec<_>>(),
+        "provenance": provenance_value(window, refresh, folded, refreshed, redactor),
     })
 }
 
@@ -231,25 +293,105 @@ fn trend_value(trend: Option<Trend>) -> Value {
 }
 
 /// One finding: the rule that fired, the report's own Problem and Action wording, how many sessions
-/// it fired on, and the hashes of those sessions.
+/// it fired on, the hashes of those sessions, and — per session — the evidence its rule can
+/// honestly offer.
 ///
 /// The Problem and Action strings are lifted from [`crate::rules`] rather than re-worded for the
 /// web, so the page and the CLI give the same advice in the same sentences. The per-session
-/// evidence *detail* lines the Markdown carries are deliberately not here: V1 renders Problem,
-/// Action, and hash references, and a hash is the whole of what this surface offers as evidence
-/// until the redacted-excerpt slice lands behind qanungo #8.
-fn finding_value(finding: &Finding) -> Value {
+/// evidence *detail* lines the Markdown carries are deliberately still not here: the page shows the
+/// counted events themselves, which is a better answer than a sentence about them.
+///
+/// `evidence_kind` is the rule's own statement about what kind of evidence it has
+/// ([`crate::rules::RuleId::evidence_kind`]), and the page renders it rather than deciding for
+/// itself: anchors for a rule that counted events, timestamps and counts for one that measured a
+/// shape, and both for fire-and-forget, which did each in a different component.
+fn finding_value(finding: &Finding, by_hash: &BTreeMap<&str, &SessionMetrics>) -> Value {
+    let kind = finding.rule.evidence_kind();
     json!({
         "rule": finding.rule.key(),
         "title": finding.rule.title(),
         "problem": finding.problem,
         "action": finding.action,
         "sessions_affected": finding.evidence.len(),
+        "evidence_kind": kind.key(),
         "source_hashes": finding
             .evidence
             .iter()
             .map(|evidence| evidence.source_hash.clone())
             .collect::<Vec<_>>(),
+        "evidence": finding
+            .evidence
+            .iter()
+            .map(|evidence| json!({
+                "source_hash": evidence.source_hash,
+                "anchors": if kind.anchors() {
+                    evidence.anchors.iter().map(anchor_value).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                },
+                "structural": if kind.structural() {
+                    by_hash
+                        .get(evidence.source_hash.as_str())
+                        .map(|session| structural_value(session))
+                } else {
+                    None
+                },
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// One anchor: where a counted event is, and nothing about what it said.
+///
+/// The tool name goes through [`format::identifier`] like every other archive-stated string on this
+/// surface — a harness names its own tools, and a served page is not a place a peer chooses
+/// characters on.
+fn anchor_value(anchor: &EventAnchor) -> Value {
+    json!({
+        "locator": anchor.locator,
+        "record": anchor.record,
+        "line": anchor.line,
+        "at": anchor.at.map(stamp),
+        "tool": anchor.tool.as_deref().map(format::identifier),
+    })
+}
+
+/// The structural evidence of a session-shaped finding: when the work happened and how much of it
+/// there was. **Timestamps and numbers only** — there is no string in here at all, which is a
+/// stronger statement than "it is scrubbed".
+///
+/// Durations arrive pre-rendered beside their raw seconds for the same reason the provenance block
+/// does it: [`crate::format`] owns how a span reads, and a second implementation of that in
+/// JavaScript would drift from the report the page claims to be a view of.
+fn structural_value(session: &SessionMetrics) -> Value {
+    let span = |delta: Option<chrono::TimeDelta>| {
+        json!({
+            "rendered": delta.map(format::span),
+            "seconds": delta.map(|delta| delta.num_seconds().max(0)),
+        })
+    };
+    json!({
+        "active": span(session.active_time()),
+        "span": span(session.span()),
+        "longest_sitting": span(session.longest_sitting()),
+        "sittings": session.sittings(),
+        "first_record": session.summary.first_timestamp.map(stamp),
+        "last_record": session.summary.last_timestamp.map(stamp),
+        "user_requests": session.summary.user_requests,
+        "assistant_messages": session.summary.assistant_messages,
+        "tool_activities": session.summary.tool_activities,
+        "boundaries": session
+            .activity
+            .sitting_boundaries()
+            .iter()
+            .map(|sitting| json!({
+                "from": stamp(sitting.from),
+                "to": stamp(sitting.to),
+                "seconds": sitting.span().num_seconds().max(0),
+                "rendered": format::span(sitting.span()),
+            }))
+            .collect::<Vec<_>>(),
+        "boundaries_elided": session.activity.sittings_elided(),
     })
 }
 
@@ -265,6 +407,7 @@ fn provenance_value(
     refresh: &Refresh,
     folded: &Folded,
     refreshed: Refreshed,
+    redactor: &Redactor,
 ) -> Value {
     let instrumentation = &folded.instrumentation;
     json!({
@@ -296,9 +439,19 @@ fn provenance_value(
             .iter()
             .map(|note| json!({ "count": note.count, "reason": note.reason }))
             .collect::<Vec<_>>(),
-        // A machine-checkable statement of this module's own contract. If it is ever true, this
-        // page needs a redaction story before it needs anything else.
-        "renders_verbatim": false,
+        // A machine-checkable statement of this *surface's* contract, not of this document's. The
+        // payload still carries no transcript text; the page it feeds can expand an anchor into a
+        // redacted excerpt, and that is verbatim rendering however narrow the span. It says so, and
+        // the block below says what stands behind it — which is the whole of qanungo #8's standing
+        // rule for a new rendering surface.
+        "renders_verbatim": true,
+        "redaction": {
+            // Launch-time, identical for every reader, and never a query string: a redaction
+            // control a browser could flip is a redaction bypass with a nicer name.
+            "secrets": redactor.redacts_secrets(),
+            "profanity": redactor.filters_profanity(),
+            "pattern_revision": PATTERN_REVISION,
+        },
     })
 }
 
@@ -313,7 +466,8 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command};
-    use crate::metrics::{Activity, CommandChurn, SessionMetrics, ToolOutcomes};
+    use crate::evidence::SessionAnchors;
+    use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
     use crate::report::Instrumentation;
     use crate::rules;
     use crate::scoring::RulePack;
@@ -360,6 +514,7 @@ mod tests {
                 SessionMetrics {
                     source_hash: format!("{index:02x}").repeat(32),
                     source_agent: source_agent.to_owned(),
+                    artifact_set_version: 2,
                     summary: SessionSummary {
                         user_requests: 4,
                         tool_activities: 20,
@@ -370,6 +525,7 @@ mod tests {
                     tools: ToolOutcomes::default(),
                     activity: Activity::over(timestamps),
                     commands: CommandChurn::default(),
+                    anchors: SessionAnchors::default(),
                     bytes_folded: 1024,
                 }
             })
@@ -418,6 +574,7 @@ mod tests {
             &refresh(),
             &folded(sessions, previous),
             refreshed(),
+            &Redactor::new(),
         )
     }
 
@@ -667,7 +824,31 @@ mod tests {
         assert_eq!(provenance["refresh_interval"], "5m");
         assert_eq!(provenance["generation"], 3);
         assert_eq!(provenance["stale_since"], Value::Null);
-        assert_eq!(provenance["renders_verbatim"], false);
+        // True since the excerpt route: the payload still carries no transcript text, but the
+        // surface it feeds renders some, and the block below says under which scrub.
+        assert_eq!(provenance["renders_verbatim"], true);
+        assert_eq!(provenance["redaction"]["secrets"], true);
+        assert_eq!(provenance["redaction"]["profanity"], false);
+        assert_eq!(
+            provenance["redaction"]["pattern_revision"],
+            PATTERN_REVISION
+        );
+    }
+
+    /// The posture a reader sees is the posture the process was started with — there is no third
+    /// state and no per-request one.
+    #[test]
+    fn the_payload_states_the_redactor_the_process_was_launched_with() {
+        let raw = payload(
+            &window("7d"),
+            &refresh(),
+            &folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            refreshed(),
+            &Redactor::new().with_secrets(false).with_profanity(true),
+        );
+        assert_eq!(raw["provenance"]["redaction"]["secrets"], false);
+        assert_eq!(raw["provenance"]["redaction"]["profanity"], true);
+        assert_eq!(raw["provenance"]["renders_verbatim"], true);
     }
 
     /// A refresh that failed does not blank the page and does not pretend to be fresh: the last
@@ -683,6 +864,7 @@ mod tests {
                 at: at("2026-08-17T12:00:00Z"),
                 stale_since: Some(at("2026-08-17T11:30:00Z")),
             },
+            &Redactor::new(),
         );
         assert_eq!(stale["provenance"]["stale_since"], "2026-08-17T11:30:00Z");
         assert_eq!(stale["lanes"].as_array().unwrap().len(), 5);
@@ -695,7 +877,13 @@ mod tests {
     fn a_window_with_no_comparison_says_so_and_draws_nothing() {
         let mut folded = folded(hygiene_window("claude-code", 20, 5), Vec::new());
         folded.compared = false;
-        let payload = payload(&window("7d"), &refresh(), &folded, refreshed());
+        let payload = payload(
+            &window("7d"),
+            &refresh(),
+            &folded,
+            refreshed(),
+            &Redactor::new(),
+        );
         assert_eq!(payload["window"]["compared"], false);
         assert_eq!(payload["window"]["comparison_opens_at"], Value::Null);
         assert_eq!(

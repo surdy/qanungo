@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -60,20 +61,32 @@ impl ArchivedSession {
 
 /// Serves `sessions` until the test process exits, and returns its base URL.
 fn spawn_archive(sessions: Vec<ArchivedSession>) -> String {
+    spawn_counted_archive(sessions).0
+}
+
+/// The same, plus a counter of **transcript-content** requests.
+///
+/// It is what pins the invariant the excerpt route rests on: a dashboard that answered a browser
+/// by fetching from the archive would be a remote control for somebody else's bandwidth, so the
+/// test asserts the counter does not move rather than asserting the response looked right.
+fn spawn_counted_archive(sessions: Vec<ArchivedSession>) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let base = format!("http://{}", listener.local_addr().unwrap());
     let sessions = Arc::new(sessions);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&fetches);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let sessions = Arc::clone(&sessions);
-            std::thread::spawn(move || serve_archive(stream, &sessions));
+            let fetches = Arc::clone(&counted);
+            std::thread::spawn(move || serve_archive(stream, &sessions, &fetches));
         }
     });
-    base
+    (base, fetches)
 }
 
-fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession]) {
+fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], fetches: &AtomicUsize) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -111,6 +124,7 @@ fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession]) {
         .strip_prefix("/api/v1/artifacts/")
         .and_then(|rest| rest.strip_suffix("/content"))
     {
+        fetches.fetch_add(1, Ordering::Relaxed);
         match sessions.iter().find(|session| session.artifact_id == id) {
             Some(session) => content_response(session),
             None => not_found(),
@@ -285,18 +299,28 @@ fn fixture(relative: &str) -> PathBuf {
 /// The dashboard's arguments, pointed at a stand-in archive and a scratch cache, on a port the
 /// operating system picks.
 fn args(base: &str, cache: &std::path::Path) -> DashboardArgs {
-    let Command::Dashboard(args) = Cli::parse_from([
-        "qanungo",
-        "dashboard",
-        "--last",
-        "30d",
-        "--bind",
-        "127.0.0.1:0",
-        "--patwari-url",
-        base,
-        "--cache-dir",
-        cache.to_str().expect("a utf-8 scratch path"),
-    ])
+    args_with(base, cache, &[])
+}
+
+/// The same, plus whatever flags a test is about — `--no-redact` above all, which is the one flag
+/// on this lane that changes what a reader is handed.
+fn args_with(base: &str, cache: &std::path::Path, extra: &[&str]) -> DashboardArgs {
+    let Command::Dashboard(args) = Cli::parse_from(
+        [
+            "qanungo",
+            "dashboard",
+            "--last",
+            "30d",
+            "--bind",
+            "127.0.0.1:0",
+            "--patwari-url",
+            base,
+            "--cache-dir",
+            cache.to_str().expect("a utf-8 scratch path"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied()),
+    )
     .command
     else {
         panic!("`dashboard` parses as the dashboard command");
@@ -475,11 +499,12 @@ fn the_data_route_serves_json_that_reconciles_with_the_fold() {
 }
 
 /// The redaction line, on the surface that publishes to a browser. The fixtures put a canary in
-/// every free-text transcript field this crate touches, and none of them may reach the wire.
+/// every free-text transcript field this crate touches, and none of them may reach the payload.
 ///
-/// It is stricter than the report's own check on one point: a coaching report may render tool names,
-/// because they are schema metadata. This payload does not carry them either — its evidence is a
-/// count and a hash — so a field that began naming tools would fail here.
+/// The line moved with this slice and the test says exactly where it moved to. **Anchors are not
+/// content**: the payload now names tool names, locators, record numbers, and timestamps, which are
+/// schema metadata and positions. Everything a human typed or a tool printed is still absent — and
+/// reaches a reader only through the excerpt route, scrubbed, one counted event at a time.
 #[test]
 fn the_served_payload_contains_no_verbatim_transcript_content() {
     for relative in ["rules/high-tool-error-rate.jsonl", "rules/retry-loop.jsonl"] {
@@ -494,7 +519,9 @@ fn the_served_payload_contains_no_verbatim_transcript_content() {
         !payload["findings"].as_array().unwrap().is_empty(),
         "the payload under test must have findings",
     );
-    assert_eq!(payload["provenance"]["renders_verbatim"], false);
+    // The surface renders verbatim now — through the route, never here — and says so.
+    assert_eq!(payload["provenance"]["renders_verbatim"], true);
+    assert_eq!(payload["provenance"]["redaction"]["secrets"], true);
 
     assert!(!body.contains("CANARY"), "a canary token reached the wire");
     for forbidden in [
@@ -509,13 +536,11 @@ fn the_served_payload_contains_no_verbatim_transcript_content() {
         "git status",
         "/work/fixture",
         "gitBranch",
-        "tool_use",
-        "Bash",
     ] {
         assert!(!body.contains(forbidden), "`{forbidden}` reached the wire");
     }
 
-    // What it does carry: counts, and hashes to go and read the rest for yourself.
+    // What it does carry: counts, hashes, and the positions of the events a rule counted.
     let hashes: Vec<&str> = payload["findings"]
         .as_array()
         .unwrap()
@@ -528,9 +553,35 @@ fn the_served_payload_contains_no_verbatim_transcript_content() {
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
     }
+    // Tool names are the one verbatim string every surface in this crate may render (decision 9),
+    // and an anchor without one would be an excerpt request nobody could read before making.
+    let anchors = all_anchors(&payload);
+    assert!(!anchors.is_empty(), "the fixture window anchors events");
+    assert!(
+        anchors.iter().any(|anchor| anchor["tool"] == "Bash"),
+        "an anchor names the tool it counted: {anchors:?}",
+    );
+    for anchor in &anchors {
+        assert!(anchor["locator"].as_u64().unwrap() >= 1);
+        assert!(anchor["record"].as_u64().unwrap() >= 1);
+        assert!(anchor["at"].as_str().unwrap().ends_with('Z'));
+    }
+
     // And no route back into the archive, whose blobs are served unredacted.
     assert!(!body.contains("/content"), "{body}");
     assert!(!body.contains("/api/v1/artifacts"), "{body}");
+}
+
+/// Every anchor the payload names, across every finding.
+fn all_anchors(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+    payload["findings"]
+        .as_array()
+        .expect("findings is an array")
+        .iter()
+        .flat_map(|finding| finding["evidence"].as_array().unwrap())
+        .flat_map(|evidence| evidence["anchors"].as_array().unwrap())
+        .cloned()
+        .collect()
 }
 
 /// The event stream announces the payload a page has just been handed, so a reconnecting page and
@@ -592,10 +643,10 @@ fn the_event_stream_announces_the_current_refresh() {
     );
 }
 
-/// Three routes, read-only, and nothing else — including nothing that looks like a path into the
+/// Four routes, read-only, and nothing else — including nothing that looks like a path into the
 /// archive or the filesystem.
 #[test]
-fn nothing_but_the_three_routes_answers() {
+fn nothing_but_the_four_routes_answers() {
     let (address, _directory) = spawn_dashboard(canary_archive());
     for target in [
         "/api",
@@ -614,10 +665,24 @@ fn nothing_but_the_three_routes_answers() {
             "{method} is not a verb this surface has",
         );
     }
-    // A query string changes nothing: there is no per-request knob on this surface at all.
+    // A query string changes nothing: there is no per-request knob on this surface at all. That
+    // matters most on the excerpt route, where the knob a caller might reach for is the redactor.
     let (head, body) = request(address, "/api/data?redact=off");
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
     assert!(!body.contains("CANARY"), "a query string is not a switch");
+
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let (source_hash, locator) = first_anchor(&payload);
+    let (head, body) = request(
+        address,
+        &format!("/api/evidence/{source_hash}/{locator}?redact=off&no-redact=1"),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    let excerpt: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        excerpt["redaction"]["secrets"], true,
+        "the scrub belongs to the process, not to the request",
+    );
 }
 
 /// A malformed request line is answered and the connection closed, rather than being parsed
@@ -658,5 +723,382 @@ fn an_empty_archive_still_serves_a_page_and_a_payload() {
         );
     }
     assert_eq!(payload["provenance"]["sessions_listed"], 0);
-    assert_eq!(payload["provenance"]["renders_verbatim"], false);
+    assert_eq!(payload["provenance"]["renders_verbatim"], true);
+    // Nothing to expand, and the route says so rather than inventing an answer: an empty window
+    // names no anchor, so every locator is unanchored.
+    let (head, body) = request(address, &format!("/api/evidence/{}/1", "a".repeat(64)));
+    assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
+    let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
+    assert_eq!(refusal["reason"], "not-anchored");
+}
+
+// ---------------------------------------------------------------------------
+// The evidence route
+// ---------------------------------------------------------------------------
+
+/// The window the excerpt tests run against: one session whose failing tool results carry planted,
+/// live-*shaped* credentials. Nothing here has ever been a real secret — each is a shape with
+/// `CANARY` spelled through its body, exactly as the standup lane's fixture does it.
+fn planted_secret_archive() -> Vec<ArchivedSession> {
+    vec![ArchivedSession::new(
+        7,
+        "claude-code",
+        &transcript("rules/error-with-planted-secret.jsonl"),
+        2,
+    )]
+}
+
+/// The first anchor of the first finding that has one, with its session's hash.
+fn first_anchor(payload: &serde_json::Value) -> (String, u64) {
+    for finding in payload["findings"].as_array().expect("findings") {
+        for evidence in finding["evidence"].as_array().expect("evidence") {
+            if let Some(anchor) = evidence["anchors"].as_array().expect("anchors").first() {
+                return (
+                    evidence["source_hash"].as_str().unwrap().to_owned(),
+                    anchor["locator"].as_u64().unwrap(),
+                );
+            }
+        }
+    }
+    panic!("the fixture window must anchor at least one event");
+}
+
+fn payload_of(address: SocketAddr) -> serde_json::Value {
+    let (_head, body) = request(address, "/api/data");
+    serde_json::from_str(&body).expect("the payload is JSON")
+}
+
+/// The whole point of the slice: an anchor the page named resolves to the one event the rule
+/// counted — its tool, its outcome, its own text — and to nothing around it.
+#[test]
+fn an_anchor_resolves_to_the_counted_event_and_nothing_around_it() {
+    let (address, _directory) = spawn_dashboard(canary_archive());
+    let payload = payload_of(address);
+
+    let errors = payload["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["rule"] == "high-tool-error-rate")
+        .expect("the error-rate rule fires on this window");
+    assert_eq!(errors["evidence_kind"], "event");
+    let evidence = &errors["evidence"][0];
+    let anchors = evidence["anchors"].as_array().unwrap();
+    // Six failures in the fixture, under the cap, so all six are offered — and in file order.
+    assert_eq!(anchors.len(), 6);
+    let locators: Vec<u64> = anchors
+        .iter()
+        .map(|anchor| anchor["locator"].as_u64().unwrap())
+        .collect();
+    let mut ascending = locators.clone();
+    ascending.sort_unstable();
+    assert_eq!(locators, ascending, "anchors are offered in file order");
+    assert_eq!(
+        evidence["structural"],
+        serde_json::Value::Null,
+        "an event-shaped rule offers events, not a shape",
+    );
+
+    let source_hash = evidence["source_hash"].as_str().unwrap();
+    let (head, body) = request(
+        address,
+        &format!("/api/evidence/{source_hash}/{}", locators[0]),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    assert!(head.contains("Cache-Control: no-store"), "{head}");
+    let excerpt: serde_json::Value = serde_json::from_str(&body).expect("the excerpt is JSON");
+
+    assert_eq!(excerpt["source_hash"], source_hash);
+    assert_eq!(excerpt["locator"], locators[0]);
+    assert_eq!(excerpt["tool"], "Bash");
+    assert_eq!(excerpt["event"], "tool_result");
+    assert_eq!(excerpt["outcome"], false, "the counted event is a failure");
+    assert!(excerpt["at"].as_str().unwrap().ends_with('Z'));
+    // Claude Code puts the command on the invocation and the error on the result, so the excerpt
+    // of a counted *error* carries the error and no command. Pairing the two means reading a
+    // second event, which is surrounding context — deliberately out of this slice.
+    assert_eq!(excerpt["command"], serde_json::Value::Null);
+    assert!(
+        excerpt["output"]
+            .as_str()
+            .expect("the failing result's own text")
+            .contains("CANARY_ERROR_TEXT_0"),
+        "{excerpt}",
+    );
+    // Nothing from any neighbouring event, and nothing from the raw tool payload.
+    for forbidden in [
+        "CANARY_USER_REQUEST_ONE",
+        "CANARY_ASSISTANT_MESSAGE",
+        "CANARY_COMMAND_0",
+        "CANARY_OUTPUT_1",
+        "CANARY_ERROR_TEXT_2",
+        "/work/fixture",
+        "gitBranch",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "`{forbidden}` reached the excerpt"
+        );
+    }
+    assert_eq!(excerpt["redaction"]["secrets"], true);
+    assert_eq!(excerpt["truncated"], false);
+}
+
+/// The done-bar's canary, at HTTP level: a planted credential in a counted event must come back
+/// as a marker, and the rest of the sentence around it must survive untouched.
+#[test]
+fn a_planted_secret_comes_back_redacted_through_the_route() {
+    let (address, _directory) = spawn_dashboard(planted_secret_archive());
+    let payload = payload_of(address);
+    let (source_hash, _) = first_anchor(&payload);
+
+    let mut redacted = 0;
+    let mut seen = 0;
+    for locator in anchored_locators(&payload, &source_hash) {
+        let (head, body) = request(address, &format!("/api/evidence/{source_hash}/{locator}"));
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        seen += 1;
+        let excerpt: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            !body.contains("ghp_CANARY") && !body.contains("sk-ant-api03-CANARY"),
+            "a planted credential reached the wire: {body}",
+        );
+        redacted += excerpt["redaction"]["total"].as_u64().unwrap();
+        if let Some(output) = excerpt["output"].as_str() {
+            if output.contains("[REDACTED:") {
+                // The scrub replaces the credential and leaves the sentence around it alone —
+                // an excerpt pockmarked past legibility would be a redactor nobody keeps on.
+                assert!(output.contains("CANARY_ERROR_TEXT_"), "{output}");
+            }
+        }
+    }
+    assert!(seen >= 2, "the fixture anchors its failures");
+    assert_eq!(
+        redacted, 2,
+        "both planted credentials fired, and nothing else did",
+    );
+}
+
+/// The same window with `--no-redact`: the flag has to actually mean raw, or it is a switch that
+/// lies. This is the negative half of the canary — a redactor that scrubbed anyway would pass the
+/// test above and fail here.
+#[test]
+fn no_redact_serves_the_event_as_the_transcript_holds_it() {
+    let base = spawn_archive(planted_secret_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args_with(&base, &directory.path().join("qanungo"), &["--no-redact"]);
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let payload = payload_of(address);
+    assert_eq!(payload["provenance"]["redaction"]["secrets"], false);
+    let (source_hash, _) = first_anchor(&payload);
+
+    let mut raw_credentials = 0;
+    for locator in anchored_locators(&payload, &source_hash) {
+        let (_head, body) = request(address, &format!("/api/evidence/{source_hash}/{locator}"));
+        let excerpt: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(excerpt["redaction"]["total"], 0, "nothing was scrubbed");
+        if body.contains("ghp_CANARYCANARYCANARYCANARYCANARYCANARY")
+            || body.contains("sk-ant-api03-CANARYSECRETCANARYSECRETCANARYSECRET99")
+        {
+            raw_credentials += 1;
+        }
+        assert!(!body.contains("[REDACTED:"), "{body}");
+    }
+    assert_eq!(
+        raw_credentials, 2,
+        "--no-redact means raw, or it means nothing",
+    );
+}
+
+/// Every locator the payload offers for one session.
+fn anchored_locators(payload: &serde_json::Value, source_hash: &str) -> Vec<u64> {
+    payload["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|finding| finding["evidence"].as_array().unwrap())
+        .filter(|evidence| evidence["source_hash"] == source_hash)
+        .flat_map(|evidence| evidence["anchors"].as_array().unwrap())
+        .map(|anchor| anchor["locator"].as_u64().unwrap())
+        .collect()
+}
+
+/// The route's grammar, and the boundary behind it. A target that is not *exactly* a 64-character
+/// lowercase hash and a bare bounded positive integer is not a repairable request — it is not this
+/// route — and a well-formed one the payload never named is a 404 too, which is the difference
+/// between an evidence route and a transcript-browsing API.
+#[test]
+fn the_evidence_route_refuses_everything_the_payload_did_not_name() {
+    let (address, _directory) = spawn_dashboard(canary_archive());
+    let payload = payload_of(address);
+    let (source_hash, locator) = first_anchor(&payload);
+
+    let malformed = [
+        format!("/api/evidence/{source_hash}"),
+        format!("/api/evidence/{source_hash}/"),
+        format!("/api/evidence/{source_hash}/{locator}/"),
+        format!("/api/evidence/{source_hash}/{locator}/1"),
+        format!("/api/evidence/{}/1", source_hash.to_uppercase()),
+        format!("/api/evidence/{}/1", &source_hash[..63]),
+        format!("/api/evidence/{source_hash}z/1"),
+        format!("/api/evidence/{}/1", "g".repeat(64)),
+        format!("/api/evidence/{source_hash}/0"),
+        format!("/api/evidence/{source_hash}/01"),
+        format!("/api/evidence/{source_hash}/-1"),
+        format!("/api/evidence/{source_hash}/1.0"),
+        format!("/api/evidence/{source_hash}/1e3"),
+        format!("/api/evidence/{source_hash}/99999999999999999999"),
+        format!("/api/evidence/{source_hash}/{}", "9".repeat(64)),
+        "/api/evidence/".to_owned(),
+        "/api/evidence".to_owned(),
+    ];
+    for target in &malformed {
+        let (head, body) = request(address, target);
+        assert!(
+            head.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{target} answered {head}",
+        );
+        assert!(
+            !body.contains("locator"),
+            "a malformed target is not a route, so it never became a lookup: {target}",
+        );
+    }
+
+    // Well-formed, and refused for the reason that matters: nothing on the page named it.
+    for target in [
+        // A hash the payload does not carry at all.
+        format!("/api/evidence/{}/{locator}", "a".repeat(64)),
+        // The right session, a locator no finding offered. The transcript has an event there —
+        // it is simply not one this page cited.
+        format!("/api/evidence/{source_hash}/1"),
+        format!("/api/evidence/{source_hash}/999999999"),
+    ] {
+        let (head, body) = request(address, &target);
+        assert!(
+            head.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{target} answered {head}",
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
+        assert_eq!(refusal["reason"], "not-anchored", "{target}");
+        assert!(
+            refusal["detail"]
+                .as_str()
+                .unwrap()
+                .contains("not a way to read a transcript"),
+        );
+    }
+
+    // A non-GET verb is not a method mismatch worth negotiating here either.
+    for method in ["POST", "PUT", "DELETE", "HEAD"] {
+        let (head, _body) = request_with(
+            address,
+            method,
+            &format!("/api/evidence/{source_hash}/{locator}"),
+        );
+        assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{method}");
+    }
+
+    // And the anchored one still answers, so the refusals above are the route's judgement rather
+    // than a route that never worked.
+    let (head, _body) = request(address, &format!("/api/evidence/{source_hash}/{locator}"));
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+}
+
+/// The invariant the whole route is built around: a cache miss is answered, never filled. A page
+/// on an unauthenticated tailnet must not be able to make this process talk to the archive.
+#[test]
+fn a_cache_miss_is_a_404_with_provenance_and_never_a_fetch() {
+    let (base, fetches) = spawn_counted_archive(canary_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let cache_root = directory.path().join("qanungo");
+    let args = args(&base, &cache_root);
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let payload = payload_of(address);
+    let (source_hash, locator) = first_anchor(&payload);
+    let mirrored = fetches.load(Ordering::Relaxed);
+    assert!(mirrored > 0, "the fold mirrored the window");
+
+    // Take the blob out from under the served payload, which still names its anchors.
+    let blob = cache_root
+        .join("blobs")
+        .join(&source_hash[..2])
+        .join(&source_hash);
+    std::fs::remove_file(&blob).expect("the blob was cached");
+
+    let (head, body) = request(address, &format!("/api/evidence/{source_hash}/{locator}"));
+    assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
+    let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
+    assert_eq!(refusal["reason"], "cache-miss");
+    assert_eq!(refusal["source_hash"], source_hash);
+    assert_eq!(refusal["locator"], locator);
+    assert!(
+        refusal["detail"]
+            .as_str()
+            .unwrap()
+            .contains("never fetches from the archive to answer a request"),
+    );
+    assert_eq!(
+        fetches.load(Ordering::Relaxed),
+        mirrored,
+        "the request must not have reached for the archive",
+    );
+}
+
+/// A session-shaped rule shows what it measured. No excerpt, because it counted no event — and the
+/// structural block it renders instead is timestamps and numbers with no string in it at all.
+#[test]
+fn a_session_shaped_finding_renders_structure_and_offers_no_anchor() {
+    let (address, _directory) = spawn_dashboard(canary_archive());
+    let payload = payload_of(address);
+
+    let marathon = payload["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["rule"] == "marathon-session")
+        .expect("the marathon rule fires on this window");
+    assert_eq!(marathon["evidence_kind"], "structural");
+
+    let evidence = &marathon["evidence"][0];
+    assert!(
+        evidence["anchors"].as_array().unwrap().is_empty(),
+        "a duration has no event in it to anchor",
+    );
+    let structural = &evidence["structural"];
+    assert_eq!(structural["sittings"], 1);
+    assert_eq!(structural["active"]["rendered"], "2h 10m");
+    assert_eq!(structural["longest_sitting"]["rendered"], "2h 10m");
+    assert!(structural["active"]["seconds"].as_u64().unwrap() > 0);
+    assert!(structural["user_requests"].as_u64().unwrap() > 0);
+    assert_eq!(structural["boundaries_elided"], 0);
+
+    let boundaries = structural["boundaries"].as_array().unwrap();
+    assert_eq!(boundaries.len(), 1, "one unbroken sitting");
+    assert!(boundaries[0]["from"].as_str().unwrap().ends_with('Z'));
+    assert!(boundaries[0]["to"].as_str().unwrap().ends_with('Z'));
+
+    // Every leaf of the structural block is a number or a timestamp: there is no string in it a
+    // transcript could have supplied.
+    let serialized = serde_json::to_string(structural).unwrap();
+    assert!(!serialized.contains("CANARY"), "{serialized}");
+    for value in structural.as_object().unwrap().values() {
+        if let Some(text) = value.as_str() {
+            assert!(
+                text.ends_with('Z'),
+                "the only strings here are timestamps: {text}",
+            );
+        }
+    }
+
+    // Asking for an excerpt anyway is refused like any other unanchored locator.
+    let source_hash = evidence["source_hash"].as_str().unwrap();
+    let (head, _body) = request(address, &format!("/api/evidence/{source_hash}/1"));
+    assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
 }

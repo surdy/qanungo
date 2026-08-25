@@ -122,15 +122,33 @@
 //!   is a memcpy. Per the 2026-08-24 grilling, process memory is the "disposable materialization"
 //!   and the persistent event store stays deferred — sync dominates the fold, and a store would fix
 //!   the smaller half.
-//! - **Aggregates only, and no way back to the archive.** Scores, rule ids, counts, and content
-//!   hashes; no transcript text, no prose, no command strings, and **no Patwari links** — the
-//!   archive serves unredacted blobs, so a deep link would be a disclosure wearing a convenience.
-//!   The P0 exemption applies unchanged, which is why no redaction flag is wired: see
-//!   [`dashboard`]. The redacted-excerpt surface is the next slice, and it arrives with a
-//!   launch-time flag, never a per-request one.
+//! - **Aggregates in the payload, and no way back to the archive.** Scores, rule ids, counts,
+//!   content hashes, and evidence anchors; no transcript text in the document itself, and **no
+//!   Patwari links** — the archive serves unredacted blobs, so a deep link would be a disclosure
+//!   wearing a convenience.
 //! - **Unauthenticated, and it says so.** Loopback by default; `--bind` on a tailnet address is how
 //!   a phone or a TV reads it, and startup prints one line naming what that costs
 //!   ([`dashboard_server::posture_line`]).
+//!
+//! ## The evidence-excerpt slice
+//!
+//! The rules used to produce verdicts and counts with no *locations*, so a finding could say six
+//! calls failed and never show one. The fold now records bounded [`evidence`] anchors for every
+//! rule whose counted signal is an event, and `GET /api/evidence/<hash>/<locator>` resolves one
+//! anchor into one scrubbed event. Four properties make it something other than a transcript API:
+//!
+//! - **Additive.** No verdict, score, fire rate, or rendered report changes; the CLI's Markdown is
+//!   byte-for-byte what it was, proved against production and pinned by a control fold in
+//!   `tests/rules.rs`.
+//! - **Honest per component.** A rule that measured a *shape* — Marathon, Heavily-resumed,
+//!   Babysitting — anchors nothing and renders structural evidence instead: active time, sitting
+//!   boundaries, cadence counts. Fire-and-forget does each in a different component and says so.
+//! - **The counted event only.** Tool name, that event's own command and error/output text through
+//!   the #8 redactor, timestamp. No neighbours, no request/response context, no raw tool payload.
+//! - **Bounded, cached, launch-time.** At most ten anchors per finding per session; the blob must
+//!   already be in the local cache, so no browser can induce archive traffic; only anchors the
+//!   current payload names resolve at all; and [`RedactionArgs`](cli::RedactionArgs) is read once
+//!   at startup, never per request. `--no-redact` on a routable bind gets its own very loud line.
 
 pub mod cache;
 pub mod cli;
@@ -139,6 +157,7 @@ pub mod cost;
 pub mod cost_report;
 pub mod dashboard;
 pub mod dashboard_server;
+pub mod evidence;
 pub mod format;
 pub mod http;
 pub mod metrics;

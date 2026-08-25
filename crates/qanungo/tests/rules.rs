@@ -8,12 +8,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use clap::Parser;
+use munshi_transcript::Source;
 use qanungo::cli::{Cli, Command, Window};
+use qanungo::evidence::{EvidenceKind, SessionAnchors};
 use qanungo::metrics::{self, SessionMetrics};
 use qanungo::patwari::sha256_hex;
+use qanungo::redaction::Redactor;
 use qanungo::report::{Instrumentation, Report};
 use qanungo::rules::{self, Finding, RuleId};
-use qanungo::scoring::RulePack;
+use qanungo::scoring::{Lane, RulePack, Scorecard};
 use qanungo::sync::SyncStats;
 
 fn fixture(relative: &str) -> PathBuf {
@@ -34,10 +37,12 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
     SessionMetrics {
         source_hash: sha256_hex(&bytes),
         source_agent: source_agent.to_owned(),
+        artifact_set_version: 2,
         summary: folded.summary,
         tools: folded.tools,
         activity: folded.activity,
         commands: folded.commands,
+        anchors: folded.anchors,
         bytes_folded: bytes.len() as u64,
     }
 }
@@ -364,4 +369,203 @@ fn render(sessions: &[SessionMetrics], findings: &[Finding]) -> String {
         instrumentation: &instrumentation,
     }
     .render()
+}
+
+// ---------------------------------------------------------------------------
+// Evidence anchors (qanungo #5)
+// ---------------------------------------------------------------------------
+
+/// The load-bearing property of the whole slice: **anchors change nothing**.
+///
+/// The same window is evaluated twice — once as the fold produced it, once with every anchor
+/// stripped before any rule sees it — and the two must agree on every finding, every Problem and
+/// Action sentence, every evidence line, every count, and every lane score. This is the fixture-level
+/// half of the guarantee `qanungo report` proves against production by diffing its Markdown.
+#[test]
+fn anchors_are_additive_and_change_no_verdict_no_detail_and_no_score() {
+    let sessions = vec![
+        claude("rules/high-tool-error-rate.jsonl"),
+        claude("rules/error-with-planted-secret.jsonl"),
+        claude("rules/marathon-session.jsonl"),
+        claude("rules/resumed-session.jsonl"),
+        claude("rules/babysitting.jsonl"),
+        claude("rules/fire-and-forget.jsonl"),
+        fold("rules/retry-loop.jsonl", "codex-cli"),
+    ];
+    let anchored = rules::evaluate(&sessions);
+    assert!(
+        anchored
+            .iter()
+            .any(|finding| finding.evidence.iter().any(|line| !line.anchors.is_empty())),
+        "the control is worthless unless the anchored fold actually anchored something",
+    );
+
+    // The same sessions with the anchors taken away — the fold this crate had before the slice.
+    let control: Vec<SessionMetrics> = sessions
+        .iter()
+        .cloned()
+        .map(|mut session| {
+            session.anchors = SessionAnchors::default();
+            session
+        })
+        .collect();
+    let unanchored = rules::evaluate(&control);
+
+    let stripped: Vec<Finding> = anchored
+        .iter()
+        .cloned()
+        .map(|mut finding| {
+            for line in &mut finding.evidence {
+                line.anchors.clear();
+            }
+            finding
+        })
+        .collect();
+    assert_eq!(
+        stripped, unanchored,
+        "a finding differs by more than its anchors",
+    );
+
+    // And the scores the report prints are the same two scorecards.
+    let with = Scorecard::fold(&sessions);
+    let without = Scorecard::fold(&control);
+    for lane in Lane::ALL {
+        assert_eq!(
+            with.fleet(lane).map(|blend| blend.score),
+            without.fleet(lane).map(|blend| blend.score),
+            "{lane:?}",
+        );
+    }
+    assert_eq!(RulePack::current().digest(), RulePack::current().digest());
+    assert_eq!(
+        render(&sessions, &anchored),
+        render(&control, &unanchored),
+        "the rendered report is byte-identical with and without anchors",
+    );
+}
+
+/// The error-rate rule anchors the calls that failed — the events it counted — and each one
+/// resolves back to that event's own text.
+#[test]
+fn the_error_rule_anchors_the_failures_it_counted() {
+    let session = claude("rules/high-tool-error-rate.jsonl");
+    let findings = rules::evaluate(std::slice::from_ref(&session));
+    let finding = finding(&findings, RuleId::HighToolErrorRate);
+    assert_eq!(finding.rule.evidence_kind(), EvidenceKind::Event);
+
+    let anchors = &finding.evidence[0].anchors;
+    assert_eq!(anchors.len(), 6, "six calls failed, six are offered");
+    for anchor in anchors {
+        assert_eq!(anchor.tool.as_deref(), Some("Bash"));
+        assert!(anchor.at.is_some(), "the record was dated");
+        assert!(anchor.locator >= 1);
+    }
+    let locators: Vec<u64> = anchors.iter().map(|anchor| anchor.locator).collect();
+    let mut ascending = locators.clone();
+    ascending.sort_unstable();
+    assert_eq!(locators, ascending, "file order");
+
+    // Every anchor resolves, and resolves to a *failure* carrying that call's own error text.
+    let bytes = std::fs::read(fixture("rules/high-tool-error-rate.jsonl")).unwrap();
+    for anchor in anchors {
+        let excerpt = extract(&bytes, Source::ClaudeCode, anchor.locator)
+            .expect("the anchor resolves")
+            .redacted(&Redactor::new());
+        assert_eq!(excerpt.locator, anchor.locator);
+        assert_eq!(excerpt.record, anchor.record);
+        assert_eq!(excerpt.tool.as_deref(), Some("Bash"));
+        assert_eq!(excerpt.outcome, Some(false));
+        assert_eq!(excerpt.event.as_deref(), Some("tool_result"));
+        assert!(
+            excerpt
+                .output
+                .as_deref()
+                .expect("a failing result carries its text")
+                .contains("CANARY_ERROR_TEXT_"),
+        );
+    }
+}
+
+/// The retry-loop rule anchors the runs of the **busiest** command — not the session's other
+/// repetition, which its evidence line reports as context and the rule does not decide on. Every
+/// anchor resolves to the same command string, which is the whole claim the rule makes.
+#[test]
+fn the_retry_rule_anchors_the_runs_of_the_one_command_it_counted() {
+    let session = fold("rules/retry-loop.jsonl", "codex-cli");
+    let findings = rules::evaluate(std::slice::from_ref(&session));
+    let finding = finding(&findings, RuleId::RetryLoop);
+
+    let anchors = &finding.evidence[0].anchors;
+    assert_eq!(
+        anchors.len() as u64,
+        session.commands.busiest_runs().unwrap(),
+        "one anchor per counted run",
+    );
+
+    let bytes = std::fs::read(fixture("rules/retry-loop.jsonl")).unwrap();
+    let commands: Vec<String> = anchors
+        .iter()
+        .map(|anchor| {
+            let excerpt = extract(&bytes, Source::Codex, anchor.locator)
+                .expect("the anchor resolves")
+                .redacted(&Redactor::new());
+            excerpt.command.expect("a shell event carries its command")
+        })
+        .collect();
+    assert!(
+        commands.windows(2).all(|pair| pair[0] == pair[1]),
+        "the anchors point at runs of one value, which is what the rule counted",
+    );
+    // The transcript's other commands ran too, and are not what fired the rule.
+    let raw = String::from_utf8(bytes).unwrap();
+    assert!(raw.contains("CANARY_ONE_OFF_A"), "the fixture has one-offs");
+    assert!(
+        !commands[0].contains("CANARY_ONE_OFF_A"),
+        "a one-off is not a run of the busiest command",
+    );
+}
+
+/// Fire-and-forget is honestly split: its ratio component is a shape, its `errors > 0` component
+/// counts events, so it offers anchors *and* is marked as mixed.
+#[test]
+fn fire_and_forget_anchors_its_error_component_only() {
+    let session = claude("rules/fire-and-forget.jsonl");
+    let findings = rules::evaluate(std::slice::from_ref(&session));
+    let finding = finding(&findings, RuleId::FireAndForget);
+    assert_eq!(finding.rule.evidence_kind(), EvidenceKind::Mixed);
+    assert_eq!(
+        finding.evidence[0].anchors.len() as u64,
+        session.tools.total.errors,
+        "one anchor per failure, all four under the cap",
+    );
+}
+
+/// A rule that measured a shape anchors nothing at all, in every session it fired on.
+#[test]
+fn session_shaped_rules_anchor_nothing() {
+    for (relative, rule) in [
+        ("rules/marathon-session.jsonl", RuleId::MarathonSession),
+        ("rules/resumed-session.jsonl", RuleId::ResumedSession),
+        ("rules/babysitting.jsonl", RuleId::Babysitting),
+    ] {
+        let session = claude(relative);
+        let findings = rules::evaluate(std::slice::from_ref(&session));
+        let finding = finding(&findings, rule);
+        assert_eq!(finding.rule.evidence_kind(), EvidenceKind::Structural);
+        for line in &finding.evidence {
+            assert!(line.anchors.is_empty(), "{relative} anchored an event");
+        }
+        // And it has the structure to show instead.
+        assert!(session.sittings().is_some(), "{relative}");
+        assert!(
+            !session.activity.sitting_boundaries().is_empty(),
+            "{relative}"
+        );
+    }
+}
+
+/// Reads one anchored event back out of transcript bytes, as the excerpt route does.
+fn extract(bytes: &[u8], source: Source, locator: u64) -> Option<qanungo::evidence::RawExcerpt> {
+    qanungo::evidence::extract(source, 2, std::io::BufReader::new(bytes), locator)
+        .expect("v2 is supported")
 }

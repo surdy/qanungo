@@ -40,6 +40,16 @@ field on a tool event, and repeated-command churn is folded from that field alon
 `RETRY_LOOP_REPEATS` — with the one-offs interleaved so that grouping by value, rather than
 counting events, is what makes the test pass.
 
+`error-with-planted-secret.jsonl` is the evidence-excerpt slice's canary (qanungo #5). It is the
+error-rate shape again — twelve `Bash` calls, the first six failing — with two of those failures
+carrying a planted, live-*shaped* credential in the tool result's own text: a GitHub classic token
+and an Anthropic key. Neither has ever been real; each is a shape with `CANARY` spelled through its
+body, exactly as the standup lane's `qanungo-cost.md` does it. `tests/dashboard.rs` folds it, takes
+the anchors the payload names, fetches every excerpt **over HTTP**, and asserts that both
+credentials come back as `[REDACTED:…]` with the sentence around them intact — and that
+`--no-redact` brings both back verbatim. A redactor that scrubbed regardless of the flag would pass
+the first half and fail the second.
+
 `high-tool-error-rate.jsonl` and `retry-loop.jsonl` additionally carry `CANARY_*` tokens in every
 free-text field (user text, assistant text, tool command input, tool error output, and in the
 retry fixture the repeated command itself). Two redaction tests fold them, render a full report,

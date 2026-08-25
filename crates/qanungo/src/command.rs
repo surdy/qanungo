@@ -411,10 +411,14 @@ fn fold_one(cache: &BlobCache, mirrored: &MirroredSession) -> Result<SessionMetr
     Ok(SessionMetrics {
         source_hash: mirrored.source_hash.clone(),
         source_agent: mirrored.source_agent.clone(),
+        // Carried, not re-derived: the excerpt route reads the anchored event back with the same
+        // interpreter this fold used, and the snapshot is what states which contract that is.
+        artifact_set_version: mirrored.artifact_set_version,
         summary: fold.summary,
         tools: fold.tools,
         activity: fold.activity,
         commands: fold.commands,
+        anchors: fold.anchors,
         // The archive's declared original size, already verified against the transferred bytes,
         // so the footer's "bytes folded" needs no second pass over the file to count.
         bytes_folded: mirrored.size_bytes,

@@ -769,6 +769,7 @@ mod tests {
     use munshi_transcript::SessionSummary;
 
     use super::*;
+    use crate::evidence::SessionAnchors;
     use crate::metrics::{Activity, CommandChurn, ToolOutcomes, ToolTally};
     use crate::rules;
 
@@ -816,6 +817,8 @@ mod tests {
         SessionMetrics {
             source_hash: "ab".repeat(32),
             source_agent: "claude-code".to_owned(),
+            artifact_set_version: 2,
+            anchors: SessionAnchors::default(),
             summary: SessionSummary {
                 user_requests: 4,
                 assistant_messages: 9,
@@ -894,6 +897,8 @@ mod tests {
                 SessionMetrics {
                     source_hash: format!("{index:02x}").repeat(32),
                     source_agent: "claude-code".to_owned(),
+                    artifact_set_version: 2,
+                    anchors: SessionAnchors::default(),
                     summary: SessionSummary {
                         user_requests: 4,
                         tool_activities: 20,

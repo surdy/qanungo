@@ -353,7 +353,12 @@ pub fn default_cache_root() -> io::Result<PathBuf> {
 }
 
 /// Exactly 64 lowercase hex characters.
-fn is_sha256_hex(value: &str) -> bool {
+///
+/// Public because a served route validates a caller's path segment with it
+/// ([`crate::dashboard_server`]): one definition of "is a digest", for the store and for the
+/// surface that names one. A second, looser one on the route would be a way to ask this cache a
+/// question it does not think is a question.
+pub fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
