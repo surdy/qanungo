@@ -1696,7 +1696,9 @@ function drawTimeline(columns, series) {
   const title = document.getElementById("timeline-title");
   const desc = document.getElementById("timeline-desc");
   title.textContent =
-    measure === "sessions" ? "Sessions archived per day" : "Active hours per day";
+    measure === "sessions"
+      ? "Sessions archived per day"
+      : "Active hours per day (summed across sessions — concurrent sessions can exceed 24h)";
   desc.textContent = columns.length
     ? "A stacked column per day over " +
       columns.length +
@@ -1810,7 +1812,8 @@ function drawTimeline(columns, series) {
      greedy walk rather than a set — a forced label and a strided one an index apart
      print on top of each other, and the result is unreadable in exactly the place a
      reader most wants a date. */
-  const placed = [0, last];
+  // A one-day chart has last === 0: seed once, not twice, or the date prints over itself.
+  const placed = [...new Set([0, last])];
   const wanted = opens > 0 ? [opens] : [];
   for (let index = stride; index < last; index += stride) wanted.push(index);
   for (const index of wanted) {
