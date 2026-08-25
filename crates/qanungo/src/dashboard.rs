@@ -153,14 +153,29 @@
 //! under the same generation stamp, and because it would put a fold behind a request an
 //! unauthenticated peer controls.
 //!
+//! # The timeline, and the clock it is honest about
+//!
+//! [`Payload::timeline_section`] adds the same fold laid on a calendar: sessions and active time per
+//! **UTC calendar day of the session's archive completion**, split by harness, for the whole window
+//! and again inside every repository scope. It is grouped by the same selection the scores are, so
+//! a narrowed page's bars sum to that page's own session count.
+//!
+//! Three things about it are worth a reviewer's attention. It is **archive time**, not the
+//! transcript's own clock and not the reader's local one — the clock the window was cut on, which is
+//! the only one the counts can reconcile against, and the page says so in its own words rather than
+//! only here. It carries **numbers and ISO dates and no string at all**, because the harness axis is
+//! the payload's existing one and a day row is positional against it. And it is why the **7×24
+//! heatmap is still not here**: a per-day volume survives a missing offset, and "at 1 a.m." does
+//! not. See [`crate::timeline`].
+//!
 //! # What this slice leaves out
 //!
-//! Per-**device** scope, the timeline, and the 7×24 heatmap. Per-device waits on a hostname to
-//! accrue in the archive — the capture side shipped on 2026-08-25, so the field exists and the
-//! history does not, and a control whose only option is "the machine I deployed from" is a control
-//! that says nothing. The heatmap is blocked on munshi#77's local-offset pull, because UTC
-//! misplaces every late-night claim the view exists to make. Each is a later slice over this same
-//! payload, not a change to it.
+//! Per-**device** scope and the 7×24 heatmap. Per-device waits on a hostname to accrue in the
+//! archive — the capture side shipped on 2026-08-25, so the field exists and the history does not,
+//! and a control whose only option is "the machine I deployed from" is a control that says nothing.
+//! The heatmap now waits only on offset-*bearing* sessions accruing, on the same reasoning: UTC
+//! misplaces every late-night and weekend claim the view exists to make. Each is a later slice over
+//! this same payload, not a change to it.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -181,6 +196,7 @@ use crate::rules::Finding;
 use crate::scopes::{self, RepositoryScope};
 use crate::scoring::{Lane, LaneScore, Scorecard, Trend};
 use crate::standup::{NO_REPOSITORY, RolledUp, StandupSession};
+use crate::timeline::Timeline;
 
 /// What the refresh loop knows and the fold does not: which run this is, when it landed, and
 /// whether the last attempt to take a new one failed.
@@ -308,11 +324,60 @@ impl Payload<'_> {
         let fields = document
             .as_object_mut()
             .expect("the coaching section is an object");
+        let timeline = self.timeline_section();
         fields.insert("cost".to_owned(), self.cost_section());
         fields.insert("standup".to_owned(), self.standup_section());
         fields.insert("scopes".to_owned(), self.scopes_section(&tags));
-        fields.insert("provenance".to_owned(), self.provenance());
+        fields.insert("provenance".to_owned(), self.provenance(&timeline));
+        fields.insert("timeline".to_owned(), timeline);
         document
+    }
+
+    /// The coaching window on a calendar: how many sessions landed on each day, and how much work
+    /// was in them.
+    ///
+    /// # Archive time, said out loud
+    ///
+    /// A day is the **UTC calendar day of the session's archive completion time**, and the page
+    /// prints that sentence rather than leaving it in this comment. It is the clock the window
+    /// itself was cut on, which is the whole reason it is the right one: the bars sum back to the
+    /// session count in the subtitle above them. It is emphatically **not local time** — the
+    /// archive states an instant and does not yet state the offset the machine was on — which is
+    /// why the 7×24 heatmap stays deferred and this view does not. A per-day volume survives UTC;
+    /// "at 1 a.m." does not. See [`crate::timeline`].
+    ///
+    /// # Numbers and dates, nothing else
+    ///
+    /// The section carries **no string at all** — not even a harness label. Its per-day arrays are
+    /// positional against `scopes.harnesses`, the payload's one harness axis, which the lanes are
+    /// already keyed on and the page's control is already built from. Two things follow. It saves
+    /// the obvious bytes: a label per day per harness per scope would be most of this section. And
+    /// it buys the stronger property — a section made only of integers and ISO dates has nowhere
+    /// for an archive-written byte to hide, which `tests/dashboard.rs` walks to prove rather than
+    /// trusts. One harness, one string, in one place: the same rule the scope slice's review
+    /// arrived at, applied before there was a second spelling to reconcile.
+    ///
+    /// # Two windows, two lists
+    ///
+    /// A window opens at an instant, not at midnight, so one calendar day can hold sessions from
+    /// both halves of the pair. They are two lists rather than one list with a flag, so each sums
+    /// to its own window's folded count and the page can draw the boundary where the window
+    /// actually opens. A straddling day appears in both, holding its own half — which is the
+    /// honest shape and, on a chart, a visible one.
+    fn timeline_section(&self) -> Value {
+        let folded = self.coaching;
+        let now = Scorecard::fold(&folded.sessions);
+        let before = folded.compared.then(|| Scorecard::fold(&folded.previous));
+        let columns = report::harness_columns(&now, before.as_ref());
+        // The comparison half is laid out only when there is a comparison window at all — the same
+        // question the lanes ask before they draw an arrow, answered the same way, so the page
+        // cannot draw a `before` the scores refused to compare against.
+        let previous = if folded.compared {
+            Timeline::fold(&folded.previous)
+        } else {
+            Timeline::default()
+        };
+        timeline_value(&Timeline::fold(&folded.sessions), &previous, &columns)
     }
 
     /// The coaching lane: the window pair, the five lanes, and the findings under them.
@@ -582,6 +647,63 @@ impl Payload<'_> {
     }
 }
 
+/// A window pair on a calendar: two day lists, each summing to its own window's folded count.
+///
+/// The two are kept apart rather than merged under a per-day flag because a window opens at an
+/// instant and not at midnight — see [`Payload::timeline_section`]. `days_covered` is served beside
+/// each list rather than left to be counted from it, because it is the provenance figure the footer
+/// quotes and a reader should not have to derive a stated number.
+///
+/// `undated` is a session the archive gave no readable completion time for. It is on no bar and it
+/// is counted, so the page can say why the bars are one short instead of the reader discovering it.
+/// It should always be zero: a session with no archive time could not have been placed into a
+/// window to be folded in the first place. Serving it is the cheap half of that claim.
+fn timeline_value(reported: &Timeline, previous: &Timeline, columns: &[String]) -> Value {
+    json!({
+        "days": days_value(reported, columns),
+        "days_covered": reported.days_covered(),
+        "undated": reported.undated,
+        "comparison_days": days_value(previous, columns),
+        "comparison_days_covered": previous.days_covered(),
+        "comparison_undated": previous.undated,
+    })
+}
+
+/// One window's days, earliest first, each a date and two arrays indexed by the payload's harness
+/// axis.
+///
+/// The arrays are **dense over the columns and sparse over the calendar**: every day carries one
+/// entry per harness — a zero where that harness worked nothing, so the page can stack a column
+/// without checking which keys exist — while a day nothing happened on is simply absent, because a
+/// window's length must not decide what a scope costs to serve.
+fn days_value(timeline: &Timeline, columns: &[String]) -> Value {
+    timeline
+        .days
+        .iter()
+        .map(|day| {
+            let cells: Vec<&crate::timeline::DayCell> = columns
+                .iter()
+                .map(|column| day.harnesses.get(column).unwrap_or(&EMPTY_DAY))
+                .collect();
+            json!({
+                "date": day.date.to_string(),
+                "sessions": cells.iter().map(|cell| cell.sessions).collect::<Vec<_>>(),
+                "active_seconds": cells
+                    .iter()
+                    .map(|cell| cell.active_seconds)
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+/// The zero a harness that worked nothing on a day contributes. A borrow of one constant rather
+/// than a value built per cell: it is the majority of the cells in any real window.
+const EMPTY_DAY: crate::timeline::DayCell = crate::timeline::DayCell {
+    sessions: 0,
+    active_seconds: 0,
+};
+
 /// One repository scope: what it holds, what it scores, and what fired inside it.
 fn scope_value(
     scope: &RepositoryScope<'_>,
@@ -593,6 +715,14 @@ fn scope_value(
 ) -> Value {
     let now = Scorecard::fold_refs(&scope.sessions);
     let before = compared.then(|| Scorecard::fold_refs(&scope.previous));
+    // The scope's own calendar, from the same selection its scores are taken over — so the bars
+    // under a narrowed page sum to the number in that page's own sentence, exactly as the whole
+    // window's do. Same fold, same grouping code, one axis: see `Payload::timeline_section`.
+    let previous_days = if compared {
+        Timeline::fold(scope.previous.iter().copied())
+    } else {
+        Timeline::default()
+    };
     json!({
         "repository": scope.label,
         "attributed": scope.attributed,
@@ -605,6 +735,11 @@ fn scope_value(
             .iter()
             .map(|lane| lane_value(*lane, &now, before.as_ref(), columns, redactor))
             .collect::<Vec<_>>(),
+        "timeline": timeline_value(
+            &Timeline::fold(scope.sessions.iter().copied()),
+            &previous_days,
+            columns,
+        ),
         "findings": scope_findings_value(scope, findings, tags),
     })
 }
@@ -1245,7 +1380,10 @@ impl Payload<'_> {
     /// [`lane_cost_value`], and every one of the three names the window it was taken over, because
     /// three folds over three spans in one document is exactly where an unlabelled number becomes a
     /// wrong one.
-    fn provenance(&self) -> Value {
+    /// `timeline` is the section [`Payload::timeline_section`] already built, handed in rather than
+    /// rebuilt: the footer quotes three of its figures, and a footer that recomputed them could
+    /// come to quote a different day count from the one drawn above it.
+    fn provenance(&self, timeline: &Value) -> Value {
         let instrumentation = &self.coaching.instrumentation;
         let cost = &self.cost.instrumentation;
         let standup = &self.standup.instrumentation;
@@ -1317,6 +1455,19 @@ impl Payload<'_> {
             "generation": self.refreshed.generation,
             "stale_since": self.refreshed.stale_since.map(stamp),
             "gaps": gaps_value(&self.coaching.skipped),
+            // What the timeline is a statement about, stated where every other basis on this page
+            // is stated. `days_covered` is days a session actually landed on, not the length of the
+            // window: a fortnight with four working days in it covered four days, and a footer that
+            // said fourteen would be quoting the calendar rather than the archive. `basis` names the
+            // clock in one word so a reader of the raw payload does not have to infer it from a
+            // module comment they cannot see — and names it as **archive time in UTC**, which is
+            // why the 7×24 heatmap is not on this page.
+            "timeline": {
+                "basis": "archive-completion-utc",
+                "days_covered": timeline["days_covered"],
+                "comparison_days_covered": timeline["comparison_days_covered"],
+                "undated": timeline["undated"],
+            },
             // A machine-checkable statement of this *surface's* contract. It was already true of
             // the excerpt route; the standup section makes it true of the document itself, which is
             // a stronger claim and the one this flag now stands for. The block below says what
@@ -1398,6 +1549,13 @@ mod tests {
                     source_hash: format!("{index:02x}").repeat(32),
                     source_agent: source_agent.to_owned(),
                     repository: None,
+                    // Spread across five UTC days so the timeline section has a calendar to lay
+                    // them on. Archive time, which is a different clock from the `first` above —
+                    // every session here starts its transcript on the same instant, and the
+                    // timeline still draws five bars.
+                    archived_at: Some(
+                        at("2026-08-11T09:00:00Z") + TimeDelta::days(index as i64 % 5),
+                    ),
                     artifact_set_version: 2,
                     summary: SessionSummary {
                         user_requests: 4,
@@ -2583,5 +2741,91 @@ mod tests {
             TimeDelta::days(7),
             "the fixture window is the one the labels above were computed from",
         );
+    }
+
+    /// The timeline section's shape, over a fixture whose sessions are archived across five UTC
+    /// days: a date and two arrays per day, the arrays positional against the payload's own harness
+    /// axis, and the whole thing summing back to the window's session count.
+    #[test]
+    fn the_timeline_lays_the_window_on_days_and_sums_back_to_it() {
+        let payload = built(hygiene_window("claude-code", 20, 5), Vec::new());
+        let timeline = &payload["timeline"];
+        let days = timeline["days"].as_array().expect("a day list");
+        assert_eq!(days.len(), 5);
+        assert_eq!(timeline["days_covered"], 5);
+        assert_eq!(timeline["undated"], 0);
+        assert_eq!(days[0]["date"], "2026-08-11");
+        assert_eq!(days[4]["date"], "2026-08-15");
+
+        // The window is spread four sessions to a day, and the counts add up to the fold.
+        let counted: u64 = days
+            .iter()
+            .map(|day| day["sessions"][0].as_u64().expect("a count"))
+            .sum();
+        assert_eq!(counted, 20);
+        assert_eq!(payload["sessions"]["folded"], 20);
+        // One column per harness in the payload's one axis, in the timeline as in the lanes.
+        let harnesses = payload["scopes"]["harnesses"].as_array().unwrap().len();
+        assert_eq!(days[0]["sessions"].as_array().unwrap().len(), harnesses);
+        assert_eq!(
+            days[0]["active_seconds"].as_array().unwrap().len(),
+            harnesses
+        );
+        // Active time is seconds, not a rendered span: a bar's height is a quantity.
+        assert!(days[0]["active_seconds"][0].as_u64().expect("seconds") > 0);
+
+        // The footer quotes the section rather than counting it a second time.
+        assert_eq!(payload["provenance"]["timeline"]["days_covered"], 5);
+        assert_eq!(
+            payload["provenance"]["timeline"]["basis"],
+            "archive-completion-utc",
+        );
+    }
+
+    /// A window with no comparison window draws no earlier calendar — the same refusal the lanes
+    /// make before they draw an arrow, made in the same place and answered from the same flag, so
+    /// the page cannot show a `before` the scores declined to compare against.
+    #[test]
+    fn a_window_with_nothing_to_compare_against_draws_no_earlier_days() {
+        let mut coaching = folded(
+            hygiene_window("claude-code", 20, 5),
+            hygiene_window("claude-code", 8, 0),
+        );
+        coaching.compared = false;
+        let payload = build(
+            coaching,
+            folded_cost(&[], None),
+            Standup::default(),
+            Redactor::new(),
+        );
+        assert_eq!(payload["window"]["compared"], false);
+        assert_eq!(payload["timeline"]["comparison_days"], json!([]));
+        assert_eq!(payload["timeline"]["comparison_days_covered"], 0);
+        assert_eq!(
+            payload["provenance"]["timeline"]["comparison_days_covered"],
+            0
+        );
+        for scope in payload["scopes"]["repositories"].as_array().unwrap() {
+            assert_eq!(scope["timeline"]["comparison_days"], json!([]));
+        }
+        // The reported half is untouched by the refusal.
+        assert_eq!(payload["timeline"]["days_covered"], 5);
+    }
+
+    /// A day nothing was archived on is a gap in the calendar, not a row of zeroes on the wire: the
+    /// section costs one row per day that *happened*, so a long quiet window costs nothing extra.
+    #[test]
+    fn a_day_with_no_session_on_it_is_absent_rather_than_zero() {
+        let mut sessions = hygiene_window("claude-code", 4, 0);
+        for (index, session) in sessions.iter_mut().enumerate() {
+            // Two sessions a fortnight apart: fourteen days between them, and two rows.
+            session.archived_at =
+                Some(at("2026-08-01T09:00:00Z") + TimeDelta::days(if index < 2 { 0 } else { 14 }));
+        }
+        let payload = built(sessions, Vec::new());
+        let days = payload["timeline"]["days"].as_array().unwrap();
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0]["date"], "2026-08-01");
+        assert_eq!(days[1]["date"], "2026-08-15");
     }
 }

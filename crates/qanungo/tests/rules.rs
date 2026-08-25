@@ -38,6 +38,7 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
         source_hash: sha256_hex(&bytes),
         source_agent: source_agent.to_owned(),
         repository: None,
+        archived_at: None,
         artifact_set_version: 2,
         summary: folded.summary,
         tools: folded.tools,

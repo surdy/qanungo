@@ -32,7 +32,7 @@ ADR 0012 anticipated qanungo carrying "application commands such as a prompt-cor
 
 ## The dashboard
 
-A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring munshi-dashboard's read-only, contract-consuming posture. Score cards + anti-pattern findings first, then timeline/heatmaps/output/context-health/chronicle. Verbatim evidence is **redacted on the way to the browser** (toggleable, default on) and served by qanungo itself.
+A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring munshi-dashboard's read-only, contract-consuming posture. Score cards + anti-pattern findings first, then the timeline, and then heatmaps/output/context-health/chronicle. Verbatim evidence is **redacted on the way to the browser** (toggleable, default on) and served by qanungo itself.
 
 > The original plan had every finding, chart point, and session row deep-link into `session-recall` → the verified transcript in Patwari. The 2026-08-24 grilling on [#5](https://github.com/surdy/qanungo/issues/5) **retracted that**: Patwari serves raw blobs and never redacts, so such a link does not hand a browser a redacted transcript — it hands any tailnet device the whole unredacted one. Raw Patwari URLs therefore never appear in dashboard HTML; anything verbatim is cut from the local cache, redacted, and served by qanungo. The recall funnel stays a CLI/harness affordance, where your own shell already has raw access.
 
@@ -188,9 +188,23 @@ sessions: its fleet blend is the unweighted mean over the harnesses present *in 
 scope too small to read scores nothing rather than a phantom number, and the all/all view is the
 whole-window payload unchanged.
 
+And it carries a **timeline**: one inline-SVG chart of sessions per day, stacked by harness, with a
+toggle to the same days measured in active hours instead — one chart with one axis, because two
+y-scales on one plot invent a correlation the data does not have. A day is the **UTC calendar day
+the archive finished the session's snapshot** — archive time, which is the clock the window itself
+is cut on and therefore the only one on which the bars add up to the session count above them. It is
+not the transcript's own clock and it is not local time. The chart narrows with the scope control,
+carries a legend and the table of its own numbers, and the whole section on the wire is integers and
+ISO dates with no string in it at all.
+
+That is also why there is still **no hour-of-day or day-of-week heatmap**: a per-day volume survives
+a missing local offset — a day is a day wherever you stand — while "worked at 1 a.m." and "worked on
+a Sunday" are exactly the claims UTC misplaces, and they are the only claims that view exists to
+make.
+
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
 dashboard's own remaining slices — per-*device* scope once a hostname has accrued in the archive,
-the timeline, and the heatmap once munshi#77 types the capture machine's local offset. Full
+and the heatmap once munshi#77's local offsets have accrued on real sessions. Full
 research + rationale:
 `~/repos/research/ai-coach/`. See
 issues for the phased plan.

@@ -28,6 +28,25 @@
   --down: #d03b3b;
   --warn-surface: #fdf3d8;
   --warn-ink: #5c4405;
+  /*
+   * The chart's categorical slots, in fixed order. Colour follows the harness, never
+   * its rank: a slot is the harness's index in the payload's one harness axis
+   * (`scopes.harnesses`), which is the same list in every scope, so narrowing the
+   * page never repaints the series that survive.
+   *
+   * Three slots and no more. The roster is an allowlist of three harnesses, and
+   * three is also where this palette validates on every pair at once — a fourth
+   * would put yellow beside orange, which fails colour-blind separation for readers
+   * who see the whole chart at a glance. Anything past the third folds into the
+   * muted ink rather than becoming a generated hue.
+   *
+   * Light aqua sits below 3:1 against this surface, so the chart ships the table
+   * view below it: identity never rests on colour alone here. Both columns were
+   * checked as sets against these two surfaces, not flipped from one another.
+   */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -43,6 +62,9 @@
     --down: #d03b3b;
     --warn-surface: #2e2611;
     --warn-ink: #fab219;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
   }
 }
 * { box-sizing: border-box; }
@@ -288,6 +310,58 @@ summary {
 .sitting-track { flex: 1 1 6rem; min-width: 4rem; height: 0.55rem; background: var(--rule); border-radius: 3px; }
 .sitting-bar { height: 100%; background: var(--ink-2); border-radius: 3px; min-width: 2px; }
 
+/* The timeline. One chart, one axis, and a control that changes what is measured
+   rather than adding a second scale to the same plot — two y-scales on one plot
+   invent a correlation the data does not have. The chart is inline SVG built in
+   this file: a dozen-odd columns is not a charting library. */
+.chart-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  margin: 0 0 0.6rem;
+}
+.chart-controls label { font-size: 0.85rem; font-weight: 600; color: var(--ink-2); }
+.chart-controls select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--ink);
+  background: var(--plane);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.5rem;
+}
+/* Two or more series always carry a legend: identity must never rest on colour
+   alone. One series carries none — the heading above already names it. */
+.legend { display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; font-size: 0.8rem; color: var(--ink-2); }
+.legend-item { display: flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
+.legend-swatch { width: 0.7rem; height: 0.7rem; border-radius: 2px; flex: none; }
+.legend-swatch.s0 { background: var(--series-1); }
+.legend-swatch.s1 { background: var(--series-2); }
+.legend-swatch.s2 { background: var(--series-3); }
+.legend-swatch.sx { background: var(--ink-muted); }
+/* The chart scrolls sideways inside its own box rather than shrinking: squeezing a
+   sixty-day window into a phone's width would take the axis text with it. */
+.chart-frame {
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: clamp(0.6rem, 1vw, 1rem);
+}
+.chart { display: block; }
+.chart .grid { stroke: var(--rule); stroke-width: 1; }
+.chart .axis-text { fill: var(--ink-muted); font-size: 10px; font-family: inherit; }
+.chart .boundary { stroke: var(--ink-muted); stroke-width: 1; }
+.chart .hit { fill: transparent; }
+.chart .s0 { fill: var(--series-1); }
+.chart .s1 { fill: var(--series-2); }
+.chart .s2 { fill: var(--series-3); }
+/* Past the third slot a series is drawn in the de-emphasis ink rather than in a
+   hue this palette never validated. The roster is an allowlist of three, so this
+   is a guard and not a plan. */
+.chart .sx { fill: var(--ink-muted); }
+
 /* The cost section. A headline, then tables — which are the honest shape for a
    priced breakdown and the one the CLI already uses, so a reader comparing the two
    is comparing rows to rows. Each table scrolls inside its own box rather than
@@ -389,6 +463,34 @@ footer .archive { overflow-wrap: anywhere; }
   <section aria-labelledby="lanes-heading">
     <h2 id="lanes-heading">Five lanes</h2>
     <div class="tiles" id="tiles"></div>
+  </section>
+
+  <!--
+    The timeline. The <svg> element is written here rather than created in script for
+    one reason worth stating: an element the HTML parser built is already in the SVG
+    namespace, so the script reads that namespace off it (`chart.namespaceURI`) and
+    this file never has to write a namespace URL down. The page's "loads nothing from
+    anywhere" invariant is checked by looking for URLs in it, and a URL that is really
+    a namespace would have made that check a judgement call.
+  -->
+  <section aria-labelledby="timeline-heading">
+    <h2 id="timeline-heading">Timeline</h2>
+    <div class="chart-controls">
+      <label for="timeline-measure">Measure</label>
+      <select id="timeline-measure">
+        <option value="sessions">Sessions per day</option>
+        <option value="active">Active hours per day</option>
+      </select>
+      <div class="legend" id="timeline-legend"></div>
+    </div>
+    <div class="chart-frame">
+      <svg id="timeline-chart" class="chart" role="img" aria-labelledby="timeline-title timeline-desc">
+        <title id="timeline-title"></title>
+        <desc id="timeline-desc"></desc>
+      </svg>
+    </div>
+    <p class="note" id="timeline-note"></p>
+    <div id="timeline-table"></div>
   </section>
 
   <section aria-labelledby="findings-heading">
@@ -1369,6 +1471,395 @@ function standupScrubNote(standup, redaction) {
   );
 }
 
+/* ------------------------------------------------------------------------ *
+ * The timeline: the coaching window on a calendar.
+ *
+ * One chart, one axis. The two measures — sessions a day and active hours a day —
+ * are a *toggle* and never two scales on one plot: aligning two y-axes is an
+ * arbitrary choice that invents a correlation the data does not contain.
+ *
+ * Every number drawn here was computed in Rust and arrives as an integer. This file
+ * scales it into pixels and labels an axis; it counts nothing, sums nothing across
+ * days that the payload did not already sum, and re-renders no duration that
+ * `format.rs` renders. The chart's own unit is decimal hours, because a bar's height
+ * is a quantity and `2h 10m` is prose.
+ *
+ * A day is the UTC calendar day of the session's *archive completion* time — see the
+ * note under the chart, which says so on the page rather than only here.
+ * ------------------------------------------------------------------------ */
+
+const TIMELINE = {
+  padLeft: 46,
+  padRight: 10,
+  padTop: 14,
+  padBottom: 34,
+  plotHeight: 150,
+  /* The slot a day gets, and the bar inside it. The leftover is air: a bar that
+     filled its slot would touch its neighbours, and the gap is what separates
+     touching marks here — never a stroke, which would add ink that is not data. */
+  slot: 18,
+  bar: 14,
+  /* The surface gap between stacked segments, and the rounded data-end on the top of
+     a column. The baseline end stays square. */
+  gap: 2,
+  radius: 4,
+};
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/* An ISO day read as characters, and deliberately never handed to `Date`.
+   `new Date("2026-08-11")` is UTC midnight and every way of printing it back is in
+   the reader's own zone, so a browser in Auckland would relabel each bar as the day
+   after. Re-expressing a UTC day as a local one is the exact confusion this view is
+   at pains to avoid, and it is why the 7×24 heatmap is not on this page at all. */
+function dayLabel(iso) {
+  return MONTHS[Number(iso.slice(5, 7)) - 1] + " " + iso.slice(8, 10);
+}
+
+/* The chart's own unit for active time. Decimal hours, because the axis is scaled in
+   them; `format.rs` stays the one place a duration is rendered as prose. */
+function activeHours(seconds) {
+  return (seconds / 3600).toFixed(1);
+}
+
+/* Which measure the chart is drawing. Module state rather than storage: it is a
+   glance, not a preference, and it survives an SSE refresh because `paint` reads it
+   rather than resetting it. */
+let measure = "sessions";
+
+/* The series to draw: one per harness in the payload's own axis, or exactly the one a
+   harness scope picked.
+ *
+ * The colour slot is the harness's index in that axis and nothing else — never its
+ * position among the survivors of a filter. A reader who learned which colour
+ * claude-code is keeps it in every scope. */
+function timelineSeries(data, column) {
+  return data.scopes.harnesses
+    .map((label, index) => ({ label, index, klass: index < 3 ? "s" + index : "sx" }))
+    .filter((series) => column < 0 || series.index === column);
+}
+
+/* Both halves of the window pair as one left-to-right run of columns: the comparison
+   window's days first, then the reported window's.
+ *
+ * They stay separate columns rather than being merged by date because a window opens
+ * at an instant and not at midnight, so one calendar day can hold sessions from both
+ * halves. Merging them would put the boundary at the nearest midnight, which is not
+ * where it is. */
+function timelineColumns(timeline, series) {
+  const half = (days, reported) =>
+    days.map((day) => {
+      const parts = series.map((entry) => ({
+        series: entry,
+        sessions: day.sessions[entry.index] || 0,
+        seconds: day.active_seconds[entry.index] || 0,
+      }));
+      return {
+        date: day.date,
+        reported,
+        parts,
+        sessions: parts.reduce((total, part) => total + part.sessions, 0),
+        seconds: parts.reduce((total, part) => total + part.seconds, 0),
+      };
+    });
+  return half(timeline.comparison_days, false).concat(half(timeline.days, true));
+}
+
+function partValue(part) {
+  return measure === "sessions" ? part.sessions : part.seconds / 3600;
+}
+
+function columnValue(column) {
+  return measure === "sessions" ? column.sessions : column.seconds / 3600;
+}
+
+/* A round number at or above the tallest column: 1, 2, 5 and their powers of ten.
+   Axis ticks carry the values no bar is directly labelled with, so they have to be
+   numbers a reader can hold. */
+function niceMax(value) {
+  if (!(value > 0)) return 1;
+  const power = Math.pow(10, Math.floor(Math.log10(value)));
+  for (const step of [1, 2, 5]) {
+    if (value <= step * power) return step * power;
+  }
+  return 10 * power;
+}
+
+/* Zero, the top, and the midpoint when the midpoint is a number worth printing. A
+   session count of 2.5 is not one, so a session axis whose top is odd gets two ticks
+   rather than a fractional one. */
+function timelineTicks(max) {
+  const middle = max / 2;
+  if (measure === "sessions" && !Number.isInteger(middle)) return [0, max];
+  return [0, middle, max];
+}
+
+function tickLabel(value) {
+  return measure === "sessions" ? String(value) : value.toFixed(1) + "h";
+}
+
+/* A column with a square baseline and a rounded data-end. The radius is clamped
+   against the bar's own width and height, so a one-pixel bar is a one-pixel bar
+   rather than a smear. */
+function barPath(x, y, width, height, radius) {
+  const r = Math.max(0, Math.min(radius, width / 2, height));
+  return (
+    "M" + x + " " + (y + height) +
+    " V" + (y + r) +
+    " A" + r + " " + r + " 0 0 1 " + (x + r) + " " + y +
+    " H" + (x + width - r) +
+    " A" + r + " " + r + " 0 0 1 " + (x + width) + " " + (y + r) +
+    " V" + (y + height) +
+    " Z"
+  );
+}
+
+/* What one column says when a reader points at it: the day, which half of the pair it
+   is in, both measures, and the harnesses inside it. Set as text on an SVG <title>,
+   which is the accessible name of the group as well as its tooltip — one mechanism
+   doing both jobs, and no markup parsed anywhere. */
+function columnTitle(column) {
+  const parts = [
+    column.date,
+    column.reported ? "reported window" : "comparison window",
+    column.sessions + (column.sessions === 1 ? " session" : " sessions"),
+    activeHours(column.seconds) + "h active",
+  ];
+  for (const part of column.parts) {
+    if (!part.sessions) continue;
+    parts.push(part.series.label + " " + part.sessions + " · " + activeHours(part.seconds) + "h");
+  }
+  return parts.join(" · ");
+}
+
+/* The chart itself. Built into the <svg> the document already carries, so the SVG
+   namespace is read off a real element rather than written down as a URL in this
+   file — see the comment on the element. */
+function drawTimeline(columns, series) {
+  const chart = document.getElementById("timeline-chart");
+  const ns = chart.namespaceURI;
+  const shape = (tag, className) => {
+    const node = document.createElementNS(ns, tag);
+    if (className) node.setAttribute("class", className);
+    return node;
+  };
+  const set = (node, attributes) => {
+    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+    return node;
+  };
+
+  const width = Math.max(320, TIMELINE.padLeft + columns.length * TIMELINE.slot + TIMELINE.padRight);
+  const height = TIMELINE.padTop + TIMELINE.plotHeight + TIMELINE.padBottom;
+  const base = TIMELINE.padTop + TIMELINE.plotHeight;
+  set(chart, { width, height, viewBox: "0 0 " + width + " " + height });
+
+  const title = document.getElementById("timeline-title");
+  const desc = document.getElementById("timeline-desc");
+  title.textContent =
+    measure === "sessions" ? "Sessions archived per day" : "Active hours per day";
+  desc.textContent = columns.length
+    ? "A stacked column per day over " +
+      columns.length +
+      " days, split by harness, on the UTC day each session's archive snapshot completed. The" +
+      " same numbers are in the table below."
+    : "No day in this window has a session on it.";
+
+  const nodes = [];
+  if (!columns.length) {
+    chart.replaceChildren(title, desc);
+    return;
+  }
+
+  const max = niceMax(Math.max(...columns.map(columnValue)));
+  /* Gridlines before direct labels, and hairline solid rather than dashed: the grid
+     carries the values no bar is labelled with and must stay recessive while it does
+     it. */
+  for (const tick of timelineTicks(max)) {
+    const y = base - (tick / max) * TIMELINE.plotHeight;
+    nodes.push(
+      set(shape("line", "grid"), {
+        x1: TIMELINE.padLeft,
+        y1: y,
+        x2: width - TIMELINE.padRight,
+        y2: y,
+      })
+    );
+    const label = shape("text", "axis-text");
+    set(label, { x: TIMELINE.padLeft - 6, y: y + 3, "text-anchor": "end" });
+    label.textContent = tickLabel(tick);
+    nodes.push(label);
+  }
+
+  columns.forEach((column, index) => {
+    const slotX = TIMELINE.padLeft + index * TIMELINE.slot;
+    const group = shape("g");
+    const label = shape("title");
+    label.textContent = columnTitle(column);
+    group.appendChild(label);
+    /* The hit target is the whole slot, full height — bigger than the mark, so a
+       one-session day is as easy to point at as a busy one. */
+    group.appendChild(
+      set(shape("rect", "hit"), {
+        x: slotX,
+        y: TIMELINE.padTop,
+        width: TIMELINE.slot,
+        height: TIMELINE.plotHeight,
+      })
+    );
+
+    const drawn = column.parts.filter((part) => partValue(part) > 0);
+    let cursor = base;
+    drawn.forEach((part, at) => {
+      const span = (partValue(part) / max) * TIMELINE.plotHeight;
+      /* The 2px surface gap goes on the top of every segment but the topmost, which
+         is where the rounded data-end goes instead. */
+      const top = at === drawn.length - 1;
+      const trim = top ? 0 : TIMELINE.gap;
+      const y = cursor - span + trim;
+      const tall = Math.max(span - trim, 1);
+      const x = slotX + (TIMELINE.slot - TIMELINE.bar) / 2;
+      if (top) {
+        group.appendChild(
+          set(shape("path", part.series.klass), {
+            d: barPath(x, y, TIMELINE.bar, tall, TIMELINE.radius),
+          })
+        );
+      } else {
+        group.appendChild(
+          set(shape("rect", part.series.klass), { x, y, width: TIMELINE.bar, height: tall })
+        );
+      }
+      cursor -= span;
+    });
+    nodes.push(group);
+  });
+
+  /* Where the reported window opens. It is drawn at the edge between the two halves
+     rather than at a midnight, because that is where it is: a window opens at an
+     instant, which is why a day can appear on both sides of this line. */
+  const opens = columns.findIndex((column) => column.reported);
+  if (opens > 0) {
+    const x = TIMELINE.padLeft + opens * TIMELINE.slot - TIMELINE.gap / 2;
+    nodes.push(set(shape("line", "boundary"), { x1: x, y1: TIMELINE.padTop, x2: x, y2: base }));
+    const marker = shape("text", "axis-text");
+    set(marker, { x: x + 4, y: TIMELINE.padTop + 8 });
+    marker.textContent = "window opens";
+    nodes.push(marker);
+  }
+
+  nodes.push(
+    set(shape("line", "grid"), {
+      x1: TIMELINE.padLeft,
+      y1: base,
+      x2: width - TIMELINE.padRight,
+      y2: base,
+    })
+  );
+
+  /* Date labels are selective: every column labelled is a wall of text at sixty days,
+     and the axis is not where the numbers are. First, the boundary, and last — plus
+     every column when there are few enough that they fit. */
+  const labelled = new Set([0, columns.length - 1]);
+  if (opens > 0) labelled.add(opens);
+  if (columns.length <= 8) columns.forEach((_, index) => labelled.add(index));
+  for (const index of labelled) {
+    const text = shape("text", "axis-text");
+    const anchor = index === 0 ? "start" : index === columns.length - 1 ? "end" : "middle";
+    const at =
+      TIMELINE.padLeft +
+      index * TIMELINE.slot +
+      (anchor === "start" ? 0 : anchor === "end" ? TIMELINE.slot : TIMELINE.slot / 2);
+    set(text, { x: at, y: base + 16, "text-anchor": anchor });
+    text.textContent = dayLabel(columns[index].date);
+    nodes.push(text);
+  }
+
+  chart.replaceChildren(title, desc, ...nodes);
+}
+
+/* The legend. Present whenever there is more than one series, because identity must
+   never rest on colour alone; absent for a single one, where the heading above
+   already names what is drawn. */
+function drawTimelineLegend(series) {
+  const legend = document.getElementById("timeline-legend");
+  if (series.length < 2) {
+    legend.replaceChildren();
+    return;
+  }
+  legend.replaceChildren(
+    ...series.map((entry) => {
+      const item = el("div", "legend-item");
+      /* The swatch wears the series colour and the label beside it wears text ink —
+         a light categorical hue is illegible as text, and identity belongs to the
+         mark next to the words rather than to the words. Both colours come from the
+         stylesheet's own classes, so the legend and the bars cannot drift. */
+      item.appendChild(el("span", "legend-swatch " + entry.klass));
+      item.appendChild(el("span", null, entry.label));
+      return item;
+    })
+  );
+}
+
+/* The same numbers as a table, behind a disclosure. It is not an afterthought: it is
+   what makes the chart legible to a reader whose colour vision, screen, or print-out
+   cannot separate two series, and it is what the light-mode palette's one low-contrast
+   slot is allowed on condition of. */
+function timelineTable(columns, series) {
+  const heading = [
+    { label: "Day" },
+    { label: "Window" },
+    ...series.map((entry) => ({ label: entry.label, figure: true })),
+    { label: "Total", figure: true },
+  ];
+  const cell = (value) => (measure === "sessions" ? String(value) : activeHours(value * 3600) + "h");
+  const rows = columns.map((column) => [
+    column.date,
+    column.reported ? "reported" : "comparison",
+    ...column.parts.map((part) => cell(partValue(part))),
+    cell(columnValue(column)),
+  ]);
+  const details = el("details");
+  details.appendChild(el("summary", null, "The numbers behind the chart"));
+  details.appendChild(table(null, heading, rows));
+  return details;
+}
+
+function timelineNote(data, timeline, columns) {
+  const covered =
+    timeline.days_covered +
+    (timeline.days_covered === 1 ? " day" : " days") +
+    " of the last " +
+    data.window.last +
+    " had a session archived on them" +
+    (timeline.comparison_days_covered
+      ? ", and " + timeline.comparison_days_covered + " in the window before it"
+      : "") +
+    ". ";
+  const basis =
+    "A day is the UTC calendar day the archive finished the session's snapshot — archive time, not" +
+    " the transcript's own clock and not the reader's local one. It is the clock the window itself" +
+    " was cut on, which is why the bars add up to the session count above. Local time is not in" +
+    " the archive yet, so there is no hour-of-day or day-of-week view here: those are the claims a" +
+    " missing offset misplaces.";
+  const undated = timeline.undated
+    ? " " + timeline.undated + " session in this window carries no readable archive time and is on no bar."
+    : "";
+  const empty = columns.length ? "" : " Nothing to draw in this scope.";
+  return covered + basis + undated + empty;
+}
+
+function paintTimeline(data, entry, column) {
+  const timeline = entry ? entry.timeline : data.timeline;
+  const series = timelineSeries(data, column);
+  const columns = timelineColumns(timeline, series);
+  drawTimelineLegend(series);
+  drawTimeline(columns, series);
+  document.getElementById("timeline-note").textContent = timelineNote(data, timeline, columns);
+  document
+    .getElementById("timeline-table")
+    .replaceChildren(...(columns.length ? [timelineTable(columns, series)] : []));
+}
+
 /* The pre-folded scope the reader chose, or null for the whole window. Looked up by
    label rather than by position, so a refresh that reorders the list (it is ordered
    busiest-first) cannot silently move a selection onto a different repository. */
@@ -1520,6 +2011,8 @@ function paint() {
     .getElementById("tiles")
     .replaceChildren(...lanes.map((lane) => laneTile(lane, column)));
 
+  paintTimeline(data, entry, column);
+
   const findings = document.getElementById("findings");
   const cards = data.findings
     .map((finding) => ({ finding, cited: finding.evidence.filter(citedInScope) }))
@@ -1669,6 +2162,13 @@ function wireScopeControls() {
     document.getElementById("scope-repository").value = "";
     document.getElementById("scope-harness").value = "";
     scopeChanged();
+  });
+  /* Changing the measure redraws from the payload in hand, exactly as changing the
+     scope does. Both series were folded before this document was published; the
+     toggle picks which of the two integers already on the page becomes a height. */
+  document.getElementById("timeline-measure").addEventListener("change", (event) => {
+    measure = event.target.value === "active" ? "active" : "sessions";
+    paint();
   });
 }
 

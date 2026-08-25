@@ -875,6 +875,22 @@ pub struct SessionMetrics {
     /// different fact from the repository a session's own `summary.md` names — see
     /// [`crate::standup`], which groups by the latter.
     pub repository: Option<String>,
+    /// When the *archive* finished the snapshot this session was listed by — **archive time, not
+    /// transcript time**, the same [`MirroredSession::archived_at`](crate::sync::MirroredSession)
+    /// the window was cut on.
+    ///
+    /// **Nothing scores it and no rule reads it**, exactly as with
+    /// [`SessionMetrics::repository`]. It is here so a *presentation* can place the per-session
+    /// facts a fold already produced on a calendar — the dashboard's timeline (qanungo #5) —
+    /// without re-listing the archive to find out when each session landed. The cost lane already
+    /// carries the same field for the same reason ([`SessionCost::archived_at`](crate::cost::SessionCost)).
+    ///
+    /// This is deliberately a *different* fact from [`SessionMetrics::day`], which is the day the
+    /// transcript's own first record is dated. A session worked overnight and archived the next
+    /// morning has two honest days, and a surface that showed one under the other's name would be
+    /// answering a question nobody asked. `None` — an archive time this build could not parse —
+    /// places the session on no day at all and is counted rather than guessed onto one.
+    pub archived_at: Option<DateTime<Utc>>,
     /// The artifact-set contract the snapshot declared, carried so an anchored event can be read
     /// back out of the cached blob with the same interpreter the fold used. Nothing scores it.
     pub artifact_set_version: u16,
@@ -911,6 +927,23 @@ impl SessionMetrics {
     /// The UTC calendar day the session started on, for the cadence fold.
     pub fn day(&self) -> Option<NaiveDate> {
         self.summary.first_timestamp.map(|first| first.date_naive())
+    }
+
+    /// The UTC calendar day the *archive* finished this session's snapshot on — the clock the
+    /// window itself is cut on, and therefore the only one on which a per-day count can be made to
+    /// add up to the window's session count.
+    ///
+    /// Not [`SessionMetrics::day`], and the difference is the point: that one is transcript time
+    /// (when the work started), this one is archive time (when the capture landed). Both are
+    /// honest and they disagree for any session archived after midnight. See
+    /// [`SessionMetrics::archived_at`] and [`crate::timeline`].
+    ///
+    /// **UTC, and no local-time claim is available.** The archive states an instant; it does not
+    /// yet state the offset the machine was on. That is munshi#77's local-offset pull, which the
+    /// 7×24 heatmap waits on — a per-day *volume* survives UTC (a day is a day), while a
+    /// late-night or weekend claim does not.
+    pub fn archive_day(&self) -> Option<NaiveDate> {
+        self.archived_at.map(|at| at.date_naive())
     }
 
     /// Time spent inside sittings — the duration a coaching report reasons about.
@@ -1333,6 +1366,7 @@ mod tests {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
             repository: None,
+            archived_at: None,
             artifact_set_version: 2,
             summary: fold.summary,
             tools: fold.tools,
@@ -1785,6 +1819,7 @@ mod tests {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
             repository: None,
+            archived_at: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(at(date)),
@@ -1882,6 +1917,7 @@ mod tests {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
             repository: None,
+            archived_at: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(start),

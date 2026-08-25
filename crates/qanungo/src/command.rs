@@ -492,6 +492,11 @@ fn fold_one(cache: &BlobCache, mirrored: &MirroredSession) -> Result<SessionMetr
         // presentation can cut the window by repository without a second fold. Nothing below reads
         // it: no rule, no score, no pack entry, no Markdown cell.
         repository: mirrored.repository.clone(),
+        // The same listing row's archive time, taken from the same place and for the same reason
+        // the cost lane already takes it: this is the clock `Placement` cut the window on, so it is
+        // the only clock a per-day count can be made to reconcile against the window's own session
+        // count. Nothing below reads it either.
+        archived_at: mirrored.archived_at,
         // Carried, not re-derived: the excerpt route reads the anchored event back with the same
         // interpreter this fold used, and the snapshot is what states which contract that is.
         artifact_set_version: mirrored.artifact_set_version,

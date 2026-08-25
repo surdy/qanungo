@@ -982,6 +982,7 @@ mod tests {
             source_hash: format!("{hash:02x}").repeat(32),
             source_agent: "claude-code".to_owned(),
             repository: None,
+            archived_at: None,
             artifact_set_version: 2,
             anchors: SessionAnchors::default(),
             summary: SessionSummary {

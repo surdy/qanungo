@@ -80,6 +80,24 @@ impl ArchivedSession {
         self
     }
 
+    /// Moves this session's archive completion to an exact wall-clock time on a UTC day some
+    /// number of days back — the only builder that can put two sessions either side of a midnight.
+    ///
+    /// [`ArchivedSession::new`] dates a session in hours-ago, so a window measured in days keeps
+    /// selecting it however long this test file lives; that is right for every lane which only asks
+    /// *whether* a session is in the window. The timeline asks *which day* it is on, and a day
+    /// boundary is a thing you can only get wrong at midnight — so this pins the time of day while
+    /// keeping the date relative, which is both properties at once.
+    fn completed_on(mut self, days_ago: i64, hour: u32, minute: u32, second: u32) -> Self {
+        let at = (Utc::now() - TimeDelta::days(days_ago))
+            .date_naive()
+            .and_hms_opt(hour, minute, second)
+            .expect("a real time of day")
+            .and_utc();
+        self.completed_at = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self
+    }
+
     /// Sets the repository the *listing's* projection reports — the string the cost lane's
     /// by-repository cut is keyed on. Deliberately not the one a `summary.md` names: the standup
     /// lane reads the summary's own, and the two are different facts about a session.
@@ -2856,4 +2874,559 @@ fn a_repository_only_the_narrative_names_is_still_a_scope_with_nothing_to_score(
         .map(|entry| entry["repository"].as_str().unwrap())
         .collect();
     assert_eq!(labels, vec!["surdy/qanungo", "surdy/munshi"]);
+}
+
+// ---------------------------------------------------------------------------
+// The timeline (qanungo #5, the last code-gated slice)
+// ---------------------------------------------------------------------------
+
+/// A window whose every archive time is an exact instant on a known UTC day, so the day a session
+/// lands on is a fact this test decides rather than one the clock decides for it.
+///
+/// The dates stay relative — `days_ago` — because the window is 30 days wide and this file has to
+/// keep working next year; the *times of day* are pinned, because midnight is the only place a day
+/// boundary can be got wrong. The two sessions a second apart across a midnight are the whole point:
+/// under any other clock, or under a page that re-expressed the day in a reader's own zone, they
+/// would share a bar.
+///
+/// | Day | Sessions | Repository | Harness |
+/// | --- | --- | --- | --- |
+/// | `D-5` | 2 | `surdy/munshi` | claude-code |
+/// | `D-3` 23:59:59 | 1 | `surdy/qanungo` | claude-code |
+/// | `D-2` 00:00:00 | 1 | `surdy/qanungo` | claude-code |
+/// | `D-2` 12:00:00 | 1 | `surdy/qanungo` | copilot-cli |
+///
+/// Three days covered, five sessions. The comparison window — `[60d, 30d)` — holds two more on two
+/// further days, one in each repository, so a scope's comparison half is a different shape from the
+/// window's.
+fn dated_archive() -> Vec<ArchivedSession> {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let copilot = transcript("munshi/copilot-1.0.76-compaction.jsonl");
+    vec![
+        ArchivedSession::new(1, "claude-code", &clean, 0)
+            .completed_on(5, 9, 0, 0)
+            .in_repository("surdy/munshi"),
+        ArchivedSession::new(2, "claude-code", &clean, 0)
+            .completed_on(5, 17, 30, 0)
+            .in_repository("surdy/munshi"),
+        // One second before midnight, and one second's worth of the next day after it.
+        ArchivedSession::new(3, "claude-code", &clean, 0)
+            .completed_on(3, 23, 59, 59)
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(4, "claude-code", &clean, 0)
+            .completed_on(2, 0, 0, 0)
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(5, "copilot-cli", &copilot, 0)
+            .completed_on(2, 12, 0, 0)
+            .in_repository("surdy/qanungo"),
+        // The comparison window, on two days of its own.
+        ArchivedSession::new(6, "claude-code", &clean, 0)
+            .completed_on(41, 10, 0, 0)
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(7, "claude-code", &clean, 0)
+            .completed_on(44, 10, 0, 0)
+            .in_repository("surdy/munshi"),
+    ]
+}
+
+/// The date this fixture's `days_ago` names, spelled the way the payload spells it.
+fn day_ago(days: i64) -> String {
+    (Utc::now() - TimeDelta::days(days))
+        .date_naive()
+        .to_string()
+}
+
+/// One day row out of a timeline's list, by date.
+fn day_in<'a>(days: &'a serde_json::Value, date: &str) -> &'a serde_json::Value {
+    days.as_array()
+        .expect("a day list")
+        .iter()
+        .find(|day| day["date"] == date)
+        .unwrap_or_else(|| panic!("no {date} in {days}"))
+}
+
+/// Every session in one day row, across the harness columns.
+fn sessions_on(day: &serde_json::Value) -> u64 {
+    day["sessions"]
+        .as_array()
+        .expect("one count per harness column")
+        .iter()
+        .map(|count| count.as_u64().expect("a count"))
+        .sum()
+}
+
+/// Every session in one day list.
+fn sessions_over(days: &serde_json::Value) -> u64 {
+    days.as_array()
+        .expect("a day list")
+        .iter()
+        .map(sessions_on)
+        .sum()
+}
+
+/// The slice's own claim: the window laid on UTC days of **archive completion**, split by harness,
+/// with the two halves of the window pair kept apart.
+///
+/// The midnight pair is what this is really about. Two sessions one second apart are two bars,
+/// because a UTC day ends at `23:59:59Z` and the next one starts at `00:00:00Z` — and because the
+/// clock is the archive's completion time, which is the clock the window itself was cut on.
+#[test]
+fn the_timeline_lays_the_window_on_utc_days_of_archive_time() {
+    let (address, _directory) = spawn_dashboard(dated_archive());
+    let payload = payload_of(address);
+    let timeline = &payload["timeline"];
+
+    // Three days in the reported window, earliest first, and no day for a session that never
+    // happened: a quiet day is a gap in the axis, not a row of zeroes on the wire.
+    let dates: Vec<&str> = timeline["days"]
+        .as_array()
+        .expect("a day list")
+        .iter()
+        .map(|day| day["date"].as_str().expect("an ISO date"))
+        .collect();
+    assert_eq!(dates, vec![day_ago(5), day_ago(3), day_ago(2)]);
+    assert_eq!(timeline["days_covered"], 3);
+    assert_eq!(timeline["undated"], 0);
+
+    // The midnight pair: one second apart, two days, one session each.
+    assert_eq!(sessions_on(day_in(&timeline["days"], &day_ago(3))), 1);
+    assert_eq!(sessions_on(day_in(&timeline["days"], &day_ago(2))), 2);
+    assert_eq!(sessions_on(day_in(&timeline["days"], &day_ago(5))), 2);
+
+    // Split by harness, positionally against the payload's one harness axis.
+    let harnesses: Vec<&str> = payload["scopes"]["harnesses"]
+        .as_array()
+        .expect("the harness axis")
+        .iter()
+        .map(|label| label.as_str().unwrap())
+        .collect();
+    assert_eq!(harnesses, vec!["claude-code", "copilot-cli"]);
+    let busiest = day_in(&timeline["days"], &day_ago(2));
+    assert_eq!(busiest["sessions"], serde_json::json!([1, 1]));
+    // A harness that worked nothing that day is a zero at its own column and never a missing one,
+    // so the page can stack a column without asking which keys exist.
+    assert_eq!(
+        day_in(&timeline["days"], &day_ago(5))["sessions"],
+        serde_json::json!([2, 0]),
+    );
+
+    // The comparison half is its own list on its own days.
+    assert_eq!(timeline["comparison_days_covered"], 2);
+    let comparison: Vec<&str> = timeline["comparison_days"]
+        .as_array()
+        .expect("a day list")
+        .iter()
+        .map(|day| day["date"].as_str().unwrap())
+        .collect();
+    assert_eq!(comparison, vec![day_ago(44), day_ago(41)]);
+    assert_eq!(sessions_over(&timeline["comparison_days"]), 2);
+
+    // And the footer quotes what the chart draws, rather than counting it a second time.
+    let provenance = &payload["provenance"]["timeline"];
+    assert_eq!(provenance["basis"], "archive-completion-utc");
+    assert_eq!(provenance["days_covered"], 3);
+    assert_eq!(provenance["comparison_days_covered"], 2);
+    assert_eq!(provenance["undated"], 0);
+}
+
+/// The reconciliation the whole view rests on: **the bars add up to the number above them**.
+///
+/// In both halves of the window pair, in the whole window and inside every scope. That is only
+/// possible because the day is taken on archive time — the clock `Placement` cut the windows on —
+/// and it is the reason the timeline could ship while the heatmap could not.
+#[test]
+fn every_days_counts_sum_to_the_windows_own_session_count() {
+    let (address, _directory) = spawn_dashboard(dated_archive());
+    let payload = payload_of(address);
+
+    let folded = payload["sessions"]["folded"].as_u64().expect("a count");
+    assert_eq!(folded, 5);
+    assert_eq!(
+        sessions_over(&payload["timeline"]["days"])
+            + payload["timeline"]["undated"].as_u64().unwrap(),
+        folded,
+    );
+    assert_eq!(
+        sessions_over(&payload["timeline"]["comparison_days"])
+            + payload["timeline"]["comparison_undated"].as_u64().unwrap(),
+        payload["sessions"]["comparison_folded"].as_u64().unwrap(),
+    );
+
+    // Every scope, against its own two counts — the numbers the page's own sentence quotes.
+    let scopes = payload["scopes"]["repositories"]
+        .as_array()
+        .expect("the scopes section lists repositories");
+    assert!(!scopes.is_empty());
+    for scope in scopes {
+        let timeline = &scope["timeline"];
+        let label = &scope["repository"];
+        assert_eq!(
+            sessions_over(&timeline["days"]) + timeline["undated"].as_u64().unwrap(),
+            scope["sessions"]["folded"].as_u64().unwrap(),
+            "{label} draws a different number of sessions from the one it counts",
+        );
+        assert_eq!(
+            sessions_over(&timeline["comparison_days"])
+                + timeline["comparison_undated"].as_u64().unwrap(),
+            scope["sessions"]["comparison_folded"].as_u64().unwrap(),
+            "{label}'s comparison half does not reconcile",
+        );
+        assert_eq!(
+            timeline["days_covered"],
+            timeline["days"].as_array().unwrap().len()
+        );
+    }
+
+    // And the scopes partition the window: every scope's day counts, added up per day, are the
+    // whole window's. A scope control that showed more sessions than the window holds — or fewer —
+    // would be narrowing to something other than a subset.
+    let mut per_day: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for scope in scopes {
+        for day in scope["timeline"]["days"].as_array().unwrap() {
+            *per_day
+                .entry(day["date"].as_str().unwrap().to_owned())
+                .or_default() += sessions_on(day);
+        }
+    }
+    let whole: std::collections::BTreeMap<String, u64> = payload["timeline"]["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| (day["date"].as_str().unwrap().to_owned(), sessions_on(day)))
+        .collect();
+    assert_eq!(per_day, whole);
+}
+
+/// Narrowing to a repository narrows the calendar with it, and the narrowed calendar is the same
+/// grouping of the same sessions — never a second fold, and never a day the scope did not work.
+#[test]
+fn a_repository_scope_draws_only_its_own_days() {
+    let (address, _directory) = spawn_dashboard(dated_archive());
+    let payload = payload_of(address);
+
+    let qanungo = scope_of(&payload, "surdy/qanungo")["timeline"].clone();
+    let dates: Vec<&str> = qanungo["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| day["date"].as_str().unwrap())
+        .collect();
+    assert_eq!(dates, vec![day_ago(3), day_ago(2)]);
+    assert_eq!(sessions_over(&qanungo["days"]), 3);
+    // Both harnesses on the busy day; the columns are the payload's own axis, in every scope.
+    assert_eq!(
+        day_in(&qanungo["days"], &day_ago(2))["sessions"],
+        serde_json::json!([1, 1]),
+    );
+
+    let munshi = scope_of(&payload, "surdy/munshi")["timeline"].clone();
+    let dates: Vec<&str> = munshi["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| day["date"].as_str().unwrap())
+        .collect();
+    assert_eq!(dates, vec![day_ago(5)]);
+    assert_eq!(munshi["days_covered"], 1);
+    // A repository's comparison half is its own, and is a different day from the other's.
+    assert_eq!(
+        munshi["comparison_days"].as_array().unwrap()[0]["date"],
+        day_ago(44),
+    );
+    assert_eq!(
+        qanungo["comparison_days"].as_array().unwrap()[0]["date"],
+        day_ago(41),
+    );
+}
+
+/// Active time on the calendar is the fold's **own** gap-aware number, summed per day — the same
+/// seconds the structural evidence block renders and the rules reason about, never a wall-clock
+/// span and never a second measurement.
+#[test]
+fn active_time_per_day_is_the_folds_own_active_time() {
+    let (address, args, _directory) = spawn_with(dated_archive(), &[]);
+    let payload = payload_of(address);
+    let folded = command::fold_coaching(&args.archive, &args.last).expect("the window folds");
+
+    let mut expected: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for session in &folded.sessions {
+        let day = session
+            .archive_day()
+            .expect("the fixture dates every session");
+        *expected.entry(day.to_string()).or_default() += session
+            .active_time()
+            .map_or(0, |active| active.num_seconds());
+    }
+    let served: std::collections::BTreeMap<String, i64> = payload["timeline"]["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| {
+            (
+                day["date"].as_str().unwrap().to_owned(),
+                day["active_seconds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|seconds| seconds.as_i64().unwrap())
+                    .sum(),
+            )
+        })
+        .collect();
+    assert_eq!(served, expected);
+    assert!(
+        served.values().any(|seconds| *seconds > 0),
+        "the fixture must have some activity to sum",
+    );
+}
+
+/// The section's hard invariant: **numbers and ISO dates, and not one string besides**.
+///
+/// Not even a harness label. The per-day arrays are positional against `scopes.harnesses`, the
+/// payload's one harness axis, so there is no place in this section for a byte the archive wrote to
+/// hide — which is a stronger claim than "it is scrubbed", and the same one the structural evidence
+/// block already makes. The walk runs over the top-level timeline and over every scope's, because a
+/// section repeated per repository is a section that can go wrong per repository.
+#[test]
+fn the_timeline_section_is_numbers_and_dates_and_nothing_else() {
+    let (address, _directory) = spawn_dashboard(dated_archive());
+    let payload = payload_of(address);
+
+    let mut leaves = 0;
+    assert_timeline_leaves(&payload["timeline"], "timeline", &mut leaves);
+    for scope in payload["scopes"]["repositories"].as_array().unwrap() {
+        assert_timeline_leaves(&scope["timeline"], "scope timeline", &mut leaves);
+    }
+    assert!(leaves > 40, "the walk visited only {leaves} leaves");
+
+    // And the width of every row is the harness axis, in every scope — which is what makes a
+    // positional array readable at all.
+    let harnesses = payload["scopes"]["harnesses"].as_array().unwrap().len();
+    let mut rows = 0;
+    for timeline in std::iter::once(&payload["timeline"]).chain(
+        payload["scopes"]["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scope| &scope["timeline"]),
+    ) {
+        for key in ["days", "comparison_days"] {
+            for day in timeline[key].as_array().unwrap() {
+                assert_eq!(day["sessions"].as_array().unwrap().len(), harnesses);
+                assert_eq!(day["active_seconds"].as_array().unwrap().len(), harnesses);
+                rows += 1;
+            }
+        }
+    }
+    assert!(rows > 0, "the fixture drew no day at all");
+}
+
+/// Asserts that every leaf under a timeline block is a non-negative number or an ISO `YYYY-MM-DD`
+/// date. Recurses, because the interesting places for a string to hide are the day rows.
+///
+/// The date grammar is pinned rather than waved at: a day here is a calendar day and carries no
+/// time and no zone, which is exactly what distinguishes it from the RFC 3339 instants the rest of
+/// the payload is stamped with.
+fn assert_timeline_leaves(value: &serde_json::Value, path: &str, leaves: &mut usize) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields {
+                assert_timeline_leaves(field, &format!("{path}.{key}"), leaves);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                assert_timeline_leaves(item, &format!("{path}[{index}]"), leaves);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            *leaves += 1;
+            assert!(
+                number.as_i64().is_some_and(|value| value >= 0),
+                "{path} is {number}, which is not a count",
+            );
+        }
+        serde_json::Value::String(text) => {
+            *leaves += 1;
+            assert!(is_calendar_day(text), "{path} carries the string {text:?}");
+        }
+        other => panic!("{path} is {other}, which the timeline never serves"),
+    }
+}
+
+/// `2026-08-11` — a calendar day, with no time of day and no zone on it.
+fn is_calendar_day(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && text
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && text.parse::<chrono::NaiveDate>().is_ok()
+}
+
+/// The grammar the walk enforces, stated against values that must fail it — otherwise the walk is a
+/// loop that visits leaves and asserts nothing.
+#[test]
+fn the_calendar_day_grammar_admits_a_date_and_nothing_else() {
+    for good in ["2026-08-11", "2026-01-01", "2024-02-29"] {
+        assert!(is_calendar_day(good), "{good} is a calendar day");
+    }
+    for bad in [
+        // An instant, which is what every other timestamp on this page is — and is not a day.
+        "2026-08-11T09:00:00Z",
+        "2026-08-11 09:00",
+        // A date that does not exist, and one that is not one at all.
+        "2026-02-30",
+        "2026-8-11",
+        "surdy/qanungo",
+        "claude-code",
+        "",
+    ] {
+        assert!(!is_calendar_day(bad), "{bad:?} is not a calendar day");
+    }
+}
+
+/// The section is bounded by **what happened**, not by how long the window is.
+///
+/// A day nothing was archived on is not served, so the cost of a scope's calendar is one row per
+/// day that scope actually worked — which is bounded above by that scope's session count, and
+/// therefore the whole section by the window's. A dense day × harness × scope grid would instead
+/// cost the window's *length* times the roster times the repository count, for every quiet day in
+/// it, which on a 28-repository production window is most of the section being zeroes.
+#[test]
+fn the_timeline_section_is_bounded_by_the_days_that_happened() {
+    let (address, _directory) = spawn_dashboard(dated_archive());
+    let (_head, body) = request(address, "/api/data");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+    let mut rows = 0;
+    let mut bytes = serde_json::to_vec(&payload["timeline"])
+        .expect("it reserializes")
+        .len();
+    for day in payload["timeline"]["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(payload["timeline"]["comparison_days"].as_array().unwrap())
+    {
+        let _ = day;
+        rows += 1;
+    }
+    for scope in payload["scopes"]["repositories"].as_array().unwrap() {
+        bytes += serde_json::to_vec(&scope["timeline"])
+            .expect("it reserializes")
+            .len();
+        for key in ["days", "comparison_days"] {
+            rows += scope["timeline"][key].as_array().unwrap().len();
+        }
+    }
+
+    // No scope draws more days than it has sessions, in either half.
+    for scope in payload["scopes"]["repositories"].as_array().unwrap() {
+        let timeline = &scope["timeline"];
+        assert!(
+            timeline["days_covered"].as_u64().unwrap()
+                <= scope["sessions"]["folded"].as_u64().unwrap(),
+            "{} draws more days than it folded sessions",
+            scope["repository"],
+        );
+    }
+
+    // And a row is small, because it is two integer arrays and a date: the ceiling is that number
+    // with room over it, meant to catch a row that started carrying something it should not.
+    let per_row = bytes / rows;
+    assert!(
+        per_row < 220,
+        "a timeline day costs {per_row} bytes over {rows} rows; the section is {bytes} of a {} byte body",
+        body.len(),
+    );
+}
+
+/// The page's half of the slice: one inline-SVG chart, drawn from the payload's own integers,
+/// computing nothing and fetching nothing.
+///
+/// There is no JavaScript engine in this harness, so what is pinned here is the shape — the chart
+/// exists, it reads the timeline section, the measure is a toggle rather than a second y-axis, the
+/// legend and the table view are both there, and every page invariant survives the growth. The
+/// drawing itself was checked in Chrome, light and dark, against production — see the issue comment.
+#[test]
+fn the_page_draws_one_inline_svg_chart_and_computes_nothing() {
+    let (address, _directory) = spawn_dashboard(dated_archive());
+    let (head, body) = request(address, "/");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+
+    for anchor in [
+        r#"id="timeline-heading""#,
+        r#"id="timeline-chart""#,
+        r#"id="timeline-measure""#,
+        r#"id="timeline-legend""#,
+        r#"id="timeline-note""#,
+        r#"id="timeline-table""#,
+        "<svg",
+        "entry.timeline : data.timeline",
+        "timeline.comparison_days",
+        "paintTimeline(data, entry, column)",
+    ] {
+        assert!(body.contains(anchor), "the page has no {anchor}");
+    }
+
+    // The chart is built into the element the document already carries, so the SVG namespace is
+    // read off a real node instead of being written here as a URL — which is what keeps the "loads
+    // nothing from anywhere" check below a grep rather than a judgement call.
+    assert!(
+        body.contains("chart.namespaceURI"),
+        "the namespace is taken from the document",
+    );
+    assert!(
+        !body.contains("createElement(\"svg\")"),
+        "an HTML element named svg is not an SVG element",
+    );
+
+    // One chart, one axis. The two measures are a toggle: two y-scales on one plot would invent a
+    // correlation that is not in the data, and the page says so where a reader of it will look.
+    assert!(
+        body.contains(r#"<option value="active">Active hours per day</option>"#),
+        "active time is a measure of the same chart",
+    );
+    assert!(
+        body.contains("never two scales on one plot"),
+        "the page states why the second measure is a toggle",
+    );
+
+    // The page says what a day is, on the page, rather than only in the crate's docs.
+    assert!(
+        body.contains("A day is the UTC calendar day the archive finished the session's snapshot"),
+        "the chart names its own clock",
+    );
+    assert!(
+        body.contains("no hour-of-day or day-of-week view here"),
+        "the page says which view the missing offset still blocks",
+    );
+
+    // Colour follows the harness's place in the payload's own axis, never its rank among whatever
+    // a filter left behind — and a series past the palette's third slot is de-emphasised rather
+    // than given a hue nobody validated.
+    assert!(
+        body.contains(r#"index < 3 ? "s" + index : "sx""#),
+        "a colour slot is the harness's index in the payload's axis",
+    );
+
+    // Every invariant the page already held, restated over the grown file.
+    assert!(!body.contains("href"), "the page carries no links at all");
+    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert!(
+        !body.contains("innerHTML"),
+        "every value is set as text, never parsed as markup",
+    );
+    assert!(
+        !body.contains("http://") && !body.contains("https://") && !body.contains("//fonts."),
+        "the page loads nothing from anywhere — the SVG namespace included",
+    );
+    assert_eq!(
+        body.matches("fetch(").count(),
+        2,
+        "the payload and an excerpt, and nothing the chart adds",
+    );
 }

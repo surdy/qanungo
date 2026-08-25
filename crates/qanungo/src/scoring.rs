@@ -937,6 +937,7 @@ mod tests {
             source_hash: "0".repeat(64),
             source_agent: source_agent.to_owned(),
             repository: None,
+            archived_at: None,
             artifact_set_version: 2,
             anchors: SessionAnchors::default(),
             summary: SessionSummary {

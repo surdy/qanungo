@@ -178,8 +178,15 @@
 //!   harness; the page's harness control reads a number rather than computing one. See
 //!   [`scopes`].
 //!
-//! What remains: per-device scope (waiting on a hostname to accrue in the archive), the timeline,
-//! and the heatmap — the last still blocked on munshi#77's local-offset pull.
+//! - **The timeline is that fold on a calendar.** Sessions and active time per **UTC day of archive
+//!   completion** — the clock the window itself was cut on, which is what makes the bars sum back to
+//!   the session count in the subtitle above them. It is grouped per scope by the same selection the
+//!   scores are, and it carries numbers and ISO dates and no string at all. See [`timeline`].
+//!
+//! What remains: per-device scope (waiting on a hostname to accrue in the archive) and the 7×24
+//! heatmap. The heatmap is the view UTC genuinely breaks — "at 1 a.m." and "on a Sunday" are the
+//! claims a missing offset misplaces — and it waits on munshi#77's local-offset pull *accruing* in
+//! the archive; the capture side shipped 2026-08-25.
 
 pub mod cache;
 pub mod cli;
@@ -202,3 +209,4 @@ pub mod scoring;
 pub mod standup;
 pub mod standup_report;
 pub mod sync;
+pub mod timeline;

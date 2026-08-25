@@ -193,6 +193,7 @@ mod tests {
             source_hash: format!("{index:02x}").repeat(32),
             source_agent: source_agent.to_owned(),
             repository: repository.map(ToOwned::to_owned),
+            archived_at: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(first),
