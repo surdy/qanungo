@@ -1084,21 +1084,168 @@ fn a_session_shaped_finding_renders_structure_and_offers_no_anchor() {
     assert!(boundaries[0]["from"].as_str().unwrap().ends_with('Z'));
     assert!(boundaries[0]["to"].as_str().unwrap().ends_with('Z'));
 
-    // Every leaf of the structural block is a number or a timestamp: there is no string in it a
-    // transcript could have supplied.
+    // Every leaf of the structural block, at every depth, is a number or one of exactly two string
+    // shapes. Walking only the top level would have skipped the nested duration objects and the
+    // per-sitting renderings, which is where a smuggled string would actually fit.
     let serialized = serde_json::to_string(structural).unwrap();
     assert!(!serialized.contains("CANARY"), "{serialized}");
-    for value in structural.as_object().unwrap().values() {
-        if let Some(text) = value.as_str() {
-            assert!(
-                text.ends_with('Z'),
-                "the only strings here are timestamps: {text}",
-            );
-        }
-    }
+    let mut leaves = 0;
+    assert_structural_leaves(structural, "structural", &mut leaves);
+    // Six leaves in the three duration objects, six flat counts and timestamps, four in the one
+    // sitting, and the elision count: a walk that stopped at the top level would see five.
+    assert_eq!(leaves, 17, "the walk must reach the nested objects");
 
     // Asking for an excerpt anyway is refused like any other unanchored locator.
     let source_hash = evidence["source_hash"].as_str().unwrap();
     let (head, _body) = request(address, &format!("/api/evidence/{source_hash}/1"));
     assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
+}
+
+/// Asserts that every leaf under a structural evidence block is a number, a null, or one of the two
+/// string shapes this surface is allowed to render: an RFC 3339 UTC timestamp, or a `format::span`
+/// duration. Recurses through objects and arrays, because the interesting places for a transcript
+/// string to hide — `active`/`span`/`longest_sitting` and each `boundaries[]` entry — are nested.
+///
+/// The duration grammar is pinned rather than waved at: `format::span` emits `<h>h <mm>m`, `<m>m`,
+/// or `<s>s` and nothing else, so anything with a letter outside `hms` in it is not a duration this
+/// crate rendered.
+fn assert_structural_leaves(value: &serde_json::Value, path: &str, leaves: &mut usize) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, nested) in fields {
+                assert_structural_leaves(nested, &format!("{path}.{key}"), leaves);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, nested) in items.iter().enumerate() {
+                assert_structural_leaves(nested, &format!("{path}[{index}]"), leaves);
+            }
+        }
+        serde_json::Value::String(text) => {
+            *leaves += 1;
+            assert!(
+                is_utc_timestamp(text) || is_rendered_span(text),
+                "{path} is a string that is neither a timestamp nor a duration: {text:?}",
+            );
+        }
+        serde_json::Value::Number(_) | serde_json::Value::Null => *leaves += 1,
+        serde_json::Value::Bool(_) => {
+            panic!("{path} is a flag, and this block states measurements")
+        }
+    }
+}
+
+/// `2026-08-10T09:00:00Z` — the one timestamp shape `report::stamp` writes.
+fn is_utc_timestamp(text: &str) -> bool {
+    text.len() == 20
+        && text.ends_with('Z')
+        && text
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                4 | 7 => character == '-',
+                10 => character == 'T',
+                13 | 16 => character == ':',
+                19 => character == 'Z',
+                _ => character.is_ascii_digit(),
+            })
+}
+
+/// `2h 10m`, `47m`, `38s` — the whole of `format::span`'s output.
+fn is_rendered_span(text: &str) -> bool {
+    let shaped = |unit: char, text: &str| {
+        text.strip_suffix(unit).is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    };
+    match text.split_once(' ') {
+        Some((hours, minutes)) => shaped('h', hours) && minutes.len() == 3 && shaped('m', minutes),
+        None => shaped('m', text) || shaped('s', text),
+    }
+}
+
+/// A harness writes its own tool names, and this surface renders them next to a control that
+/// expands into transcript text. Decision 9 blessed tool names as schema metadata for the aggregate
+/// lines; on the two verbatim paths — the anchor in the payload and the excerpt behind it — they are
+/// clamped **and** scrubbed, so a name shaped like a credential is a marker on both.
+#[test]
+fn a_tool_name_shaped_like_a_credential_is_scrubbed_on_both_paths() {
+    let raw = std::fs::read_to_string(fixture("rules/tool-name-canary.jsonl")).unwrap();
+    let token = format!("ghp_{}", "CANARY".repeat(6));
+    assert!(
+        raw.contains(&token),
+        "the fixture names its tool after a token"
+    );
+
+    let (address, _directory) = spawn_dashboard(vec![ArchivedSession::new(
+        9,
+        "claude-code",
+        &transcript("rules/tool-name-canary.jsonl"),
+        2,
+    )]);
+
+    // The payload path.
+    let (_head, body) = request(address, "/api/data");
+    assert!(
+        !body.contains(&token),
+        "a token-shaped tool name reached the payload"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let anchors = all_anchors(&payload);
+    assert!(!anchors.is_empty(), "the fixture fires the error rule");
+    for anchor in &anchors {
+        assert_eq!(anchor["tool"], "[REDACTED:github-token]", "{anchor}");
+    }
+
+    // The excerpt path, which is where a reader actually reads it.
+    let (source_hash, locator) = first_anchor(&payload);
+    let (head, body) = request(address, &format!("/api/evidence/{source_hash}/{locator}"));
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(
+        !body.contains(&token),
+        "a token-shaped tool name reached the excerpt"
+    );
+    let excerpt: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(excerpt["tool"], "[REDACTED:github-token]");
+    assert_eq!(
+        excerpt["event"], "tool_result",
+        "an ordinary name is untouched"
+    );
+    assert!(
+        excerpt["redaction"]["total"].as_u64().unwrap() >= 1,
+        "the scrub is counted, so the marker explains itself: {excerpt}",
+    );
+}
+
+/// The grammar the structural walk enforces, stated against values that must fail it — otherwise
+/// the walk is a loop that visits leaves and asserts nothing.
+#[test]
+fn the_structural_grammar_admits_timestamps_and_durations_and_nothing_else() {
+    for timestamp in ["2026-08-10T09:00:00Z", "2026-01-01T00:00:00Z"] {
+        assert!(is_utc_timestamp(timestamp), "{timestamp}");
+    }
+    for span in ["2h 10m", "0h 00m", "47m", "38s", "365h 32m"] {
+        assert!(is_rendered_span(span), "{span}");
+    }
+    for hostile in [
+        "CANARY_COMMAND_0 rm -rf /tmp",
+        "rm -rf",
+        "/work/fixture",
+        "2026-08-10T09:00:00Z extra",
+        "2026-08-10 09:00:00",
+        "",
+        "h",
+        "m",
+        "2h",
+        "2h 1m",
+        "2 h 10 m",
+        "12 sessions",
+        "1d",
+        "-5m",
+    ] {
+        assert!(
+            !is_utc_timestamp(hostile) && !is_rendered_span(hostile),
+            "{hostile:?} must not pass for a timestamp or a duration",
+        );
+    }
 }

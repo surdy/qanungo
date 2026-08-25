@@ -115,9 +115,10 @@ pub const EXCERPT_TRUNCATED: &str = "…";
 
 /// Where one counted event is, in one transcript.
 ///
-/// Carries no transcript content: a locator, two record positions, a timestamp, and a tool name —
-/// which is schema metadata, the one verbatim string every surface in this crate may already
-/// render.
+/// Carries no transcript content: a locator, two record positions, a timestamp, and a tool name.
+/// The name is schema metadata — the one verbatim string decision 9 blessed for an aggregate
+/// surface — but a harness writes it, so every *rendering* path clamps and scrubs it on the way out
+/// ([`identifier_field`]). What is stored here is what the transcript said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventAnchor {
     /// 1-based ordinal among the transcript's tool events, in file order. The key.
@@ -274,10 +275,10 @@ pub struct RawExcerpt {
 impl RawExcerpt {
     /// Scrubs every free-text field and reports what that cost.
     ///
-    /// Tool names and event discriminators are schema metadata and go through
-    /// [`format::identifier`] instead — the clamp every archive-stated identifier in this crate
-    /// already passes through, because a harness gets to name its tools and does not get to choose
-    /// characters on somebody's screen.
+    /// Tool names and event discriminators are schema metadata — decision 9 blessed them as the one
+    /// verbatim string an *aggregate* surface may render — but this is not an aggregate surface, and
+    /// a harness writes its own tool names. A name shaped like a credential is a credential on the
+    /// screen, so they go through [`identifier_field`] rather than through the clamp alone.
     pub fn redacted(self, redactor: &Redactor) -> Excerpt {
         let mut report = RedactionReport::default();
         let mut truncated = false;
@@ -292,13 +293,23 @@ impl RawExcerpt {
         let command = field(self.command);
         let error = field(self.error);
         let output = field(self.output);
+        // The clamp-then-scrub [`identifier_field`] states, spelled out here rather than called,
+        // so a name that fired the scrub is *counted* in this excerpt's report — a reader seeing a
+        // marker where a tool name belongs needs the total to explain it.
+        let mut identifier = |text: Option<String>| -> Option<String> {
+            let scrubbed = redactor.scrub(&format::identifier(text.as_deref()?));
+            report.absorb(&scrubbed.report);
+            Some(scrubbed.text)
+        };
+        let tool = identifier(self.tool);
+        let event = identifier(self.event);
         Excerpt {
             locator: self.locator,
             record: self.record,
             line: self.line,
             at: self.at,
-            tool: self.tool.as_deref().map(format::identifier),
-            event: self.event.as_deref().map(format::identifier),
+            tool,
+            event,
             outcome: self.outcome,
             command,
             error,
@@ -307,6 +318,27 @@ impl RawExcerpt {
             report,
         }
     }
+}
+
+/// An archive-stated identifier on a surface that renders verbatim: clamped, then scrubbed.
+///
+/// # Why the clamp runs first
+///
+/// The two do different jobs and only this order keeps both of them. [`format::identifier`] judges
+/// **what the archive actually said** — it replaces a value carrying a control character, a pipe, a
+/// backtick, or more than [`format::MAX_IDENTIFIER_CHARS`] characters *wholesale*, because a prefix
+/// of arbitrary text is still arbitrary text. Scrubbing first would let a hostile value launder
+/// itself past that judgement: a 200-character token is not a renderable identifier, but the marker
+/// it scrubs down to is, so the clamp would wave through a value it exists to refuse. Clamping
+/// first means the clamp sees the archive's own bytes, and the scrub then works on text already
+/// known to be renderable.
+///
+/// It costs nothing in the other direction: a name shaped like a credential is well under the
+/// clamp's ceiling and carries none of its forbidden characters, so it reaches the scrub intact and
+/// leaves as a marker. And scrubbing a marker is a no-op ([`crate::redaction`] is idempotent), so
+/// nothing here can nest.
+pub fn identifier_field(value: &str, redactor: &Redactor) -> String {
+    redactor.scrub_text(&format::identifier(value))
 }
 
 /// One counted event, scrubbed and clipped, ready to be serialized to a reader.
@@ -654,6 +686,108 @@ mod tests {
     fn a_locator_past_the_last_tool_event_resolves_to_nothing() {
         assert!(read(3).is_none());
         assert!(read(999_999).is_none());
+    }
+
+    /// A harness writes its own tool names, and this is a surface that renders verbatim. Decision 9
+    /// blessed tool names for the aggregate lines; a name shaped like a credential is a credential
+    /// on the screen, so on this path they are clamped *and* scrubbed — and the scrub is counted, so
+    /// the marker a reader sees where a tool name belongs is explained by the excerpt's own total.
+    #[test]
+    fn a_tool_name_shaped_like_a_credential_is_scrubbed_like_one() {
+        let token = format!("ghp_{}", "CANARY".repeat(6));
+        let raw = RawExcerpt {
+            locator: 1,
+            record: 1,
+            line: 1,
+            at: None,
+            tool: Some(token.clone()),
+            event: Some("tool_result".to_owned()),
+            outcome: Some(false),
+            command: None,
+            error: Some("exit status 1".to_owned()),
+            output: None,
+        };
+        let excerpt = raw.redacted(&Redactor::new());
+        assert_eq!(excerpt.tool.as_deref(), Some("[REDACTED:github-token]"));
+        assert_eq!(
+            excerpt.event.as_deref(),
+            Some("tool_result"),
+            "an ordinary name is untouched"
+        );
+        assert_eq!(
+            excerpt.report.total(),
+            1,
+            "the scrub is counted, not silent"
+        );
+        assert_eq!(excerpt.error.as_deref(), Some("exit status 1"));
+
+        // `--no-redact` means raw here too, or the flag would be lying about a different field.
+        let bare = RawExcerpt {
+            tool: Some(token.clone()),
+            ..raw_of(&excerpt)
+        }
+        .redacted(&Redactor::new().with_secrets(false));
+        assert_eq!(bare.tool, Some(token));
+    }
+
+    /// Rebuilds a raw excerpt from a scrubbed one's positions, so the test above can run the same
+    /// event through a second redactor without restating every field.
+    fn raw_of(excerpt: &Excerpt) -> RawExcerpt {
+        RawExcerpt {
+            locator: excerpt.locator,
+            record: excerpt.record,
+            line: excerpt.line,
+            at: excerpt.at,
+            tool: None,
+            event: excerpt.event.clone(),
+            outcome: excerpt.outcome,
+            command: None,
+            error: None,
+            output: None,
+        }
+    }
+
+    /// The order is the argument, so it is pinned rather than left to the comment. Clamping first
+    /// means the clamp judges what the archive said; scrubbing first would let a value too long to
+    /// be an identifier launder itself into one.
+    #[test]
+    fn an_identifier_is_clamped_before_it_is_scrubbed() {
+        let redactor = Redactor::new();
+        // Inside the clamp, shaped like a secret: the clamp passes it and the scrub takes it.
+        let token = format!("ghp_{}", "CANARY".repeat(6));
+        assert_eq!(
+            identifier_field(&token, &redactor),
+            "[REDACTED:github-token]"
+        );
+
+        // Too long to be an identifier at all: replaced wholesale, and *not* rescued into
+        // renderability by scrubbing it down to a marker first.
+        let overlong = format!("ghp_{}", "CANARY".repeat(20));
+        assert!(overlong.chars().count() > format::MAX_IDENTIFIER_CHARS);
+        assert_eq!(
+            identifier_field(&overlong, &redactor),
+            format::INVALID_IDENTIFIER,
+        );
+
+        // A control character is the clamp's business and stays the clamp's business.
+        assert_eq!(
+            identifier_field("Bash\nSPOOFED", &redactor),
+            format::INVALID_IDENTIFIER,
+        );
+        // And an ordinary tool name costs nothing on the way through either pass.
+        for ordinary in [
+            "Bash",
+            "local_shell",
+            "mcp__server__search_code",
+            "<synthetic>",
+        ] {
+            assert_eq!(identifier_field(ordinary, &redactor), ordinary);
+        }
+        // Scrubbing a marker is a no-op, so nothing here can nest on a second pass.
+        assert_eq!(
+            identifier_field(&identifier_field(&token, &redactor), &redactor),
+            "[REDACTED:github-token]",
+        );
     }
 
     /// The scrub runs before the cut, so a credential that straddles the ceiling is replaced by a

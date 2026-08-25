@@ -13,9 +13,11 @@
 //! before this module can see it, so there is no string here to filter.
 //!
 //! An **anchor is not content**: a locator, a record number, a line number, a timestamp, and a tool
-//! name, which is schema metadata and the one verbatim string every surface here may already
-//! render. What an anchor *resolves to* is content, and that resolution is a separate on-demand
-//! route with the redactor wired into it — see [`crate::evidence`] and
+//! name — schema metadata, and the one verbatim string decision 9 blessed for an aggregate surface.
+//! The tool name is nevertheless *scrubbed* here as well as clamped, because a harness writes its
+//! own tool names and this payload is the label on a control that expands into transcript text; see
+//! [`anchor_value`]. What an anchor *resolves to* is content, and that resolution is a separate
+//! on-demand route with the same redactor wired into it — see [`crate::evidence`] and
 //! [`crate::dashboard_server`]. This is why `provenance.renders_verbatim` is now **`true`**: the
 //! payload still carries none, but the surface it belongs to does, and a page that claimed
 //! otherwise would be inviting a reader to trust a control it had stopped exercising.
@@ -54,7 +56,7 @@ use serde_json::{Value, json};
 
 use crate::cli::{Refresh, Window};
 use crate::command::Folded;
-use crate::evidence::{EventAnchor, EvidenceIndex};
+use crate::evidence::{self, EventAnchor, EvidenceIndex};
 use crate::format;
 use crate::metrics::{SessionMetrics, Totals};
 use crate::redaction::{PATTERN_REVISION, Redactor};
@@ -120,10 +122,11 @@ pub fn evidence_index(folded: &Folded) -> EvidenceIndex {
 /// One call per refresh, never per request: the body is serialized once and handed to every reader
 /// as bytes, so a hundred open tabs cost one fold and one serialization between them.
 ///
-/// The `redactor` is not used to build anything here — this document has nothing to scrub. It is
-/// *stated* in the provenance block, because a page that offers to expand evidence has to say
-/// which scrub stands behind the expansion, and the answer is fixed at launch and identical for
-/// every reader.
+/// The `redactor` does two things. It is **stated** in the provenance block, because a page that
+/// offers to expand evidence has to say which scrub stands behind the expansion — an answer fixed at
+/// launch and identical for every reader. And it scrubs the one archive-written string this document
+/// carries onto its evidence controls, the tool name on an anchor ([`anchor_value`]). Everything
+/// else here was already counts, timestamps, and digests before this module could see it.
 pub fn payload(
     window: &Window,
     refresh: &Refresh,
@@ -163,7 +166,7 @@ pub fn payload(
         "findings": folded
             .findings
             .iter()
-            .map(|finding| finding_value(finding, &by_hash))
+            .map(|finding| finding_value(finding, &by_hash, redactor))
             .collect::<Vec<_>>(),
         "provenance": provenance_value(window, refresh, folded, refreshed, redactor),
     })
@@ -305,7 +308,11 @@ fn trend_value(trend: Option<Trend>) -> Value {
 /// ([`crate::rules::RuleId::evidence_kind`]), and the page renders it rather than deciding for
 /// itself: anchors for a rule that counted events, timestamps and counts for one that measured a
 /// shape, and both for fire-and-forget, which did each in a different component.
-fn finding_value(finding: &Finding, by_hash: &BTreeMap<&str, &SessionMetrics>) -> Value {
+fn finding_value(
+    finding: &Finding,
+    by_hash: &BTreeMap<&str, &SessionMetrics>,
+    redactor: &Redactor,
+) -> Value {
     let kind = finding.rule.evidence_kind();
     json!({
         "rule": finding.rule.key(),
@@ -325,7 +332,11 @@ fn finding_value(finding: &Finding, by_hash: &BTreeMap<&str, &SessionMetrics>) -
             .map(|evidence| json!({
                 "source_hash": evidence.source_hash,
                 "anchors": if kind.anchors() {
-                    evidence.anchors.iter().map(anchor_value).collect::<Vec<_>>()
+                    evidence
+                        .anchors
+                        .iter()
+                        .map(|anchor| anchor_value(anchor, redactor))
+                        .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 },
@@ -343,16 +354,23 @@ fn finding_value(finding: &Finding, by_hash: &BTreeMap<&str, &SessionMetrics>) -
 
 /// One anchor: where a counted event is, and nothing about what it said.
 ///
-/// The tool name goes through [`format::identifier`] like every other archive-stated string on this
-/// surface — a harness names its own tools, and a served page is not a place a peer chooses
-/// characters on.
-fn anchor_value(anchor: &EventAnchor) -> Value {
+/// The tool name is clamped **and scrubbed** — [`evidence::identifier_field`], which is where the
+/// clamp-then-scrub order is argued. Decision 9 blessed tool names as schema metadata a surface may
+/// render verbatim, and that still holds for the aggregate lines this payload is otherwise made of.
+/// It stops holding here: a harness writes its own tool names, an anchor is the label on the control
+/// that expands into transcript text, and a tool name shaped like a credential is a credential on
+/// the screen. Scrubbing a name nobody would mistake for a secret costs exactly nothing, so the
+/// verbatim surfaces pay it.
+fn anchor_value(anchor: &EventAnchor, redactor: &Redactor) -> Value {
     json!({
         "locator": anchor.locator,
         "record": anchor.record,
         "line": anchor.line,
         "at": anchor.at.map(stamp),
-        "tool": anchor.tool.as_deref().map(format::identifier),
+        "tool": anchor
+            .tool
+            .as_deref()
+            .map(|tool| evidence::identifier_field(tool, redactor)),
     })
 }
 

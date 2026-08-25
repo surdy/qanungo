@@ -50,6 +50,15 @@ credentials come back as `[REDACTED:…]` with the sentence around them intact �
 `--no-redact` brings both back verbatim. A redactor that scrubbed regardless of the flag would pass
 the first half and fail the second.
 
+`tool-name-canary.jsonl` puts the planted credential in the one field a coaching surface is
+otherwise allowed to render verbatim: the **tool name**. Twelve calls to a tool named
+`ghp_CANARY…` — forty characters, inside the identifier clamp's ceiling and carrying none of its
+forbidden characters, so the clamp passes it — half of them failing. It exists because decision 9's
+"tool names are schema metadata" holds for aggregate lines and stops holding on a surface that
+renders transcript text beside them: `tests/dashboard.rs` asserts the name comes back as a marker on
+*both* verbatim paths, the anchor in the payload and the excerpt behind it, while an ordinary event
+discriminator beside it is untouched.
+
 `high-tool-error-rate.jsonl` and `retry-loop.jsonl` additionally carry `CANARY_*` tokens in every
 free-text field (user text, assistant text, tool command input, tool error output, and in the
 retry fixture the repeated command itself). Two redaction tests fold them, render a full report,
