@@ -101,12 +101,44 @@
 //!   ([`patwari::MAX_DECLARED_SUMMARY_BYTES`]) — and the *same* mirror, cache, and sibling-fallback
 //!   discipline otherwise, because a lane that selected its window differently would be describing
 //!   a different week.
+//!
+//! # The dashboard (qanungo #5)
+//!
+//! ```text
+//! qanungo dashboard --last 30d
+//! ```
+//!
+//! is the fourth lane and the first that is not a document. It is the coaching report's own
+//! numbers, served: five score cards, the findings under them, a provenance footer, and nothing
+//! else. Four properties are the whole of it:
+//!
+//! - **It is a presentation, not a computation.** [`command::fold_coaching`] is the same call
+//!   `report` makes, on the same window pair, and [`dashboard`] serializes the
+//!   [`command::Folded`] it returns instead of rendering it as Markdown. A dashboard with its own
+//!   fold would drift from the CLI beside it, and "the page and the terminal disagree about my
+//!   scores" is not a bug anybody can act on.
+//! - **In memory, on a timer.** A long-lived process re-syncs and re-folds every `--refresh`,
+//!   swaps the served payload atomically, and pushes an SSE event so open pages re-fetch; a request
+//!   is a memcpy. Per the 2026-08-24 grilling, process memory is the "disposable materialization"
+//!   and the persistent event store stays deferred — sync dominates the fold, and a store would fix
+//!   the smaller half.
+//! - **Aggregates only, and no way back to the archive.** Scores, rule ids, counts, and content
+//!   hashes; no transcript text, no prose, no command strings, and **no Patwari links** — the
+//!   archive serves unredacted blobs, so a deep link would be a disclosure wearing a convenience.
+//!   The P0 exemption applies unchanged, which is why no redaction flag is wired: see
+//!   [`dashboard`]. The redacted-excerpt surface is the next slice, and it arrives with a
+//!   launch-time flag, never a per-request one.
+//! - **Unauthenticated, and it says so.** Loopback by default; `--bind` on a tailnet address is how
+//!   a phone or a TV reads it, and startup prints one line naming what that costs
+//!   ([`dashboard_server::posture_line`]).
 
 pub mod cache;
 pub mod cli;
 pub mod command;
 pub mod cost;
 pub mod cost_report;
+pub mod dashboard;
+pub mod dashboard_server;
 pub mod format;
 pub mod http;
 pub mod metrics;

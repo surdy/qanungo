@@ -15,9 +15,18 @@
 //! and so far only — command to flatten it. `report` and `cost` still do not, and attaching it to
 //! them would be decoration over documents that carry no content at all (see
 //! [`crate::redaction`]).
+//!
+//! `qanungo dashboard` (qanungo #5) is the fourth lane and the first that is not a document: it
+//! flattens [`ArchiveArgs`] like the rest and adds only what a served surface needs — where to
+//! listen, and how often to recompute. It does not flatten [`RedactionArgs`] either, on the same
+//! reasoning as `report`: its V1 payload carries scores, rule ids, counts, and content hashes, and
+//! nothing that ever held a transcript string. See [`DashboardArgs`] for what changes when the
+//! evidence-excerpt slice lands.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand};
@@ -39,6 +48,35 @@ pub const DEFAULT_PATWARI_URL: &str = "https://patwari.clusterfault.com";
 /// and `--last 30d` still says exactly what the issue asked for.
 pub const DEFAULT_STANDUP_WINDOW: &str = "7d";
 
+/// Where `qanungo dashboard` listens when nobody says otherwise.
+///
+/// **Loopback**, because a surface with no authentication has to be opt-in to being reachable at
+/// all; `--bind` on a tailnet address is how a phone or a TV gets at it, and the startup line says
+/// out loud what that costs (see [`DashboardArgs::bind`]).
+///
+/// Port **8878** is one above munshi-dashboard's 8877, deliberately: the two are sibling read-only
+/// dashboards over the same lineage and get run on the same laptop, so adjacent ports are one
+/// fewer thing to remember. It is well clear of Patwari's own 8787.
+pub const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8878";
+
+/// How often the dashboard re-syncs and re-folds when nobody says otherwise.
+///
+/// **A tunable, not a decision.** A coaching window of thirty days does not change meaningfully
+/// inside five minutes — a session has to be finished, archived, and listed before it can move a
+/// number — so this is chosen to keep the archive quiet rather than to keep the page fresh. The
+/// measured warm re-sync against the production archive is 16.8 s, so five minutes spends about
+/// 6% of the dashboard's life talking to Patwari.
+pub const DEFAULT_DASHBOARD_REFRESH: &str = "5m";
+
+/// Floor under `--refresh`, refused rather than clamped.
+///
+/// A warm re-sync measured 16.8 s against the production archive, and Patwari serves about eight
+/// concurrent requests. A refresh interval near the sync's own duration is not a fresher
+/// dashboard, it is a permanent polling load on a LAN archive that has other readers — so the
+/// floor sits at roughly three times the measured sync, and somebody who typed `--refresh 5s` is
+/// told what this client will not do rather than quietly given something else.
+pub const MIN_DASHBOARD_REFRESH: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "qanungo",
@@ -58,11 +96,14 @@ pub enum Command {
     Cost(CostArgs),
     /// Narrate recent archived sessions from their own summaries, as Markdown on stdout.
     Standup(StandupArgs),
+    /// Serve the coaching report's own numbers as a read-only web page, refreshed in the
+    /// background.
+    Dashboard(DashboardArgs),
 }
 
 /// How to reach the archive, shared by every lane. Flattened rather than repeated so
 /// `--patwari-url` cannot come to mean two slightly different things in two subcommands.
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 pub struct ArchiveArgs {
     /// Base URL of the Patwari archive server.
     #[arg(long = "patwari-url", env = "PATWARI_URL", default_value = DEFAULT_PATWARI_URL)]
@@ -153,6 +194,96 @@ pub struct StandupArgs {
 
     #[command(flatten)]
     pub redaction: RedactionArgs,
+}
+
+/// The dashboard lane (qanungo #5).
+///
+/// Flattens [`ArchiveArgs`] like every other lane, because the dashboard is the *same* fold behind
+/// a different presentation and a `--patwari-url` that meant something else here would be a
+/// dashboard describing a different archive from the report beside it.
+///
+/// It deliberately does **not** flatten [`RedactionArgs`]. V1 renders zero verbatim — lane scores,
+/// rule ids, counts, and content hashes — so the P0 exemption in [`crate::report`] applies
+/// unchanged, and a redaction switch over a payload with no content in it would be decoration on a
+/// security control, which is the argument `report` and `cost` already refuse it on. When the
+/// evidence-excerpt slice lands, the flag arrives with it and is **launch-time only**: a
+/// per-request toggle a browser could flip is not a redaction control, it is a redaction bypass
+/// with a query string.
+#[derive(Debug, Args)]
+pub struct DashboardArgs {
+    /// How far back to score, as `<count><unit>` with unit `h`, `d`, or `w`. The comparison window
+    /// the trend arrows are drawn against is the equal-length one before it, as in `report`.
+    #[arg(long = "last", default_value = "30d", value_parser = parse_window)]
+    pub last: Window,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
+
+    /// Address to listen on. **Nothing here authenticates a caller.** A loopback address keeps the
+    /// page on this machine; a tailnet address publishes it to every device on the tailnet, which
+    /// is the intended way to read it from a phone or a TV and is safe exactly to the extent the
+    /// tailnet is. Startup says which of the two is happening, in one line, whichever it is.
+    #[arg(long, default_value = DEFAULT_DASHBOARD_BIND)]
+    pub bind: SocketAddr,
+
+    /// How often to re-sync and re-fold in the background, as `<count><unit>` with unit `s`, `m`,
+    /// or `h`.
+    #[arg(long, default_value = DEFAULT_DASHBOARD_REFRESH, value_parser = parse_refresh)]
+    pub refresh: Refresh,
+}
+
+/// A background refresh interval, kept in the spelling the operator typed so the provenance footer
+/// can echo it back — the same discipline [`Window`] holds, for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refresh {
+    text: String,
+    interval: Duration,
+}
+
+impl Refresh {
+    /// How long the refresh loop sleeps between folds.
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+}
+
+impl fmt::Display for Refresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+/// Parses `30s`, `5m`, `1h`. A different grammar from [`parse_window`] on purpose: a refresh
+/// interval is a number of seconds or minutes and a *window* deliberately is not, so the two
+/// parsers accept disjoint units rather than one accepting both and inviting `--last 5m`.
+fn parse_refresh(value: &str) -> Result<Refresh, String> {
+    let (digits, unit) = value.split_at(
+        value
+            .find(|character: char| !character.is_ascii_digit())
+            .ok_or_else(|| format!("`{value}` has no unit; try `5m`"))?,
+    );
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{value}` does not start with a count; try `5m`"))?;
+    let seconds = match unit {
+        "s" => Some(count),
+        "m" => count.checked_mul(60),
+        "h" => count.checked_mul(3600),
+        other => return Err(format!("`{other}` is not an interval unit; use s, m, or h")),
+    }
+    .ok_or_else(|| format!("`{value}` is too long an interval"))?;
+    let interval = Duration::from_secs(seconds);
+    if interval < MIN_DASHBOARD_REFRESH {
+        return Err(format!(
+            "must be at least {}s — a warm re-sync of the archive takes about 17 s, and refreshing \
+             near that interval is a polling load on a LAN server rather than a fresher dashboard",
+            MIN_DASHBOARD_REFRESH.as_secs(),
+        ));
+    }
+    Ok(Refresh {
+        text: value.to_owned(),
+        interval,
+    })
 }
 
 /// A report window, kept in the spelling the operator typed so the report can echo it back.
@@ -286,7 +417,7 @@ mod tests {
         for bad in ["0", "9", "64", "-1", "many"] {
             assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
         }
-        for command in ["report", "cost", "standup"] {
+        for command in ["report", "cost", "standup", "dashboard"] {
             assert!(Cli::try_parse_from(["qanungo", command, "--concurrency", "64"]).is_err());
         }
     }
@@ -352,24 +483,114 @@ mod tests {
             )
             .command
         };
-        let (Command::Report(report), Command::Cost(cost), Command::Standup(standup)) =
-            (parse("report"), parse("cost"), parse("standup"))
+        let (
+            Command::Report(report),
+            Command::Cost(cost),
+            Command::Standup(standup),
+            Command::Dashboard(dashboard),
+        ) = (
+            parse("report"),
+            parse("cost"),
+            parse("standup"),
+            parse("dashboard"),
+        )
         else {
             panic!("each subcommand parses as itself");
         };
-        for archive in [&cost.archive, &standup.archive] {
+        for archive in [&cost.archive, &standup.archive, &dashboard.archive] {
             assert_eq!(report.archive.patwari_url, archive.patwari_url);
             assert_eq!(report.archive.concurrency, archive.concurrency);
         }
     }
 
-    /// The redaction flags go live on `standup` and nowhere else: `report` and `cost` render no
-    /// archived prose, so a `--no-redact` on either would be a switch over nothing.
+    /// The redaction flags go live on `standup` and nowhere else: `report`, `cost`, and the
+    /// dashboard render no archived prose, so a `--no-redact` on any of them would be a switch
+    /// over nothing. The dashboard is the one that matters most — a redaction flag on a *served*
+    /// surface that carried no content would invite a reader to trust a control that is not doing
+    /// anything.
     #[test]
     fn only_the_lane_that_renders_prose_takes_the_redaction_flags() {
         assert!(Cli::try_parse_from(["qanungo", "standup", "--no-redact"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
         assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--no-redact"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--filter-profanity"]).is_err());
+    }
+
+    /// A run with no flags serves the loopback default over thirty days, refreshing on the named
+    /// interval — the same window `report` defaults to, because the dashboard is that report's
+    /// numbers under a different presentation.
+    #[test]
+    fn the_dashboard_defaults_to_loopback_thirty_days_and_the_named_interval() {
+        let Command::Dashboard(args) = Cli::parse_from(["qanungo", "dashboard"]).command else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        assert_eq!(args.last.to_string(), "30d");
+        assert_eq!(args.last.delta(), TimeDelta::days(30));
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
+        assert_eq!(args.bind.to_string(), DEFAULT_DASHBOARD_BIND);
+        assert!(args.bind.ip().is_loopback());
+        assert_eq!(args.refresh.to_string(), DEFAULT_DASHBOARD_REFRESH);
+        assert_eq!(args.refresh.interval(), Duration::from_secs(300));
+    }
+
+    /// A routable bind parses — that is the tailnet case, and refusing it here would be refusing
+    /// the whole point of the lane. What it must not do is happen silently; the posture line is
+    /// [`crate::dashboard_server`]'s half of that bargain.
+    #[test]
+    fn a_routable_bind_parses_because_the_tailnet_is_the_point() {
+        let bind = |address: &str| {
+            let Command::Dashboard(args) =
+                Cli::parse_from(["qanungo", "dashboard", "--bind", address]).command
+            else {
+                panic!("`dashboard` parses as the dashboard command");
+            };
+            args.bind
+        };
+        assert!(!bind("0.0.0.0:8878").ip().is_loopback());
+        assert!(!bind("100.64.0.1:9000").ip().is_loopback());
+        assert!(bind("[::1]:8878").ip().is_loopback());
+        // A malformed address is a usage error before a socket is ever opened.
+        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--bind", "nowhere"]).is_err());
+    }
+
+    /// The refresh grammar is disjoint from the window grammar: an interval is seconds, minutes,
+    /// or hours, and a window is hours, days, or weeks. Neither parser accepts the other's units,
+    /// so `--last 5m` and `--refresh 30d` are both refused rather than silently meaning something.
+    #[test]
+    fn the_refresh_grammar_and_the_window_grammar_do_not_overlap() {
+        assert_eq!(
+            parse_refresh("60s").unwrap().interval(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_refresh("5m").unwrap().interval(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_refresh("2h").unwrap().interval(),
+            Duration::from_secs(7200)
+        );
+        assert_eq!(parse_refresh("5m").unwrap().to_string(), "5m");
+
+        for bad in ["", "m", "5", "5d", "5w", "0s", "-1m", "5 minutes"] {
+            assert!(parse_refresh(bad).is_err(), "`{bad}` must not parse");
+        }
+        assert!(parse_window("5m").is_err());
+        assert!(parse_window("60s").is_err());
+    }
+
+    /// The floor is refused, not clamped: somebody who typed `--refresh 5s` has a belief about
+    /// what this tool will do to the archive, and the honest answer is that it will not.
+    #[test]
+    fn a_refresh_faster_than_the_floor_is_refused_not_clamped() {
+        let refused = parse_refresh("5s").expect_err("under the floor");
+        assert!(refused.contains("at least 60s"), "{refused}");
+        assert!(refused.contains("polling load"), "{refused}");
+        assert!(parse_refresh("59s").is_err());
+        assert!(parse_refresh("60s").is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--refresh", "5s"]).is_err());
     }
 
     /// [`RedactionArgs`] is exercised through the same stand-in the redaction lane pinned it with,

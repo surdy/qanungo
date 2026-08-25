@@ -108,16 +108,37 @@ revision they fired from. A session with no summary anywhere, one this build can
 munshi's own placeholder each land in **Gaps** with the reason, never in the narrative and never
 silently dropped.
 
+**The dashboard** ([#5](https://github.com/surdy/qanungo/issues/5)) is the fourth lane and the first
+that is not a document. `qanungo dashboard` serves the coaching report's own numbers — five score
+cards, the findings under them, a provenance footer — as one embedded single-file page on a
+hand-rolled `std::net` server, theme-aware and legible from a phone to a TV. It is a *presentation*,
+not a second computation: it calls the same fold `qanungo report` calls, on the same window pair,
+and serializes the result instead of rendering it as Markdown, so the page and the terminal cannot
+come to disagree about a score. A long-lived process re-syncs and re-folds every `--refresh`, swaps
+the served payload atomically, and pushes an SSE event so open pages re-fetch; a request is then a
+memcpy. Per the issue's 2026-08-24 grilling the persistent event store stays **deferred** — sync
+dominates the fold, and a store would fix the smaller half — so process memory is the disposable
+materialization. V1 renders **aggregates only**: scores, rule ids, counts, and content hashes, with
+no transcript text and, deliberately, **no link into Patwari**, which serves unredacted blobs; a
+hash is what you take to your own shell. Loopback by default; `--bind` on a tailnet address is how a
+phone reads it, and startup prints one line saying that nothing authenticates a caller and the
+tailnet is therefore the only boundary.
+
 ```sh
 cargo run -- report --last 30d                       # the production archive on the LAN
 cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
 cargo run -- cost --last 12w                         # a quarter, in the units the grammar has
 cargo run -- standup --last 7d                       # a week you can read to the end of
 cargo run -- standup --last 30d --no-redact          # secrets unscrubbed, and the footer says so
+cargo run -- dashboard --last 30d                    # http://127.0.0.1:8878, refolded every 5m
+cargo run -- dashboard --bind 100.64.0.7:8878        # the tailnet, unauthenticated, and it says so
 ```
 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
-minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default.
+minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default. The
+dashboard's `--refresh` is a *disjoint* grammar — `s`, `m`, `h` — so neither parser accepts the
+other's units, and an interval faster than a minute is refused rather than clamped: a warm re-sync
+takes about 17 s, and polling near that is load on a LAN archive rather than a fresher page.
 
 `--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the blob cache, which otherwise
 lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
@@ -133,6 +154,9 @@ until the footer's fold-cost and rule-firing data say otherwise. The prices in
 `crates/qanungo/src/pricing.rs` are the opposite kind of number: not a knob at all, but a sourced
 figure with a date, changed only by adding a row.
 
-Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the dashboard (#5), the
-narrator (#6). Full research + rationale: `~/repos/research/ai-coach/`. See
+Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
+dashboard's own later slices — redacted evidence excerpts (the #8-gated surface), standup and cost
+views over the folds that already ship, scope selection, the timeline, and the heatmap once
+munshi#77 types the capture machine's local offset. Full research + rationale:
+`~/repos/research/ai-coach/`. See
 issues for the phased plan.
