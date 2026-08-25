@@ -438,12 +438,12 @@ fn fold_and_publish(
         archive.patwari_url, windows.coaching, windows.cost, windows.standup,
     );
     let started = Instant::now();
-    let coaching = command::fold_coaching(archive, &windows.coaching)?;
+    let coaching = command::fold_coaching(archive, &windows.coaching, redactor)?;
     eprintln!(
         "qanungo dashboard: coaching — {}",
         instrumentation_line(&coaching)
     );
-    let cost = command::fold_cost(archive, &windows.cost)?;
+    let cost = command::fold_cost(archive, &windows.cost, redactor)?;
     eprintln!(
         "qanungo dashboard: cost — sync {} · fold {} · {} sessions (+{} comparison) · {} records \
          · price table {}",

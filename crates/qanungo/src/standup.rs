@@ -21,6 +21,13 @@
 //! clamped through [`crate::format::identifier`], in that order: the scrub is about what the text
 //! contains, the clamp is about what a peer may put on a rendering surface, and both apply.
 //!
+//! The harness label on a Gaps line takes the same two passes in the *other* order — the one
+//! [`crate::evidence::identifier_field`] argues for and the one the coaching and cost lanes' Gaps
+//! sections use. Clamping first means the clamp judges the archive's own bytes, so an over-length
+//! token cannot launder itself into a renderable marker; see that helper's rustdoc. The label comes
+//! off a *listing row* rather than out of a summary, which is why it is handled here beside the
+//! gaps rather than with the two fields above.
+//!
 //! # No signal, no claim
 //!
 //! A session whose snapshots carry no `summary.md`, one whose summary this build cannot parse, and
@@ -270,12 +277,15 @@ impl Standup {
             .sum::<usize>();
         let decisions = roll_up(&repositories, |session| &session.decisions);
         let open_items = roll_up(&repositories, |session| &session.open_items);
+        // Last, because it adds to `redaction`: a harness label the scrub fired on is counted in
+        // the same footer total as the prose above it.
+        let gaps = summarize(gaps, unplaceable, redactor, &mut redaction);
 
         Self {
             repositories,
             decisions,
             open_items,
-            gaps: summarize(gaps, unplaceable),
+            gaps,
             redaction,
             sessions,
             bytes_read,
@@ -345,17 +355,25 @@ fn roll_up(
 
 /// Groups gaps by reason so a systematic one reads as a single line.
 ///
-/// The harness label is the archive's string and goes through [`format::identifier`] on the way
-/// in, for exactly the reason [`crate::command`] clamps it in the other two lanes: a manifest
-/// states whatever `source_agent` it likes, and this line is rendered verbatim.
-fn summarize(gaps: &[Gap], unplaceable: usize) -> Vec<SkippedNote> {
+/// The harness label is the archive's string and is clamped *and then* scrubbed on the way in, for
+/// exactly the reason [`crate::command`] does both in the other two lanes: a manifest states
+/// whatever `source_agent` it likes, this line is rendered verbatim, and a credential is shaped
+/// precisely like an ordinary harness name so the clamp alone would wave one through.
+///
+/// It spells out what [`crate::evidence::identifier_field`] does rather than calling it, so a label
+/// that fired the scrub is *counted* in `redaction` — this lane has a footer that says what fired,
+/// and a reader seeing a marker where a harness name belongs needs the total to explain it.
+fn summarize(
+    gaps: &[Gap],
+    unplaceable: usize,
+    redactor: &Redactor,
+    redaction: &mut RedactionReport,
+) -> Vec<SkippedNote> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for gap in gaps {
-        let reason = format!(
-            "{}: {}",
-            format::identifier(&gap.source_agent),
-            gap.reason.sentence()
-        );
+        let label = redactor.scrub(&format::identifier(&gap.source_agent));
+        redaction.absorb(&label.report);
+        let reason = format!("{}: {}", label.text, gap.reason.sentence());
         *counts.entry(reason).or_default() += 1;
     }
     let mut notes: Vec<_> = counts
@@ -524,6 +542,8 @@ mod tests {
                 },
             ],
             0,
+            &Redactor::new(),
+            &mut RedactionReport::default(),
         );
         let rendered = notes
             .iter()
@@ -536,9 +556,99 @@ mod tests {
         assert_eq!(rendered.matches(format::INVALID_IDENTIFIER).count(), 2);
     }
 
+    /// The clamp's blind spot, in this lane's Gaps section: a credential is shaped exactly like a
+    /// harness name, so [`format::identifier`] hands it straight back and only the scrub catches
+    /// it. Swap the scrub out and the token appears where the marker is asserted.
+    ///
+    /// The count travels with it. This lane's footer says what the scrub fired, and a marker in the
+    /// Gaps section with `redaction none` beneath it would be the document contradicting itself.
+    #[test]
+    fn a_credential_shaped_harness_label_is_scrubbed_and_counted() {
+        const TOKEN_SHAPED: &str = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+        // The clamp on its own is the state this test exists to refuse: it is a no-op here.
+        assert_eq!(format::identifier(TOKEN_SHAPED), TOKEN_SHAPED);
+
+        let mut redaction = RedactionReport::default();
+        let notes = summarize(
+            &[Gap {
+                source_agent: TOKEN_SHAPED.to_owned(),
+                reason: GapReason::MissingSummary,
+            }],
+            0,
+            &Redactor::new(),
+            &mut redaction,
+        );
+        assert!(
+            !notes[0].reason.contains(TOKEN_SHAPED),
+            "{}",
+            notes[0].reason
+        );
+        assert!(
+            notes[0].reason.starts_with("[REDACTED:github-token]: "),
+            "{}",
+            notes[0].reason,
+        );
+        assert_eq!(redaction.total(), 1, "the footer can explain the marker");
+    }
+
+    /// The clamp still runs first, so an over-length label is refused wholesale rather than
+    /// scrubbed down into something renderable.
+    #[test]
+    fn an_over_length_credential_shaped_label_still_clamps() {
+        let token = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+        let over_length = format!("{token} {token}");
+        let mut redaction = RedactionReport::default();
+        let notes = summarize(
+            &[Gap {
+                source_agent: over_length,
+                reason: GapReason::MissingSummary,
+            }],
+            0,
+            &Redactor::new(),
+            &mut redaction,
+        );
+        assert!(
+            notes[0]
+                .reason
+                .starts_with(&format!("{}: ", format::INVALID_IDENTIFIER)),
+            "{}",
+            notes[0].reason,
+        );
+        assert!(
+            !notes[0].reason.contains("[REDACTED:"),
+            "{}",
+            notes[0].reason
+        );
+        assert_eq!(
+            redaction.total(),
+            0,
+            "nothing reached the scrub to be counted"
+        );
+    }
+
+    /// An ordinary label costs the common case nothing: no marker, no count, the name as written.
+    #[test]
+    fn an_ordinary_harness_label_is_unchanged() {
+        let mut redaction = RedactionReport::default();
+        let notes = summarize(
+            &[Gap {
+                source_agent: "claude-code".to_owned(),
+                reason: GapReason::Placeholder,
+            }],
+            0,
+            &Redactor::new(),
+            &mut redaction,
+        );
+        assert_eq!(
+            notes[0].reason,
+            "claude-code: munshi wrote a placeholder summary here and still owes a real one",
+        );
+        assert_eq!(redaction.total(), 0);
+    }
+
     #[test]
     fn unplaceable_sessions_become_their_own_gap_line() {
-        let notes = summarize(&[], 3);
+        let notes = summarize(&[], 3, &Redactor::new(), &mut RedactionReport::default());
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].count, 3);
         assert!(notes[0].reason.contains("could not place in the window"));

@@ -590,7 +590,8 @@ fn the_data_route_serves_json_that_reconciles_with_the_fold() {
     let payload: serde_json::Value = serde_json::from_str(&body).expect("the payload is JSON");
 
     // The same window, folded again from the same archive and the now-warm cache.
-    let folded = command::fold_coaching(&args.archive, &args.last).expect("the window folds");
+    let folded = command::fold_coaching(&args.archive, &args.last, &args.redaction.redactor())
+        .expect("the window folds");
     let scorecard = Scorecard::fold(&folded.sessions);
 
     assert_eq!(payload["sessions"]["folded"], folded.sessions.len());
@@ -1466,7 +1467,8 @@ fn all_three_sections_reconcile_with_their_own_folds() {
     let payload = payload_of(address);
 
     // Coaching, over `--last`.
-    let coaching = command::fold_coaching(&args.archive, &args.last).expect("the window folds");
+    let coaching = command::fold_coaching(&args.archive, &args.last, &args.redaction.redactor())
+        .expect("the window folds");
     assert_eq!(payload["sessions"]["folded"], coaching.sessions.len());
     assert_eq!(payload["window"]["last"], "30d");
     assert_eq!(
@@ -1475,7 +1477,8 @@ fn all_three_sections_reconcile_with_their_own_folds() {
     );
 
     // Cost, over `--cost-last` — a different window, and the payload says which.
-    let cost = command::fold_cost(&args.archive, &args.cost_last).expect("the window prices");
+    let cost = command::fold_cost(&args.archive, &args.cost_last, &args.redaction.redactor())
+        .expect("the window prices");
     let served = &payload["cost"];
     assert_eq!(served["window"]["last"], "12w");
     assert_eq!(served["sessions"]["priced"], cost.totals.priceable_sessions);
@@ -3146,7 +3149,8 @@ fn a_repository_scope_draws_only_its_own_days() {
 fn active_time_per_day_is_the_folds_own_active_time() {
     let (address, args, _directory) = spawn_with(dated_archive(), &[]);
     let payload = payload_of(address);
-    let folded = command::fold_coaching(&args.archive, &args.last).expect("the window folds");
+    let folded = command::fold_coaching(&args.archive, &args.last, &args.redaction.redactor())
+        .expect("the window folds");
 
     let mut expected: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     for session in &folded.sessions {
@@ -3428,5 +3432,141 @@ fn the_page_draws_one_inline_svg_chart_and_computes_nothing() {
         body.matches("fetch(").count(),
         2,
         "the payload and an excerpt, and nothing the chart adds",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The harness label on a Gaps line
+// ---------------------------------------------------------------------------
+
+/// A GitHub token's shape — `ghp_` and exactly 36 base62 characters — and not a real one.
+///
+/// The point of the fixture is that it is *renderable*: no pipe, no backtick, no control
+/// character, well under the identifier clamp's ceiling. `qanungo::format::identifier` hands it
+/// straight back, which is why the clamp alone never protected this line.
+const TOKEN_SHAPED_AGENT: &str = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+
+/// A window whose second session's manifest names a credential-shaped harness.
+///
+/// That session is a gap in every lane at once, which is what makes one archive enough for all four
+/// surfaces: no build has an interpreter for this "harness", so the transcript lanes skip it before
+/// they fold, and no snapshot of it carries a `summary.md`, so the standup lane never narrates it.
+/// Its label is the only thing about it that reaches a page — three times over, plus the payload.
+fn hostile_label_archive() -> Vec<ArchivedSession> {
+    vec![
+        ArchivedSession::new(
+            31,
+            "claude-code",
+            &transcript("cost/claude-billing.jsonl"),
+            2,
+        )
+        .with_summary(&summary("qanungo-cost.md"))
+        .in_repository("surdy/qanungo"),
+        ArchivedSession::new(
+            32,
+            TOKEN_SHAPED_AGENT,
+            &transcript("cost/copilot-billing.jsonl"),
+            3,
+        ),
+    ]
+}
+
+/// Runs one document lane end to end against a stand-in archive and hands back its Markdown.
+///
+/// Through `Cli::parse_from` and the real command function, so the redactor each lane renders with
+/// is the one it builds for itself — which for `report` and `cost` is the whole property under
+/// test: neither flattens `RedactionArgs`, so there is no flag in the line below to have set.
+fn document(lane: &str, base: &str, cache: &std::path::Path) -> String {
+    let parsed = Cli::parse_from([
+        "qanungo",
+        lane,
+        "--patwari-url",
+        base,
+        "--cache-dir",
+        cache.to_str().expect("a utf-8 scratch path"),
+    ])
+    .command;
+    let mut out = Vec::new();
+    match &parsed {
+        Command::Report(args) => command::report(args, &mut out).expect("the report renders"),
+        Command::Cost(args) => command::cost(args, &mut out).expect("the cost report renders"),
+        Command::Standup(args) => command::standup(args, &mut out).expect("the standup renders"),
+        Command::Dashboard(_) => panic!("`{lane}` is not a document lane"),
+    }
+    String::from_utf8(out).expect("a document is UTF-8")
+}
+
+/// The gap this closes: a credential-shaped `source_agent` in a listing reached the Gaps section of
+/// all three documents and the dashboard's `provenance.gaps` as itself, because the label was
+/// clamped and never scrubbed.
+///
+/// All four surfaces are checked from one archive because all four render the same `SkippedNote`,
+/// and the whole point of treating the label in the fold rather than at each rendering site is that
+/// they cannot come apart. The negative half is the mutation guard: swap `evidence::identifier_field`
+/// back to `format::identifier` and the token is present in every document below.
+#[test]
+fn a_credential_shaped_harness_label_is_scrubbed_in_every_gaps_section() {
+    const MARKER: &str = "[REDACTED:github-token]";
+
+    let base = spawn_archive(hostile_label_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let cache = directory.path().join("qanungo");
+
+    for lane in ["report", "cost", "standup"] {
+        let rendered = document(lane, &base, &cache);
+        assert!(
+            !rendered.contains(TOKEN_SHAPED_AGENT),
+            "`{lane}` printed the token: {rendered}",
+        );
+        assert!(
+            rendered.contains(MARKER),
+            "`{lane}` has no marker where the label belongs: {rendered}",
+        );
+    }
+
+    // The served surface, over its own archive and its own fold.
+    let (address, _args, _directory) = spawn_with(hostile_label_archive(), &[]);
+    let payload = payload_of(address);
+    let gaps = payload["provenance"]["gaps"].to_string();
+    assert!(
+        gaps.contains(MARKER) && !gaps.contains(TOKEN_SHAPED_AGENT),
+        "provenance.gaps: {gaps}",
+    );
+    assert!(
+        !payload.to_string().contains(TOKEN_SHAPED_AGENT),
+        "the token reached the payload somewhere else",
+    );
+}
+
+/// An ordinary harness label costs the common case nothing: the scrub is a no-op on it, the clamp
+/// is a no-op on it, and every document names the harness exactly as the archive did.
+///
+/// The standup document is checked on its Gaps line rather than on the whole page, because that
+/// lane's fixtures carry planted credentials in their *prose* and the markers those produce are the
+/// scrub working as intended.
+#[test]
+fn an_ordinary_harness_label_is_unchanged_by_the_scrub() {
+    let base = spawn_archive(three_lane_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let cache = directory.path().join("qanungo");
+
+    for lane in ["report", "cost"] {
+        let rendered = document(lane, &base, &cache);
+        assert!(
+            !rendered.contains("[REDACTED:"),
+            "`{lane}` scrubbed something in a window of ordinary labels: {rendered}",
+        );
+        assert!(
+            !rendered.contains(qanungo::format::INVALID_IDENTIFIER),
+            "`{lane}` clamped something in a window of ordinary labels: {rendered}",
+        );
+        assert!(rendered.contains("claude-code"), "`{lane}`: {rendered}");
+    }
+
+    // The one lane with a gap to name here: the copilot session carries no `summary.md`.
+    let standup = document("standup", &base, &cache);
+    assert!(
+        standup.contains("copilot-cli: no snapshot of this session carries a `summary.md`"),
+        "the gap line names the harness the archive named: {standup}",
     );
 }

@@ -49,6 +49,22 @@
 //! held — the fields handed to [`CostReport`] and [`StandupReport`] are the ones the old bodies
 //! computed, in the same order, so both documents are byte-for-byte what they were.
 //!
+//! # The Gaps section's one archive-derived string
+//!
+//! Every other string `report` and `cost` put on a page is this build's own — an aggregate, a tool
+//! name the rule pack knows, a `source_hash`. The exception is the harness label on a Gaps line,
+//! which is whatever a snapshot manifest said its `source_agent` was. It therefore goes through
+//! [`evidence::identifier_field`] — clamp *then* scrub, in that order and for the reason that
+//! helper's own rustdoc argues — rather than through the clamp alone, so a credential-shaped label
+//! in a corrupted or adversarial listing leaves as a marker instead of as itself.
+//!
+//! That is the whole reason [`fold_coaching`] and [`fold_cost`] take a [`Redactor`] at all: neither
+//! computes anything else a redactor touches. The dashboard hands them its launch-time one. The CLI
+//! lanes build [`Redactor::new`] internally, and there is deliberately no `--no-redact` on `report`
+//! or `cost` to turn it back off — those two documents render aggregates and hashes by design, so a
+//! harness label is not content anybody asked to see raw, and a flag whose only effect would be to
+//! leak one is not worth offering. The CLI's gap labels are scrubbed unconditionally.
+//!
 //! The standup seam carries one extra property the other two do not need. [`Standup::fold`] scrubs
 //! **on the way in**, so [`FoldedStandup`] holds no pre-scrub string at all: [`ReadSummary`] — the
 //! parsed, unscrubbed record — is a local of [`fold_standup`] and is dropped before it returns.
@@ -67,7 +83,7 @@ use crate::cache::BlobCache;
 use crate::cli::{ArchiveArgs, CostArgs, ReportArgs, StandupArgs, Window};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
-use crate::format;
+use crate::evidence;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
 use crate::redaction::Redactor;
@@ -121,11 +137,18 @@ pub struct Folded {
 
 /// Runs the coaching lane's `sync → fold → evaluate` over the window pair.
 ///
+/// The `redactor` scrubs exactly one thing: the harness label on a gap line, which is the only
+/// archive-stated string this fold's output carries. Nothing else here is text anybody wrote.
+///
 /// # Errors
 ///
 /// Returns an error when the cache is unusable or the archive window cannot be listed. A single
 /// unreadable session is a reported gap, not a failure.
-pub fn fold_coaching(archive: &ArchiveArgs, window: &Window) -> Result<Folded, CommandError> {
+pub fn fold_coaching(
+    archive: &ArchiveArgs,
+    window: &Window,
+    redactor: &Redactor,
+) -> Result<Folded, CommandError> {
     let prepared = Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowPair)?;
 
     let fold_started = Instant::now();
@@ -166,7 +189,7 @@ pub fn fold_coaching(archive: &ArchiveArgs, window: &Window) -> Result<Folded, C
     Ok(Folded {
         generated_at: prepared.generated_at,
         compared: prepared.comparison_opens_at.is_some(),
-        skipped: summarize(&skipped, placed.unplaceable),
+        skipped: summarize(&skipped, placed.unplaceable, redactor),
         sessions,
         previous,
         findings,
@@ -176,12 +199,17 @@ pub fn fold_coaching(archive: &ArchiveArgs, window: &Window) -> Result<Folded, C
 
 /// Runs `qanungo report`, writing Markdown to `out`.
 ///
+/// The redactor is built here rather than taken from a flag: `report` exposes no `RedactionArgs`,
+/// because the document renders aggregates and hashes and the one archive-stated string in it — a
+/// gap line's harness label — is not content a reader asked to see raw. Scrubbing it is therefore
+/// unconditional, and there is nothing to turn off.
+///
 /// # Errors
 ///
 /// Returns an error when the cache is unusable, the archive window cannot be listed, or the
 /// report cannot be written. A single unreadable session is a reported gap, not a failure.
 pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let folded = fold_coaching(&args.archive, &args.last)?;
+    let folded = fold_coaching(&args.archive, &args.last, &Redactor::new())?;
     let markdown = Report {
         window: &args.last,
         generated_at: folded.generated_at,
@@ -223,11 +251,18 @@ pub struct FoldedCost {
 /// deduplicated by message id, and [`CostTotals`] prices the result as of each session's own
 /// archive time.
 ///
+/// The `redactor` is here for the same one string [`fold_coaching`]'s is: a gap line's harness
+/// label. A priced window is otherwise arithmetic and model ids.
+///
 /// # Errors
 ///
 /// Returns an error when the cache is unusable or the archive window cannot be listed. A single
 /// unreadable session is a reported gap, not a failure.
-pub fn fold_cost(archive: &ArchiveArgs, window: &Window) -> Result<FoldedCost, CommandError> {
+pub fn fold_cost(
+    archive: &ArchiveArgs,
+    window: &Window,
+    redactor: &Redactor,
+) -> Result<FoldedCost, CommandError> {
     let prepared = Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowPair)?;
 
     let fold_started = Instant::now();
@@ -273,19 +308,22 @@ pub fn fold_cost(archive: &ArchiveArgs, window: &Window) -> Result<FoldedCost, C
         generated_at: prepared.generated_at,
         totals,
         previous: earlier,
-        skipped: summarize(&skipped, placed.unplaceable),
+        skipped: summarize(&skipped, placed.unplaceable, redactor),
         instrumentation,
     })
 }
 
 /// Runs `qanungo cost`, writing Markdown to `out`.
 ///
+/// Its redactor is built the same way [`report`]'s is, and for the same reason: this lane has no
+/// `--no-redact` either, and a gap line's harness label is scrubbed whatever the operator typed.
+///
 /// # Errors
 ///
 /// Returns an error on the same three conditions [`report`] does, and for the same reason: a
 /// single unreadable session is a gap the document states, never a failed run.
 pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let folded = fold_cost(&args.archive, &args.last)?;
+    let folded = fold_cost(&args.archive, &args.last, &Redactor::new())?;
     let markdown = CostReport {
         window: &args.last,
         generated_at: folded.generated_at,
@@ -586,15 +624,28 @@ impl<'a> Placement<'a> {
 ///
 /// The harness label is the archive's string, not this build's — a snapshot manifest states
 /// whatever `session.source_agent` it likes, and an unrecognized one is precisely the case that
-/// reaches [`SkipReason::UnknownAgent`] — so it goes through [`format::identifier`] before it is
-/// interpolated. Both lanes print these lines verbatim in their Gaps section, so clamping here
-/// rather than at either rendering site is what keeps the two from drifting apart, and is why the
-/// coaching report's own claim to render "aggregates, tool names, and `source_hash` references"
-/// survives contact with a hostile archive.
-fn summarize(skipped: &[Skip], unplaceable: usize) -> Vec<SkippedNote> {
+/// reaches [`SkipReason::UnknownAgent`] — so it goes through [`evidence::identifier_field`], which
+/// clamps it and *then* scrubs it, before it is interpolated. Both lanes print these lines verbatim
+/// in their Gaps section, so treating the label here rather than at either rendering site is what
+/// keeps the two from drifting apart, and is why the coaching report's own claim to render
+/// "aggregates, tool names, and `source_hash` references" survives contact with a hostile archive.
+///
+/// The clamp alone was not enough. It refuses a label that could break the line's *shape* — a pipe,
+/// a backtick, a newline, anything over the identifier ceiling — but a credential is shaped exactly
+/// like an ordinary identifier, so a `source_agent` holding one would have rendered raw in all
+/// three documents and in the dashboard's `provenance.gaps`. Clamping first is still what keeps an
+/// over-length token from laundering itself into a renderable marker; see
+/// [`evidence::identifier_field`] for the ordering argument in full.
+///
+/// The rest of the sentence is this build's own text: a logical path from [`Artifact`], a fixed
+/// clause, or the locally generated error prose a [`SkipReason::Unreadable`] carries — paths, URLs,
+/// and transport failures, never transcript content, and with every archive-stated value inside it
+/// (Patwari's `error.code`, a compression header, a content digest) already clamped where it was
+/// parsed.
+fn summarize(skipped: &[Skip], unplaceable: usize, redactor: &Redactor) -> Vec<SkippedNote> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for skip in skipped {
-        let agent = format::identifier(&skip.source_agent);
+        let agent = evidence::identifier_field(&skip.source_agent, redactor);
         let reason = match &skip.reason {
             SkipReason::MissingArtifact(artifact) => {
                 format!(
@@ -604,7 +655,7 @@ fn summarize(skipped: &[Skip], unplaceable: usize) -> Vec<SkippedNote> {
             }
             SkipReason::UnknownAgent(named) => format!(
                 "{}: no interpreter for this harness in this build",
-                format::identifier(named),
+                evidence::identifier_field(named, redactor),
             ),
             SkipReason::Unreadable(detail) => format!("{agent}: {detail}"),
         };
@@ -627,6 +678,13 @@ fn summarize(skipped: &[Skip], unplaceable: usize) -> Vec<SkippedNote> {
 mod tests {
     use super::*;
 
+    use crate::format;
+
+    /// A GitHub token's shape — `ghp_` and exactly 36 base62 characters — and not a real one.
+    /// Well inside [`format::MAX_IDENTIFIER_CHARS`] and carrying nothing the clamp refuses, which
+    /// is the whole point: it is exactly as renderable as `claude-code` is.
+    const TOKEN_SHAPED: &str = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+
     #[test]
     fn skips_are_grouped_by_reason() {
         let skips = vec![
@@ -643,7 +701,7 @@ mod tests {
                 reason: SkipReason::UnknownAgent("future".to_owned()),
             },
         ];
-        let notes = summarize(&skips, 0);
+        let notes = summarize(&skips, 0, &Redactor::new());
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].count, 2);
         assert!(notes[0].reason.contains("no `transcript.jsonl` artifact"));
@@ -676,6 +734,7 @@ mod tests {
                 ),
             ],
             0,
+            &Redactor::new(),
         );
         let rendered = notes
             .iter()
@@ -700,10 +759,97 @@ mod tests {
                 SkipReason::MissingArtifact(Artifact::Transcript),
             )],
             0,
+            &Redactor::new(),
         );
         assert_eq!(
             ordinary[0].reason,
             "claude-code: snapshot has no `transcript.jsonl` artifact",
+        );
+    }
+
+    /// The clamp's blind spot, and the reason this line takes a redactor at all.
+    ///
+    /// A credential is shaped exactly like a harness name — no pipe, no backtick, no control
+    /// character, far under the length ceiling — so [`format::identifier`] hands it straight back
+    /// and a listing whose `source_agent` holds one would print it, verbatim, in the Gaps section
+    /// of all three documents and in the dashboard's `provenance.gaps`.
+    ///
+    /// This test is the mutation guard for that: swap [`evidence::identifier_field`] back to
+    /// [`format::identifier`] and the token appears where the marker is asserted, so the assertion
+    /// below fails rather than the property quietly regressing.
+    #[test]
+    fn a_credential_shaped_harness_label_is_scrubbed_and_not_only_clamped() {
+        // The clamp on its own is the state this test exists to refuse: it is a no-op here.
+        assert_eq!(format::identifier(TOKEN_SHAPED), TOKEN_SHAPED);
+
+        let notes = summarize(
+            &[
+                Skip {
+                    source_agent: TOKEN_SHAPED.to_owned(),
+                    reason: SkipReason::MissingArtifact(Artifact::Transcript),
+                },
+                Skip {
+                    source_agent: TOKEN_SHAPED.to_owned(),
+                    reason: SkipReason::UnknownAgent(TOKEN_SHAPED.to_owned()),
+                },
+                Skip {
+                    source_agent: TOKEN_SHAPED.to_owned(),
+                    reason: SkipReason::Unreadable("cache read failed".to_owned()),
+                },
+            ],
+            0,
+            &Redactor::new(),
+        );
+        assert_eq!(notes.len(), 3, "one line per reason");
+        for note in &notes {
+            assert!(
+                !note.reason.contains(TOKEN_SHAPED),
+                "the token survived: {}",
+                note.reason,
+            );
+            assert!(
+                note.reason.starts_with("[REDACTED:github-token]: "),
+                "the label is a marker: {}",
+                note.reason,
+            );
+        }
+    }
+
+    /// Why the clamp runs *first*, pinned rather than only argued.
+    ///
+    /// An over-length label is not a renderable identifier whatever it turns out to contain, so it
+    /// is replaced wholesale. Scrubbing first would let this one launder itself: two markers and a
+    /// space is 47 characters, comfortably renderable, and the clamp would then wave through a
+    /// value it exists to refuse.
+    #[test]
+    fn an_over_length_credential_shaped_label_still_clamps() {
+        let over_length = format!("{TOKEN_SHAPED} {TOKEN_SHAPED}");
+        assert!(over_length.chars().count() > format::MAX_IDENTIFIER_CHARS);
+
+        let notes = summarize(
+            &[Skip {
+                source_agent: over_length,
+                reason: SkipReason::MissingArtifact(Artifact::Transcript),
+            }],
+            0,
+            &Redactor::new(),
+        );
+        assert_eq!(
+            notes[0].reason,
+            format!(
+                "{}: snapshot has no `transcript.jsonl` artifact",
+                format::INVALID_IDENTIFIER
+            ),
+        );
+        assert!(
+            !notes[0].reason.contains("[REDACTED:"),
+            "{}",
+            notes[0].reason
+        );
+        assert!(
+            !notes[0].reason.contains(TOKEN_SHAPED),
+            "{}",
+            notes[0].reason
         );
     }
 
@@ -764,7 +910,7 @@ mod tests {
     /// A session the archive dated unreadably is named in the report's Gaps rather than dropped.
     #[test]
     fn unplaceable_sessions_become_a_gap_line() {
-        let notes = summarize(&[], 3);
+        let notes = summarize(&[], 3, &Redactor::new());
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].count, 3);
         assert!(notes[0].reason.contains("could not place in either window"));
