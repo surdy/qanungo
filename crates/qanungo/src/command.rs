@@ -488,6 +488,10 @@ fn fold_one(cache: &BlobCache, mirrored: &MirroredSession) -> Result<SessionMetr
     Ok(SessionMetrics {
         source_hash: mirrored.source_hash.clone(),
         source_agent: mirrored.source_agent.clone(),
+        // The listing's own projection, carried the way the cost lane already carries it, so a
+        // presentation can cut the window by repository without a second fold. Nothing below reads
+        // it: no rule, no score, no pack entry, no Markdown cell.
+        repository: mirrored.repository.clone(),
         // Carried, not re-derived: the excerpt route reads the anchored event back with the same
         // interpreter this fold used, and the snapshot is what states which contract that is.
         artifact_set_version: mirrored.artifact_set_version,

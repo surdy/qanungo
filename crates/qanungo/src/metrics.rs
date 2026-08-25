@@ -861,6 +861,20 @@ pub struct SessionMetrics {
     pub source_hash: String,
     /// The harness that produced the transcript (`claude-code`, `copilot-cli`, `codex-cli`).
     pub source_agent: String,
+    /// The repository the *archive* recorded for the snapshot this session was listed by, when it
+    /// recorded one. `None` for a session captured outside a checkout — a real state, not a defect,
+    /// and the same one [`SessionCost::repository`](crate::cost::SessionCost) already carries.
+    ///
+    /// **Nothing scores it and no rule reads it.** It is here so a *presentation* can group the
+    /// per-session facts a fold already produced — the dashboard's repository scopes (qanungo #5) —
+    /// without re-folding a transcript to find out where the work happened. Carrying it changes no
+    /// number: the rule pack does not stamp it, `Scorecard` does not group by it, and the Markdown
+    /// report renders it nowhere.
+    ///
+    /// This is Patwari's *projection* (the repository on the session's latest snapshot), which is a
+    /// different fact from the repository a session's own `summary.md` names — see
+    /// [`crate::standup`], which groups by the latter.
+    pub repository: Option<String>,
     /// The artifact-set contract the snapshot declared, carried so an anchored event can be read
     /// back out of the cached blob with the same interpreter the fold used. Nothing scores it.
     pub artifact_set_version: u16,
@@ -1318,6 +1332,7 @@ mod tests {
         SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
+            repository: None,
             artifact_set_version: 2,
             summary: fold.summary,
             tools: fold.tools,
@@ -1769,6 +1784,7 @@ mod tests {
         let day = |date: &str, span_minutes: i64, gaps: &[i64]| SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
+            repository: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(at(date)),
@@ -1865,6 +1881,7 @@ mod tests {
         let session = SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
+            repository: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(start),

@@ -819,6 +819,7 @@ mod tests {
         SessionMetrics {
             source_hash: "ab".repeat(32),
             source_agent: "claude-code".to_owned(),
+            repository: None,
             artifact_set_version: 2,
             anchors: SessionAnchors::default(),
             summary: SessionSummary {
@@ -904,6 +905,7 @@ mod tests {
                 SessionMetrics {
                     source_hash: format!("{index:02x}").repeat(32),
                     source_agent: "claude-code".to_owned(),
+                    repository: None,
                     artifact_set_version: 2,
                     anchors: SessionAnchors::default(),
                     summary: SessionSummary {

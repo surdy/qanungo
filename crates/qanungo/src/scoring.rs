@@ -668,12 +668,31 @@ impl Scorecard {
     ///
     /// Grouping is by `source_agent` and nothing else: harness-relative first, per qanungo #4.
     pub fn fold(sessions: &[SessionMetrics]) -> Self {
+        let borrowed: Vec<&SessionMetrics> = sessions.iter().collect();
+        Self::fold_refs(&borrowed)
+    }
+
+    /// The same fold over a **selection** of a window's sessions.
+    ///
+    /// The dashboard's repository scopes (qanungo #5) are exactly this: the sessions a fold already
+    /// produced, grouped a second way and scored by the same arithmetic. A borrowing entry point
+    /// rather than a second implementation, on purpose — a scope whose scores came out of a
+    /// parallel formula would drift from the all/all numbers beside it the first time either
+    /// changed, and "the page disagrees with itself depending on a dropdown" is not a bug anybody
+    /// can act on. [`Self::fold`] is this function over everything.
+    ///
+    /// A selection changes no rule. A scope's fire-rate denominators are still the rules' own
+    /// eligibility over the sessions in it, [`constants::MIN_SCORED_SESSIONS`] still applies, and a
+    /// scope too small to read scores nothing rather than a phantom number. The fleet blend inside
+    /// a scope is the unweighted mean over **the harnesses present in that scope**, under the same
+    /// roster rule — see [`Self::fleet`].
+    pub fn fold_refs(sessions: &[&SessionMetrics]) -> Self {
         let mut by_agent: BTreeMap<&str, Vec<&SessionMetrics>> = BTreeMap::new();
         for session in sessions {
             by_agent
                 .entry(session.source_agent.as_str())
                 .or_default()
-                .push(session);
+                .push(*session);
         }
         Self {
             harnesses: by_agent
@@ -917,6 +936,7 @@ mod tests {
         SessionMetrics {
             source_hash: "0".repeat(64),
             source_agent: source_agent.to_owned(),
+            repository: None,
             artifact_set_version: 2,
             anchors: SessionAnchors::default(),
             summary: SessionSummary {

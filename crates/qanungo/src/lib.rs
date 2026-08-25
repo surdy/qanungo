@@ -171,8 +171,15 @@
 //! - **Copilot's honesty rule rides the wire.** Copilot rows are token volumes with no money-shaped
 //!   field anywhere and no blended total: a page cannot render a dollar figure it was never handed.
 //!
-//! What remains: scope selection by repository and harness, the timeline, and the heatmap — the
-//! last still blocked on munshi#77's local-offset pull.
+//! - **Scopes are the same fold, selected.** A repository scope is the sessions the coaching fold
+//!   already produced, grouped by the archive's own projection and handed back to
+//!   [`scoring::Scorecard::fold_refs`] — never re-folded, never re-scored by a second formula. The
+//!   harness axis needs no payload dimension of its own, because the scorecard is already per
+//!   harness; the page's harness control reads a number rather than computing one. See
+//!   [`scopes`].
+//!
+//! What remains: per-device scope (waiting on a hostname to accrue in the archive), the timeline,
+//! and the heatmap — the last still blocked on munshi#77's local-offset pull.
 
 pub mod cache;
 pub mod cli;
@@ -190,6 +197,7 @@ pub mod pricing;
 pub mod redaction;
 pub mod report;
 pub mod rules;
+pub mod scopes;
 pub mod scoring;
 pub mod standup;
 pub mod standup_report;

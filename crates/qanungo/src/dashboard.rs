@@ -1097,6 +1097,7 @@ mod tests {
                 SessionMetrics {
                     source_hash: format!("{index:02x}").repeat(32),
                     source_agent: source_agent.to_owned(),
+                    repository: None,
                     artifact_set_version: 2,
                     summary: SessionSummary {
                         user_requests: 4,
