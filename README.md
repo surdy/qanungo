@@ -179,8 +179,18 @@ until the footer's fold-cost and rule-firing data say otherwise. The prices in
 `crates/qanungo/src/pricing.rs` are the opposite kind of number: not a knob at all, but a sourced
 figure with a date, changed only by adding a row.
 
+The dashboard also carries a **scope control**: one select for the repository the archive listed a
+session under, one for the harness, narrowing the scores, the findings, and — for a repository —
+the bill and the narrative together. Every scope is folded server-side and shipped with the payload
+(there is no query string on that route, and a scope is never a per-request fold), so switching one
+re-renders what the browser already holds. A scope's lanes are the same arithmetic over fewer
+sessions: its fleet blend is the unweighted mean over the harnesses present *in that scope*, a
+scope too small to read scores nothing rather than a phantom number, and the all/all view is the
+whole-window payload unchanged.
+
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
-dashboard's own remaining slices — scope selection by repository and harness, the timeline, and the
-heatmap once munshi#77 types the capture machine's local offset. Full research + rationale:
+dashboard's own remaining slices — per-*device* scope once a hostname has accrued in the archive,
+the timeline, and the heatmap once munshi#77 types the capture machine's local offset. Full
+research + rationale:
 `~/repos/research/ai-coach/`. See
 issues for the phased plan.

@@ -110,11 +110,50 @@
 //! goes there, the answer is still not a split — it is that a served narrative of 400 sessions is
 //! not a thing anybody reads, and the section should bound what it renders and say that it did.
 //!
+//! ## What the scope slice added, measured
+//!
+//! Re-measured against production on 2026-08-25 with the scopes in: **1,095,731 B (1070.0 KiB)**
+//! against **969,498 B (946.8 KiB)** for the same window without them — **+123.3 KiB, +13.0%**,
+//! of which the `scopes` section is 105.5 KiB (9.9% of the body) and the two evidence tags are
+//! 17.8 KiB across 333 citations. The window was 705 sessions in **28 repositories** across two
+//! harnesses.
+//!
+//! What that cost buys is worth stating plainly, because 10% is not nothing. It is 28 pre-folded
+//! scopes served to every reader, of which one reader will look at one — but the alternative is a
+//! per-request fold, which is the thing this design refuses for reasons that are not about bytes
+//! (see below). It also **scales with repositories, not with sessions or with prose**: the section
+//! is one cell per (repository × lane × harness-or-fleet) and each cell is a score, a trend, and
+//! the component lines that explain it — about 650 B on production. Doubling the archive's history
+//! does not move it; working in twice as many repositories does.
+//!
+//! The one trim available and not taken is the component `detail` sentences, which are
+//! most of those bytes. They stay because a score with no reading beside it is a number a reader
+//! cannot check, and the whole argument for scopes is that a reader can ask a narrower question and
+//! still see what answered it.
+//!
+//! # Scopes, and the rule they do not bend
+//!
+//! [`Payload::scopes_section`] adds every repository scope to the same document: one pre-folded
+//! entry per repository, each carrying the five lanes and what fired inside it. The numbers are
+//! [`crate::scopes`]'s selection of this fold handed back to [`Scorecard::fold_refs`] — never a
+//! second formula, and never a second fold of a transcript.
+//!
+//! Two properties are worth naming here because they are what a reviewer should check. The
+//! **all/all scope is the top-level section**, unchanged and unduplicated: a scope control that
+//! moved the whole-window numbers would be a payload change wearing a feature. And **no scope is a
+//! function of the request** — there is no query string on this route and there will not be one,
+//! because a served document that varied by who asked could show two readers different numbers
+//! under the same generation stamp, and because it would put a fold behind a request an
+//! unauthenticated peer controls.
+//!
 //! # What this slice leaves out
 //!
-//! Scope selection by repository and harness, the timeline, and the 7×24 heatmap — the last blocked
-//! on munshi#77's local-offset pull, because UTC misplaces every late-night claim the view exists to
-//! make. Each is a later slice over this same payload, not a change to it.
+//! Per-**device** scope, the timeline, and the 7×24 heatmap. Per-device waits on a hostname to
+//! accrue in the archive — the capture side shipped on 2026-08-25, so the field exists and the
+//! history does not, and a control whose only option is "the machine I deployed from" is a control
+//! that says nothing. The heatmap is blocked on munshi#77's local-offset pull, because UTC
+//! misplaces every late-night claim the view exists to make. Each is a later slice over this same
+//! payload, not a change to it.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -132,8 +171,9 @@ use crate::pricing::PRICE_TABLE_REVISION;
 use crate::redaction::{PATTERN_REVISION, RedactionReport, Redactor};
 use crate::report::{self, SkippedNote, stamp};
 use crate::rules::Finding;
+use crate::scopes::{self, RepositoryScope};
 use crate::scoring::{Lane, LaneScore, Scorecard, Trend};
-use crate::standup::{RolledUp, StandupSession};
+use crate::standup::{NO_REPOSITORY, RolledUp, StandupSession};
 
 /// What the refresh loop knows and the fold does not: which run this is, when it landed, and
 /// whether the last attempt to take a new one failed.
@@ -250,18 +290,26 @@ impl Payload<'_> {
     /// every reader of the V1 payload to buy a shape nobody reads twice, and the duplication that
     /// would keep both working is a second copy of the largest section in the document.
     pub fn build(&self) -> Value {
-        let mut document = self.coaching_section();
+        // One pass over the fold's per-session facts, shared by the two sections that need them:
+        // the findings, which tag each cited session so the page can narrow a list it already has,
+        // and the scopes, which group the same sessions to score them. Built once because a tag and
+        // a group key that were computed twice are two things that can disagree, and the whole
+        // point of a scope control is that the tag on a row and the scope it belongs to are the
+        // same statement.
+        let tags = self.scope_tags();
+        let mut document = self.coaching_section(&tags);
         let fields = document
             .as_object_mut()
             .expect("the coaching section is an object");
         fields.insert("cost".to_owned(), self.cost_section());
         fields.insert("standup".to_owned(), self.standup_section());
+        fields.insert("scopes".to_owned(), self.scopes_section(&tags));
         fields.insert("provenance".to_owned(), self.provenance());
         document
     }
 
     /// The coaching lane: the window pair, the five lanes, and the findings under them.
-    fn coaching_section(&self) -> Value {
+    fn coaching_section(&self, tags: &ScopeTags) -> Value {
         let window = &self.windows.coaching;
         let folded = self.coaching;
         // The same two questions the report asks in the same order: is there a comparison window at
@@ -296,7 +344,7 @@ impl Payload<'_> {
             "findings": folded
                 .findings
                 .iter()
-                .map(|finding| finding_value(finding, &by_hash, self.redactor))
+                .map(|finding| finding_value(finding, &by_hash, tags, self.redactor))
                 .collect::<Vec<_>>(),
         })
     }
@@ -425,6 +473,150 @@ impl Payload<'_> {
             "redaction": redaction_value(&standup.redaction),
         })
     }
+
+    /// The scope control's whole vocabulary, and every number a scope selection can put on screen.
+    ///
+    /// # Why the payload carries every scope
+    ///
+    /// **Query strings decide nothing on this surface.** There is no `?repository=` here and there
+    /// will not be one: a per-request knob would make the served document a function of who asked,
+    /// which is how a page comes to show two readers different numbers under the same generation
+    /// stamp, and it would put a fold behind a request a peer on an unauthenticated tailnet
+    /// controls. The scopes are pre-folded per view, exactly as the grilling decided drill-down
+    /// slices would be, and the cost of that is one small section on a payload that is already
+    /// dominated by narrative prose. See the module docs for the measurement.
+    ///
+    /// # One dimension, not two
+    ///
+    /// A scope reads as a pair — repository × harness — and is serialized as one axis, because the
+    /// other is already folded: each scope's `lanes` carry the per-harness split
+    /// [`Scorecard::fold_refs`] produces, so the harness-filtered scope *is* a column that is
+    /// already here and the all-harnesses one *is* the fleet blend beside it. Writing the cross
+    /// product out would be writing the same numbers twice. See [`crate::scopes`].
+    ///
+    /// Every scope's `lanes` array is built over the **same** harness columns as the top-level one,
+    /// so a harness keeps its position in every scope and the page's control is one index
+    /// everywhere. A harness with no session in a scope renders `no-sessions` there — the state
+    /// [`report::harness_columns`] takes the union to be able to state at all.
+    fn scopes_section(&self, tags: &ScopeTags) -> Value {
+        let folded = self.coaching;
+        // The same two questions, and therefore the same answer, as the whole-window section: no
+        // comparison window, no arrow anywhere — including inside a scope.
+        let compared = folded.compared;
+        let now_all = Scorecard::fold(&folded.sessions);
+        let before_all = compared.then(|| Scorecard::fold(&folded.previous));
+        let columns = report::harness_columns(&now_all, before_all.as_ref());
+
+        let scopes = scopes::by_repository(folded, self.redactor, self.foreign_labels());
+        json!({
+            // The bucket a session with no repository lands in, named once so the page can match
+            // the cost lane's `null` row and the standup lane's own heading against it rather than
+            // spelling the sentence a second time in JavaScript.
+            "unattributed": NO_REPOSITORY,
+            "harnesses": columns
+                .iter()
+                .map(|column| format::identifier(column))
+                .collect::<Vec<_>>(),
+            "repositories": scopes
+                .iter()
+                .map(|scope| scope_value(scope, compared, &columns, &folded.findings, tags))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Repository labels the *other* two sections put on the page, each already rendered by the
+    /// lane that owns it.
+    ///
+    /// They join the scope list so the control can narrow everything the page shows. It has to be
+    /// the other lanes' own strings rather than a re-rendering of the archive's: the cost table's
+    /// cells and the standup's headings are what a reader is comparing the control against, and a
+    /// scope that spelled the same repository differently would be an option that narrowed nothing.
+    ///
+    /// The three lanes agree on every ordinary repository name, and the windows are what actually
+    /// differ — the bill covers a quarter and the narrative a week, so both hold repositories a
+    /// 30-day coaching window does not. Where the *renderings* could differ is a repository name
+    /// that is not shaped like one (the cost lane clamps without scrubbing, the standup lane scrubs
+    /// before it clamps, and [`crate::scopes`] clamps before it scrubs), and such a name would
+    /// simply appear as more than one option, each narrowing the section that spelled it that way.
+    /// Nothing unrendered reaches the wire on any of the three paths, which is the property that
+    /// matters; `tests/dashboard.rs` pins the agreement on ordinary names.
+    fn foreign_labels(&self) -> Vec<String> {
+        let cost = self.cost.totals.by_repository.keys().map(|repository| {
+            repository
+                .as_deref()
+                .map_or_else(|| NO_REPOSITORY.to_owned(), format::identifier)
+        });
+        let standup = self
+            .standup
+            .standup
+            .repositories
+            .iter()
+            .map(|group| group.repository.clone());
+        cost.chain(standup).collect()
+    }
+}
+
+/// One repository scope: what it holds, what it scores, and what fired inside it.
+fn scope_value(
+    scope: &RepositoryScope<'_>,
+    compared: bool,
+    columns: &[String],
+    findings: &[Finding],
+    tags: &ScopeTags,
+) -> Value {
+    let now = Scorecard::fold_refs(&scope.sessions);
+    let before = compared.then(|| Scorecard::fold_refs(&scope.previous));
+    json!({
+        "repository": scope.label,
+        "attributed": scope.attributed,
+        "sessions": {
+            "folded": scope.sessions.len(),
+            "comparison_folded": scope.previous.len(),
+            "by_harness": scope.by_harness(),
+        },
+        "lanes": Lane::ALL
+            .iter()
+            .map(|lane| lane_value(*lane, &now, before.as_ref(), columns))
+            .collect::<Vec<_>>(),
+        "findings": scope_findings_value(scope, findings, tags),
+    })
+}
+
+/// What each rule fired on inside one scope, per harness.
+///
+/// Every rule that fired **anywhere in the window** gets a row here, including the ones that fired
+/// nowhere in this scope: a zero is a reading and a missing key is not, and a page that hid the
+/// difference could not tell "this repository is clean of that habit" from "this build forgot to
+/// count it". The counts are counts of *cited sessions* — the evidence the finding already carries
+/// — which is the same set the page narrows, so the number under a heading and the rows under it
+/// can be checked against each other by anybody with the payload open.
+fn scope_findings_value(
+    scope: &RepositoryScope<'_>,
+    findings: &[Finding],
+    tags: &ScopeTags,
+) -> Value {
+    findings
+        .iter()
+        .map(|finding| {
+            let mut by_harness: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut total = 0_usize;
+            for evidence in &finding.evidence {
+                let Some(tag) = tags.get(evidence.source_hash.as_str()) else {
+                    continue;
+                };
+                if tag.repository != scope.label {
+                    continue;
+                }
+                total += 1;
+                *by_harness.entry(tag.harness.as_str()).or_default() += 1;
+            }
+            json!({
+                "rule": finding.rule.key(),
+                "sessions_affected": total,
+                "by_harness": by_harness,
+            })
+        })
+        .collect()
 }
 
 /// The window's bill: the headline, and the sample behind it.
@@ -798,9 +990,52 @@ fn trend_value(trend: Option<Trend>) -> Value {
 /// ([`crate::rules::RuleId::evidence_kind`]), and the page renders it rather than deciding for
 /// itself: anchors for a rule that counted events, timestamps and counts for one that measured a
 /// shape, and both for fire-and-forget, which did each in a different component.
+/// Which scope each folded session belongs to, by `source_hash`: the rendered repository label and
+/// the rendered harness label, and nothing else.
+///
+/// The **same two strings** the scopes section groups by and the lane columns are keyed on, so the
+/// page can narrow a finding list it already holds by comparing labels rather than by recomputing
+/// anything. That equality is the contract: a tag is a claim about which scope's numbers a row is
+/// counted in, and it is pinned by a test that reconciles the tags against the per-scope fire
+/// counts serialized beside them.
+type ScopeTags = BTreeMap<String, ScopeTag>;
+
+/// One session's scope membership, as the wire spells it.
+struct ScopeTag {
+    repository: String,
+    harness: String,
+}
+
+impl Payload<'_> {
+    /// Tags every session of the reported coaching window.
+    ///
+    /// The comparison window is deliberately not in here. Nothing on the page cites a comparison
+    /// session — it exists to produce an earlier score and nothing else — and a tag for a row that
+    /// cannot be rendered would be an index into a list that does not exist.
+    fn scope_tags(&self) -> ScopeTags {
+        self.coaching
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.source_hash.clone(),
+                    ScopeTag {
+                        repository: scopes::repository_label(
+                            session.repository.as_deref(),
+                            self.redactor,
+                        ),
+                        harness: format::identifier(&session.source_agent),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 fn finding_value(
     finding: &Finding,
     by_hash: &BTreeMap<&str, &SessionMetrics>,
+    tags: &ScopeTags,
     redactor: &Redactor,
 ) -> Value {
     let kind = finding.rule.evidence_kind();
@@ -821,6 +1056,16 @@ fn finding_value(
             .iter()
             .map(|evidence| json!({
                 "source_hash": evidence.source_hash,
+                // Which scope this cited session is in, so the page can narrow the list without a
+                // second request and without any scoring of its own. Identifiers, not content:
+                // the repository the archive projected onto the session's snapshot and the harness
+                // label, each rendered exactly as the scopes section renders it.
+                "repository": tags
+                    .get(evidence.source_hash.as_str())
+                    .map(|tag| tag.repository.clone()),
+                "harness": tags
+                    .get(evidence.source_hash.as_str())
+                    .map(|tag| tag.harness.clone()),
                 "anchors": if kind.anchors() {
                     evidence
                         .anchors

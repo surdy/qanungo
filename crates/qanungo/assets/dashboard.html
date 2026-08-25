@@ -82,6 +82,43 @@ p { margin: 0 0 0.5rem; }
 }
 .banner.shown { display: block; }
 
+/* The scope control. Two selects and a sentence saying what they narrow — small,
+   because it is a lens on the page and not a section of it. */
+.scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  margin: 0 0 0.5rem;
+  padding: 0.7rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.scope-field { display: flex; align-items: center; gap: 0.5rem; }
+.scope-field label { font-size: 0.85rem; font-weight: 600; color: var(--ink-2); }
+.scope select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--ink);
+  background: var(--plane);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.5rem;
+  max-width: min(100%, 26rem);
+}
+.scope-reset {
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--ink-2);
+  background: var(--plane);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+.scope-note { margin: 0 0 1.5rem; font-size: 0.82rem; color: var(--ink-muted); max-width: 100ch; }
+
 /* Five tiles. auto-fit rather than a fixed count: one column on a phone, five
    across a TV, and nothing reflows into a half-empty row in between. */
 .tiles {
@@ -336,6 +373,19 @@ footer .archive { overflow-wrap: anywhere; }
   <p class="sub" id="subtitle">Loading the fold…</p>
   <div class="banner" id="banner"></div>
 
+  <div class="scope" id="scope">
+    <div class="scope-field">
+      <label for="scope-repository">Repository</label>
+      <select id="scope-repository"></select>
+    </div>
+    <div class="scope-field">
+      <label for="scope-harness">Harness</label>
+      <select id="scope-harness"></select>
+    </div>
+    <button type="button" class="scope-reset" id="scope-reset">Whole window</button>
+  </div>
+  <p class="scope-note" id="scope-note"></p>
+
   <section aria-labelledby="lanes-heading">
     <h2 id="lanes-heading">Five lanes</h2>
     <div class="tiles" id="tiles"></div>
@@ -382,6 +432,48 @@ const el = (tag, className, text) => {
 
 let generation = null;
 
+/*
+ * The scope. Two labels, each null for "everything" — never an index, because the
+ * payload's repository order is busiest-first and a refresh may reorder it, and a
+ * remembered position would silently become a different repository.
+ *
+ * Every number a scope shows was computed in Rust. Selecting a repository picks a
+ * pre-folded scope out of the payload; selecting a harness picks a column out of that
+ * scope, which is a number that is already there because the scorecard is folded per
+ * harness. Nothing here averages, weights, or re-scores anything: this file narrows
+ * lists and reads fields.
+ */
+const SCOPE_KEY = "qanungo.scope";
+let current = null;
+let scope = { repository: null, harness: null };
+
+/* Remembering the scope is a convenience for one viewer in one browser, so every
+   access is guarded and every failure is silent: a private window, cleared site data,
+   or a browser configured to refuse storage must render the page exactly as a fresh
+   one does, which is with nothing selected. */
+function readRememberedScope() {
+  try {
+    const raw = window.localStorage.getItem(SCOPE_KEY);
+    if (!raw) return { repository: null, harness: null };
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return { repository: null, harness: null };
+    return {
+      repository: typeof parsed.repository === "string" ? parsed.repository : null,
+      harness: typeof parsed.harness === "string" ? parsed.harness : null,
+    };
+  } catch (error) {
+    return { repository: null, harness: null };
+  }
+}
+
+function rememberScope() {
+  try {
+    window.localStorage.setItem(SCOPE_KEY, JSON.stringify(scope));
+  } catch (error) {
+    /* Storage is unavailable or full. The page is already rendered correctly. */
+  }
+}
+
 function banner(message) {
   const node = document.getElementById("banner");
   node.textContent = message || "";
@@ -410,29 +502,43 @@ function scoreText(entry) {
   return "not scored";
 }
 
-function laneTile(lane) {
+/* One lane, in the scope the reader chose. `column` is an index into the lane's own
+   per-harness array, or -1 for the fleet blend — the payload already holds both, so
+   selecting a harness reads a number rather than computing one. */
+function laneTile(lane, column) {
   const tile = el("div", "tile");
   tile.appendChild(el("div", "tile-label", lane.title));
 
-  const fleet = lane.fleet;
-  const scored = fleet.state === "scored";
-  tile.appendChild(el("div", "tile-value" + (scored ? "" : " unscored"), scoreText(fleet)));
-  if (scored) tile.appendChild(deltaNode(fleet.trend));
+  const picked = column >= 0 ? lane.harnesses[column] : null;
+  const headline = picked || lane.fleet;
+  const scored = headline.state === "scored";
+  tile.appendChild(el("div", "tile-value" + (scored ? "" : " unscored"), scoreText(headline)));
+  if (scored) tile.appendChild(deltaNode(headline.trend));
 
-  const split = el("div", "split");
-  for (const harness of lane.harnesses) {
-    const row = el("div", "split-row");
-    row.appendChild(el("span", "split-name", harness.source_agent));
-    let right = scoreText(harness);
-    if (harness.state === "scored" && harness.trend) {
-      right += " " + harness.trend.glyph;
-      if (harness.trend.direction !== "flat") right += " " + harness.trend.points;
+  if (picked) {
+    tile.appendChild(
+      el(
+        "div",
+        "reason",
+        picked.source_agent + " · " + picked.sessions + " sessions in this scope"
+      )
+    );
+  } else {
+    const split = el("div", "split");
+    for (const harness of lane.harnesses) {
+      const row = el("div", "split-row");
+      row.appendChild(el("span", "split-name", harness.source_agent));
+      let right = scoreText(harness);
+      if (harness.state === "scored" && harness.trend) {
+        right += " " + harness.trend.glyph;
+        if (harness.trend.direction !== "flat") right += " " + harness.trend.points;
+      }
+      if (harness.sessions) right += " · " + harness.sessions + " sessions";
+      row.appendChild(el("span", "split-score", right));
+      split.appendChild(row);
     }
-    if (harness.sessions) right += " · " + harness.sessions + " sessions";
-    row.appendChild(el("span", "split-score", right));
-    split.appendChild(row);
+    if (lane.harnesses.length) tile.appendChild(split);
   }
-  if (lane.harnesses.length) tile.appendChild(split);
 
   // The sentence naming the pull that would light an unfed lane up is the whole content of
   // "not scored", so it belongs behind the same disclosure a score's readings do — otherwise
@@ -444,7 +550,7 @@ function laneTile(lane) {
     tile.appendChild(details);
   }
 
-  const readings = lane.harnesses.flatMap((harness) =>
+  const readings = (picked ? [picked] : lane.harnesses).flatMap((harness) =>
     (harness.components || []).map((component) => ({ harness, component }))
   );
   if (readings.length) {
@@ -625,14 +731,24 @@ const EVIDENCE_KIND = {
   mixed: "the events it anchored, and the shape it measured",
 };
 
-function findingCard(finding, folded) {
+/* Whether a cited session belongs to the chosen scope. The payload tags every
+   evidence row with the repository and harness labels the scopes section groups by,
+   so this is a comparison of two strings the server wrote — never a rule re-evaluated
+   here. */
+function citedInScope(evidence) {
+  if (scope.repository !== null && evidence.repository !== scope.repository) return false;
+  if (scope.harness !== null && evidence.harness !== scope.harness) return false;
+  return true;
+}
+
+function findingCard(finding, cited, folded) {
   const card = el("div", "finding");
   card.appendChild(el("h3", null, finding.title));
   card.appendChild(
     el(
       "div",
       "finding-count",
-      finding.sessions_affected + " of " + folded + " folded sessions · rule " + finding.rule
+      cited.length + " of " + folded + " folded sessions · rule " + finding.rule
     )
   );
   const list = el("dl");
@@ -642,19 +758,35 @@ function findingCard(finding, folded) {
   list.appendChild(el("dd", null, finding.action));
   card.appendChild(list);
 
+  /* The Problem and Action sentences are the rule's own, written by the fold over the
+     whole window — they are the CLI's wording and the page does not re-word them. Under
+     a scope that makes them a wider statement than the count above, and saying so is
+     cheaper than a reader deciding the two numbers in one card disagree. */
+  if (cited.length !== finding.sessions_affected) {
+    card.appendChild(
+      el(
+        "div",
+        "finding-count",
+        "The Problem and Action above are the whole window's wording, over all " +
+          finding.sessions_affected +
+          " sessions the rule fired on. The count and the evidence are this scope's."
+      )
+    );
+  }
+
   const details = el("details");
   details.appendChild(
     el(
       "summary",
       null,
       "Evidence — " +
-        finding.evidence.length +
+        cited.length +
         " sessions, showing " +
         (EVIDENCE_KIND[finding.evidence_kind] || "what the rule saw")
     )
   );
   const sessions = el("div", "sessions");
-  for (const evidence of finding.evidence) {
+  for (const evidence of cited) {
     sessions.appendChild(sessionRow(finding, evidence));
   }
   details.appendChild(sessions);
@@ -720,6 +852,71 @@ function costComparison(comparison, window) {
     comparison.opens_at +
     " (UTC). ▲ is more money, not a worse window.";
   return node;
+}
+
+/* The bill, cut to one repository.
+ *
+ * The `By repository` rows are the only cut of the bill the payload holds, so that is
+ * the only cut this page will show: a scoped view renders the repository's own row and
+ * says plainly which of the window-wide tables below it does not apply to. It does not
+ * apportion a model breakdown, a cache saving, or a window-over-window delta across
+ * repositories — none of those was computed per repository, and dividing them here
+ * would be this file inventing numbers, which is the one thing it does not do.
+ */
+function scopedCostSection(cost, repository, unattributed) {
+  const nodes = [];
+  const row = cost.by_repository.find(
+    (candidate) =>
+      (candidate.repository === null ? unattributed : candidate.repository) === repository
+  );
+  if (row) {
+    nodes.push(el("p", "headline", row.dollars_rendered));
+    nodes.push(
+      el(
+        "p",
+        "headline-sub",
+        "in " +
+          repository +
+          " — " +
+          row.messages +
+          " billed messages and " +
+          row.tokens.total.rendered +
+          " tokens, of the " +
+          cost.priced.dollars_rendered +
+          " this window priced in total, archived in the last " +
+          cost.window.last +
+          " since " +
+          cost.window.opens_at +
+          " (UTC)."
+      )
+    );
+  } else {
+    nodes.push(
+      el(
+        "p",
+        "empty",
+        "No session listed under " +
+          repository +
+          " in the last " +
+          cost.window.last +
+          " carried usage this build could price. The window as a whole priced " +
+          cost.priced.dollars_rendered +
+          "."
+      )
+    );
+  }
+  nodes.push(
+    el(
+      "p",
+      "note",
+      "The repository row above is the only cut of the bill this fold computed. The model " +
+        "breakdown, the cache saving, the window-over-window delta, the copilot volumes and the " +
+        "unpriced flags are all window-wide, so they are not shown under a repository rather than " +
+        "being divided into one — none of them was measured per repository, and apportioning them " +
+        "here would be a number nobody computed. Clear the scope to read them."
+    )
+  );
+  return nodes;
 }
 
 function costSection(cost) {
@@ -1006,6 +1203,82 @@ function rollup(heading, lines, note) {
   return nodes;
 }
 
+/* The narrative for one repository.
+ *
+ * The standup groups by the repository each session's own `summary.md` names, while the
+ * scope list is Patwari's projection onto the snapshot the session was listed by. They
+ * agree on ordinary sessions and are allowed to disagree, and the windows differ too —
+ * the narrative covers a week and the scores a month. So a scope with nothing here is a
+ * real answer and the page says which of those it is, rather than rendering an empty
+ * section and letting a reader conclude nothing happened.
+ */
+function scopedStandupSection(standup, repository) {
+  const nodes = [];
+  const groups = standup.repositories.filter((group) => group.repository === repository);
+  const sessions = groups.reduce((total, group) => total + group.sessions.length, 0);
+  if (sessions === 0) {
+    nodes.push(
+      el(
+        "p",
+        "empty",
+        "No summary in the last " +
+          standup.window.last +
+          " named " +
+          repository +
+          ". The standup groups by the repository each session's own summary states, which is a " +
+          "different fact from the repository the archive listed the session under — and it covers " +
+          "a shorter window than the scores above."
+      )
+    );
+  } else {
+    nodes.push(
+      el(
+        "p",
+        "headline-sub",
+        sessions +
+          " sessions in " +
+          repository +
+          ", archived since " +
+          standup.window.opens_at +
+          " (UTC) — narrated from the summaries munshi wrote when it captured them. No model" +
+          " reconstructed any of this."
+      )
+    );
+    for (const group of groups) {
+      const repo = el("div", "repo");
+      for (const session of group.sessions) repo.appendChild(standupSession(session));
+      nodes.push(repo);
+    }
+  }
+  const attributed = (lines) => lines.filter((line) => line.repository === repository);
+  nodes.push(
+    ...rollup(
+      "Decisions",
+      attributed(standup.decisions),
+      "These are the decisions the sessions themselves recorded, in reading order, with exact" +
+        " repeats within a repository dropped."
+    )
+  );
+  nodes.push(
+    ...rollup(
+      "Open items",
+      attributed(standup.open_items),
+      "These are the open items the sessions themselves recorded — what was still owed when each" +
+        " capture ended, not a live task list."
+    )
+  );
+  nodes.push(
+    el(
+      "p",
+      "note",
+      "Gaps are window-wide: a session with no summary at all cannot be attributed to a" +
+        " repository, so it is counted for the window and not under one. Clear the scope to read" +
+        " them."
+    )
+  );
+  return nodes;
+}
+
 function standupSection(standup) {
   const nodes = [];
   if (standup.sessions === 0) {
@@ -1096,16 +1369,113 @@ function standupScrubNote(standup, redaction) {
   );
 }
 
-function render(data) {
+/* The pre-folded scope the reader chose, or null for the whole window. Looked up by
+   label rather than by position, so a refresh that reorders the list (it is ordered
+   busiest-first) cannot silently move a selection onto a different repository. */
+function chosenScope(data) {
+  if (scope.repository === null) return null;
+  return (
+    data.scopes.repositories.find((entry) => entry.repository === scope.repository) || null
+  );
+}
+
+function chosenColumn(data) {
+  return scope.harness === null ? -1 : data.scopes.harnesses.indexOf(scope.harness);
+}
+
+/* The two selects, rebuilt from the payload on every fetch. An option's value is its
+   position in the payload's own array and its text is the label; the selection itself
+   is held as a label, so an option that stops existing between refreshes falls back to
+   "all" instead of quietly becoming its neighbour. */
+function fillScopeControls(data) {
+  const repositories = document.getElementById("scope-repository");
+  const repositoryOptions = [option("", "All repositories")];
+  data.scopes.repositories.forEach((entry, index) => {
+    repositoryOptions.push(
+      option(String(index), entry.repository + " (" + entry.sessions.folded + ")")
+    );
+  });
+  repositories.replaceChildren(...repositoryOptions);
+  const chosenRepository = data.scopes.repositories.findIndex(
+    (entry) => entry.repository === scope.repository
+  );
+  if (scope.repository !== null && chosenRepository < 0) scope.repository = null;
+  repositories.value = chosenRepository >= 0 ? String(chosenRepository) : "";
+
+  const harnesses = document.getElementById("scope-harness");
+  const harnessOptions = [option("", "All harnesses (fleet)")];
+  data.scopes.harnesses.forEach((label, index) => {
+    harnessOptions.push(option(String(index), label));
+  });
+  harnesses.replaceChildren(...harnessOptions);
+  const chosenHarness = chosenColumn(data);
+  if (scope.harness !== null && chosenHarness < 0) scope.harness = null;
+  harnesses.value = chosenHarness >= 0 ? String(chosenHarness) : "";
+}
+
+function option(value, text) {
+  const node = el("option", null, text);
+  node.value = value;
+  return node;
+}
+
+function labelAt(labels, raw) {
+  if (raw === "") return null;
+  const index = Number(raw);
+  return Number.isInteger(index) && index >= 0 && index < labels.length ? labels[index] : null;
+}
+
+function scopeSentence(data, entry, column) {
+  if (!entry && column < 0) {
+    return (
+      "Showing the whole window. Choose a repository or a harness to narrow the scores, the " +
+      "findings, and — for a repository — the bill and the narrative. Every scope is folded " +
+      "server-side and shipped with this payload; nothing here recomputes a score."
+    );
+  }
+  const parts = [];
+  if (entry) {
+    parts.push(
+      entry.repository +
+        " — " +
+        entry.sessions.folded +
+        " of " +
+        data.sessions.folded +
+        " folded sessions"
+    );
+  }
+  if (column >= 0) parts.push(data.scopes.harnesses[column]);
+  let sentence = "Scoped to " + parts.join(" · ") + ". ";
+  sentence +=
+    column >= 0
+      ? "A harness scope shows that harness's own score rather than the fleet blend, and narrows " +
+        "the findings to its sessions. The bill and the narrative carry no harness cut, so they " +
+        "are shown by repository alone."
+      : "Fleet inside a scope is the unweighted mean over the harnesses present in that scope, " +
+        "under the same roster rule as the whole window.";
+  if (entry && entry.sessions.folded === 0) {
+    sentence +=
+      " No coaching session in this window was listed under this repository — it is on the list " +
+      "because the bill or the narrative names it — so the lanes above have nothing to read.";
+  }
+  return sentence;
+}
+
+function paint() {
+  const data = current;
+  if (!data) return;
   const provenance = data.provenance;
-  const harnesses = Object.entries(data.sessions.by_harness)
+  const entry = chosenScope(data);
+  const column = chosenColumn(data);
+  const scopedSessions = entry ? entry.sessions : data.sessions;
+  const harnesses = Object.entries(scopedSessions.by_harness)
     .map(([name, count]) => name + " (" + count + ")")
     .join(", ");
   document.getElementById("subtitle").textContent =
     "Scored over the last " +
     data.window.last +
     " — " +
-    data.sessions.folded +
+    scopedSessions.folded +
     " sessions since " +
     data.window.opens_at +
     " (UTC)" +
@@ -1115,6 +1485,7 @@ function render(data) {
     " and the standup the last " +
     data.standup.window.last +
     "; each section says which.";
+  document.getElementById("scope-note").textContent = scopeSentence(data, entry, column);
 
   if (provenance.stale_since) {
     banner(
@@ -1128,29 +1499,45 @@ function render(data) {
     banner("");
   }
 
-  document.getElementById("tiles").replaceChildren(...data.lanes.map(laneTile));
+  const lanes = entry ? entry.lanes : data.lanes;
+  document
+    .getElementById("tiles")
+    .replaceChildren(...lanes.map((lane) => laneTile(lane, column)));
 
   const findings = document.getElementById("findings");
-  if (data.findings.length === 0) {
+  const cards = data.findings
+    .map((finding) => ({ finding, cited: finding.evidence.filter(citedInScope) }))
+    .filter(({ cited }) => cited.length > 0)
+    .map(({ finding, cited }) => findingCard(finding, cited, scopedSessions.folded));
+  if (cards.length === 0) {
     findings.replaceChildren(
       el(
         "p",
         "empty",
-        "Nothing crossed a rule threshold this window. The thresholds are first guesses, so a " +
-          "quiet window is as much a statement about them as about the work."
+        entry || column >= 0
+          ? "No rule fired in this scope. The thresholds are first guesses, so a quiet scope is " +
+            "as much a statement about them as about the work."
+          : "Nothing crossed a rule threshold this window. The thresholds are first guesses, so a " +
+            "quiet window is as much a statement about them as about the work."
       )
     );
   } else {
-    findings.replaceChildren(
-      ...data.findings.map((finding) => findingCard(finding, data.sessions.folded))
-    );
+    findings.replaceChildren(...cards);
   }
 
-  document.getElementById("cost").replaceChildren(...costSection(data.cost));
+  document
+    .getElementById("cost")
+    .replaceChildren(
+      ...(entry
+        ? scopedCostSection(data.cost, entry.repository, data.scopes.unattributed)
+        : costSection(data.cost))
+    );
   document
     .getElementById("standup")
     .replaceChildren(
-      ...standupSection(data.standup),
+      ...(entry
+        ? scopedStandupSection(data.standup, entry.repository)
+        : standupSection(data.standup)),
       el("p", "note", standupScrubNote(data.standup, provenance.redaction))
     );
 
@@ -1236,6 +1623,39 @@ function render(data) {
   footer.replaceChildren(...nodes);
 }
 
+function render(data) {
+  current = data;
+  fillScopeControls(data);
+  paint();
+}
+
+/* Changing the scope re-renders from the payload already in hand. It fetches nothing:
+   every scope was folded before this document was published, which is the whole reason
+   there is no query string on this route. */
+function scopeChanged() {
+  if (!current) return;
+  scope.repository = labelAt(
+    current.scopes.repositories.map((entry) => entry.repository),
+    document.getElementById("scope-repository").value
+  );
+  scope.harness = labelAt(
+    current.scopes.harnesses,
+    document.getElementById("scope-harness").value
+  );
+  rememberScope();
+  paint();
+}
+
+function wireScopeControls() {
+  document.getElementById("scope-repository").addEventListener("change", scopeChanged);
+  document.getElementById("scope-harness").addEventListener("change", scopeChanged);
+  document.getElementById("scope-reset").addEventListener("click", () => {
+    document.getElementById("scope-repository").value = "";
+    document.getElementById("scope-harness").value = "";
+    scopeChanged();
+  });
+}
+
 async function load() {
   const response = await fetch("/api/data", { cache: "no-store" });
   if (!response.ok) throw new Error("the payload came back " + response.status);
@@ -1275,6 +1695,8 @@ function subscribe() {
   events.addEventListener("open", () => banner(""));
 }
 
+scope = readRememberedScope();
+wireScopeControls();
 reload().then(subscribe);
 </script>
 </body>

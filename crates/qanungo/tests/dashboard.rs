@@ -2053,3 +2053,665 @@ fn the_context_management_lane_scores_and_its_finding_offers_no_excerpt() {
     let (head, _body) = request(address, &format!("/api/evidence/{source_hash}/1"));
     assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
 }
+
+// ---------------------------------------------------------------------------
+// Scope selection (qanungo #5): repository and harness
+// ---------------------------------------------------------------------------
+
+/// A window cut three ways, arranged so that every scope's score can be worked out by hand.
+///
+/// The Context Management lane is the instrument, because it is the pack's only **single-component**
+/// lane: its score is `100 − 100 × clamp(fire_rate / 0.25, 0, 1)` and nothing else, so a fire rate
+/// read off the fixture is a lane score with no second reading to reason about. Everything below is
+/// either munshi's compaction fixture (four completions — the churn rule fires) or a claude
+/// transcript with no compaction marker in it at all (observable and clean, so it counts in the
+/// denominator rather than leaving it).
+///
+/// | Scope | Sessions | Thrashed | Rate | Lane |
+/// | --- | --- | --- | --- | --- |
+/// | `surdy/qanungo` · claude-code | 10 | 1 | 10% | 100 − 100×(0.10/0.25) = **60** |
+/// | `surdy/qanungo` · copilot-cli | 5 | 5 | 100% | clamped → **0** |
+/// | `surdy/qanungo` · fleet | — | — | — | mean(60, 0) = **30** |
+/// | `surdy/munshi` · claude-code | 10 | 0 | 0% | **100** |
+/// | unattributed · claude-code | 5 | 0 | 0% | **100** |
+/// | whole window · claude-code | 25 | 1 | 4% | 100 − 100×(0.04/0.25) = **84** |
+/// | whole window · fleet | — | — | — | mean(84, 0) = **42** |
+///
+/// The comparison window holds ten clean claude-code sessions in `surdy/qanungo` and nothing else,
+/// which buys two facts at once: that scope's claude-code column moved 100 → 60, and its fleet
+/// blend cannot carry an arrow at all, because copilot is in the roster on one side and not the
+/// other.
+fn scoped_archive() -> Vec<ArchivedSession> {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let thrashing = transcript("munshi/claude-code-2.1.235-compaction.jsonl");
+    let copilot = transcript("munshi/copilot-1.0.76-compaction.jsonl");
+    let mut sessions = Vec::new();
+    for index in 0..10u8 {
+        let body = if index == 0 { &thrashing } else { &clean };
+        sessions.push(
+            ArchivedSession::new(index, "claude-code", body, 24).in_repository("surdy/qanungo"),
+        );
+    }
+    for index in 10..15u8 {
+        sessions.push(
+            ArchivedSession::new(index, "copilot-cli", &copilot, 25).in_repository("surdy/qanungo"),
+        );
+    }
+    for index in 15..25u8 {
+        sessions.push(
+            ArchivedSession::new(index, "claude-code", &clean, 26).in_repository("surdy/munshi"),
+        );
+    }
+    // Captured outside a checkout: a real state, and its own bucket.
+    for index in 25..30u8 {
+        sessions.push(ArchivedSession::new(index, "claude-code", &clean, 27));
+    }
+    // The comparison window — 45 days back, inside `[60d, 30d)`.
+    for index in 30..40u8 {
+        sessions.push(
+            ArchivedSession::new(index, "claude-code", &clean, 24 * 45)
+                .in_repository("surdy/qanungo"),
+        );
+    }
+    sessions
+}
+
+/// The lanes whose every component is a fire rate over *sessions*, so a scope with fewer than
+/// [`qanungo::scoring::constants::MIN_SCORED_SESSIONS`] eligible sessions cannot read them.
+///
+/// Tool Mastery is deliberately not here: its pooled component is a rate over tool *calls*, gated
+/// by a minimum number of calls rather than of sessions, so a handful of busy sessions is a real
+/// reading and refusing it would be the honest-refusal discipline applied to the wrong denominator.
+const FIRE_RATE_LANES: [&str; 4] = [
+    "prompt-quality",
+    "session-hygiene",
+    "code-review",
+    "context-management",
+];
+
+/// How many lanes the pack scores.
+const LANES: u8 = 5;
+
+/// One repository's pre-folded scope.
+fn scope_of<'a>(payload: &'a serde_json::Value, repository: &str) -> &'a serde_json::Value {
+    payload["scopes"]["repositories"]
+        .as_array()
+        .expect("the scopes section lists repositories")
+        .iter()
+        .find(|entry| entry["repository"] == repository)
+        .unwrap_or_else(|| panic!("{repository} is not a scope"))
+}
+
+/// One lane inside a scope, or inside the whole-window section.
+fn lane_in<'a>(scope: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    scope["lanes"]
+        .as_array()
+        .expect("five lanes")
+        .iter()
+        .find(|lane| lane["key"] == key)
+        .unwrap_or_else(|| panic!("no {key} lane"))
+}
+
+/// One harness's column inside a lane.
+fn column_in<'a>(lane: &'a serde_json::Value, source_agent: &str) -> &'a serde_json::Value {
+    lane["harnesses"]
+        .as_array()
+        .expect("a column per harness")
+        .iter()
+        .find(|column| column["source_agent"] == source_agent)
+        .unwrap_or_else(|| panic!("no {source_agent} column"))
+}
+
+/// The slice, end to end: every scope's score is the pack's own arithmetic over that scope's
+/// sessions, and the all/all numbers are exactly the ones the page served before this slice.
+///
+/// The expectations are the table in [`scoped_archive`], computed by hand rather than by folding a
+/// second time — a scope reconciling with a re-fold would prove only that two calls agree, which is
+/// what the seam already guarantees. What is under test is that grouping the fold a second way
+/// produces the *right* groups.
+#[test]
+fn every_repository_scope_scores_its_own_sessions_and_nothing_else() {
+    let (address, _directory) = spawn_dashboard(scoped_archive());
+    let payload = payload_of(address);
+
+    // The whole window is unchanged by the slice: the top level is still the all/all scope.
+    let whole = lane_in(&payload, "context-management");
+    assert_eq!(column_in(whole, "claude-code")["score"], 84);
+    assert_eq!(column_in(whole, "copilot-cli")["score"], 0);
+    assert_eq!(whole["fleet"]["score"], 42);
+    assert_eq!(payload["sessions"]["folded"], 30);
+
+    // Scopes are listed busiest first, with the unattributed residue last.
+    let labels: Vec<&str> = payload["scopes"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["surdy/qanungo", "surdy/munshi", "no repository recorded"],
+    );
+    assert_eq!(payload["scopes"]["unattributed"], "no repository recorded");
+    assert_eq!(
+        payload["scopes"]["harnesses"],
+        serde_json::json!(["claude-code", "copilot-cli"]),
+    );
+
+    let qanungo = scope_of(&payload, "surdy/qanungo");
+    assert_eq!(qanungo["attributed"], true);
+    assert_eq!(qanungo["sessions"]["folded"], 15);
+    assert_eq!(qanungo["sessions"]["comparison_folded"], 10);
+    assert_eq!(
+        qanungo["sessions"]["by_harness"],
+        serde_json::json!({ "claude-code": 10, "copilot-cli": 5 }),
+    );
+    let lane = lane_in(qanungo, "context-management");
+    assert_eq!(column_in(lane, "claude-code")["score"], 60);
+    assert_eq!(column_in(lane, "copilot-cli")["score"], 0);
+    // The fleet inside a scope is the unweighted mean over the harnesses *present in that scope*,
+    // which is the same rule the whole window blends by.
+    assert_eq!(lane["fleet"]["state"], "scored");
+    assert_eq!(lane["fleet"]["score"], 30);
+    assert_eq!(
+        lane["fleet"]["harnesses"],
+        serde_json::json!(["claude-code", "copilot-cli"]),
+    );
+
+    let munshi = scope_of(&payload, "surdy/munshi");
+    assert_eq!(munshi["sessions"]["folded"], 10);
+    assert_eq!(munshi["sessions"]["comparison_folded"], 0);
+    let lane = lane_in(munshi, "context-management");
+    assert_eq!(column_in(lane, "claude-code")["score"], 100);
+    assert_eq!(lane["fleet"]["score"], 100);
+    // Only one harness worked in this repository, so only one is in its blend — and the column for
+    // the other says "no sessions" rather than disappearing, because the columns are the window's
+    // union and a harness that did not appear here is a fact rather than an absence.
+    assert_eq!(
+        lane["fleet"]["harnesses"],
+        serde_json::json!(["claude-code"])
+    );
+    assert_eq!(column_in(lane, "copilot-cli")["state"], "no-sessions");
+    assert_eq!(column_in(lane, "copilot-cli")["sessions"], 0);
+
+    let unattributed = scope_of(&payload, "no repository recorded");
+    assert_eq!(unattributed["attributed"], false);
+    assert_eq!(unattributed["sessions"]["folded"], 5);
+    assert_eq!(
+        column_in(lane_in(unattributed, "context-management"), "claude-code")["score"],
+        100,
+    );
+
+    // Every scope accounts for every folded session exactly once.
+    let scoped: u64 = payload["scopes"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["sessions"]["folded"].as_u64().unwrap())
+        .sum();
+    assert_eq!(scoped, payload["sessions"]["folded"].as_u64().unwrap());
+}
+
+/// A trend inside a scope is the same statement as a trend over the window, taken over less: both
+/// windows are cut by the same repository key, and the roster rule that suppresses a fleet arrow
+/// applies inside a scope exactly as it does outside one.
+#[test]
+fn a_scopes_trend_is_taken_against_the_same_repository_in_the_earlier_window() {
+    let (address, _directory) = spawn_dashboard(scoped_archive());
+    let payload = payload_of(address);
+    let lane = lane_in(scope_of(&payload, "surdy/qanungo"), "context-management");
+
+    let trend = &column_in(lane, "claude-code")["trend"];
+    assert_eq!(trend["direction"], "down");
+    assert_eq!(trend["points"], 40, "100 in the earlier window, 60 in this");
+    assert_eq!(trend["was"], 100);
+
+    // Copilot worked in this repository only in the later window, so the blend is over a different
+    // roster on each side and carries no arrow at all — a roster change moves an unweighted mean
+    // with nobody's behaviour behind it.
+    assert_eq!(lane["fleet"]["trend"], serde_json::Value::Null);
+    // The copilot column itself has no earlier score to move against, which is a different fact
+    // from a flat one.
+    assert_eq!(
+        column_in(lane, "copilot-cli")["trend"],
+        serde_json::Value::Null
+    );
+
+    // A repository the earlier window never held has no arrow anywhere.
+    let munshi = lane_in(scope_of(&payload, "surdy/munshi"), "context-management");
+    assert_eq!(
+        column_in(munshi, "claude-code")["trend"],
+        serde_json::Value::Null
+    );
+    assert_eq!(munshi["fleet"]["trend"], serde_json::Value::Null);
+}
+
+/// A scope with nothing to read scores nothing. Never a zero, never a hundred, and never a number
+/// carried over from the scope beside it.
+#[test]
+fn a_scope_too_small_to_read_renders_no_reading_rather_than_a_number() {
+    // Four sessions in their own repository: one below `MIN_SCORED_SESSIONS`, so no fire rate in
+    // this scope is a reading however the sessions went.
+    let clean = transcript("rules/marathon-session.jsonl");
+    let mut sessions: Vec<ArchivedSession> = (0..10u8)
+        .map(|index| {
+            ArchivedSession::new(index, "claude-code", &clean, 24).in_repository("surdy/qanungo")
+        })
+        .collect();
+    sessions.extend((10..14u8).map(|index| {
+        ArchivedSession::new(index, "claude-code", &clean, 25).in_repository("surdy/thin")
+    }));
+    let (address, _directory) = spawn_dashboard(sessions);
+    let payload = payload_of(address);
+
+    let thin = scope_of(&payload, "surdy/thin");
+    assert_eq!(thin["sessions"]["folded"], 4);
+    for key in FIRE_RATE_LANES {
+        let lane = lane_in(thin, key);
+        assert_eq!(
+            lane["fleet"]["state"], "no-reading",
+            "{key} invented a reading",
+        );
+        assert_eq!(lane["fleet"]["score"], serde_json::Value::Null);
+        let column = column_in(lane, "claude-code");
+        assert_eq!(column["state"], "no-reading", "{key}");
+        assert_eq!(column["score"], serde_json::Value::Null);
+        // And it says why, in the pack's own words, rather than going quiet.
+        assert!(
+            column["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|component| component["cost"].is_null()),
+            "a silent component has no say: {column}",
+        );
+    }
+    // The window it is part of does score, so this is the scope's own emptiness and not the fold's.
+    assert_eq!(
+        lane_in(scope_of(&payload, "surdy/qanungo"), "context-management")["fleet"]["score"],
+        100,
+    );
+}
+
+/// The tags and the counts are one statement.
+///
+/// Every cited session carries the repository and harness labels its scope is keyed on, and the
+/// per-scope fire counts serialized beside them are counts of exactly those rows. That equality is
+/// what lets the page narrow a finding list without evaluating a rule: the number under a heading
+/// and the rows under it come from the same place.
+#[test]
+fn every_cited_session_is_tagged_with_the_scope_that_counts_it() {
+    let (address, _directory) = spawn_dashboard(scoped_archive());
+    let payload = payload_of(address);
+    let scopes = payload["scopes"]["repositories"].as_array().unwrap();
+
+    for finding in payload["findings"].as_array().unwrap() {
+        let rule = finding.rule_key();
+        let mut tagged = 0_usize;
+        for evidence in finding["evidence"].as_array().unwrap() {
+            let repository = evidence["repository"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{rule}: an untagged citation"));
+            let harness = evidence["harness"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{rule}: an untagged citation"));
+            assert!(
+                scopes.iter().any(|scope| scope["repository"] == repository),
+                "{rule}: cited a repository that is not a scope: {repository}",
+            );
+            assert!(
+                payload["scopes"]["harnesses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|label| label == harness),
+                "{rule}: cited a harness that is not on the control: {harness}",
+            );
+            tagged += 1;
+        }
+        assert_eq!(
+            tagged,
+            finding["sessions_affected"].as_u64().unwrap() as usize,
+            "{rule}: the count and the citations disagree",
+        );
+
+        // The per-scope counts partition the same citations: the tags a page filters by and the
+        // counts a page could show cannot come apart.
+        let mut summed = 0_usize;
+        for scope in scopes {
+            let row = scope["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["rule"] == rule.as_str())
+                .unwrap_or_else(|| panic!("{rule} has no row in {}", scope["repository"]));
+            let counted = row["sessions_affected"].as_u64().unwrap() as usize;
+            let by_hand = finding["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|evidence| evidence["repository"] == scope["repository"])
+                .count();
+            assert_eq!(counted, by_hand, "{rule} in {}", scope["repository"]);
+            let split: u64 = row["by_harness"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|count| count.as_u64().unwrap())
+                .sum();
+            assert_eq!(
+                split as usize, counted,
+                "{rule}: the harness split is short"
+            );
+            summed += counted;
+        }
+        assert_eq!(summed, tagged, "{rule}: the scopes lost a citation");
+    }
+
+    // The window's one firing rule landed entirely in one repository, split across both harnesses —
+    // checkable by hand against the fixture.
+    let churn = scope_of(&payload, "surdy/qanungo")["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "compaction-churn")
+        .expect("the churn rule has a row");
+    assert_eq!(churn["sessions_affected"], 6);
+    assert_eq!(
+        churn["by_harness"],
+        serde_json::json!({ "claude-code": 1, "copilot-cli": 5 }),
+    );
+    let elsewhere = scope_of(&payload, "surdy/munshi")["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "compaction-churn")
+        .expect("a rule that fired nowhere here still has a row, carrying a zero");
+    assert_eq!(elsewhere["sessions_affected"], 0);
+}
+
+trait RuleKey {
+    fn rule_key(&self) -> String;
+}
+
+impl RuleKey for serde_json::Value {
+    fn rule_key(&self) -> String {
+        self["rule"]
+            .as_str()
+            .expect("a finding names its rule")
+            .to_owned()
+    }
+}
+
+/// A repository name is an archive-stated identifier on a surface that renders verbatim, so it is
+/// clamped **and then** scrubbed — and the label it becomes is what the scope control, the evidence
+/// tags, and the group key all use, so there is nowhere for the raw value to survive.
+#[test]
+fn a_hostile_repository_name_never_reaches_a_scope_control() {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let sessions: Vec<ArchivedSession> = (0..6u8)
+        .map(|index| {
+            let session = ArchivedSession::new(index, "claude-code", &clean, 24);
+            match index % 3 {
+                // A live-shaped credential inside the clamp's ceiling: it reaches the scrub and
+                // leaves as a marker.
+                0 => session.in_repository("ghp_FAKEfake0123456789ABCDEFabcdef012345"),
+                // A table pipe and a backtick: not shaped like an identifier at all, so it is
+                // replaced wholesale rather than truncated — a prefix of arbitrary text is still
+                // arbitrary text.
+                1 => session.in_repository("surdy/evil|table`break"),
+                _ => session.in_repository("surdy/qanungo"),
+            }
+        })
+        .collect();
+    let (address, _directory) = spawn_dashboard(sessions);
+    let (_head, body) = request(address, "/api/data");
+
+    for raw in [
+        "ghp_FAKEfake0123456789ABCDEFabcdef012345",
+        "surdy/evil|table",
+        "table`break",
+    ] {
+        assert!(
+            !body.contains(raw),
+            "a raw repository name reached the wire: {raw}"
+        );
+    }
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let labels: Vec<&str> = payload["scopes"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["repository"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"surdy/qanungo"), "{labels:?}");
+    assert!(
+        labels.contains(&"invalid-identifier"),
+        "the unrenderable name is replaced wholesale: {labels:?}",
+    );
+    assert!(
+        labels.iter().any(|label| label.contains("REDACTED")),
+        "the credential-shaped name is scrubbed rather than clamped away: {labels:?}",
+    );
+}
+
+/// The scopes section is bounded by the shape of the window rather than by its size.
+///
+/// It is one cell per (repository × lane × harness-or-fleet), so it grows with how many
+/// repositories were worked in and not with how many sessions or how much prose the window holds.
+/// The assertion is a per-cell ceiling rather than a share of the body, because the share depends
+/// on how much narrative the standup section happens to carry — against production on 2026-08-25 a
+/// cell was about 650 bytes and the whole section 105.5 KiB of a 1070 KiB payload, which is the
+/// measurement in the module docs. The ceiling here is that number with room over it: it is meant
+/// to catch a cell that started carrying something it should not, not to pin a byte count.
+#[test]
+fn the_scopes_section_is_bounded_by_the_number_of_scopes() {
+    let (address, _directory) = spawn_dashboard(scoped_archive());
+    let (_head, body) = request(address, "/api/data");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let scopes = serde_json::to_vec(&payload["scopes"]).expect("the section reserializes");
+    let count = payload["scopes"]["repositories"].as_array().unwrap().len();
+    let harnesses = payload["scopes"]["harnesses"].as_array().unwrap().len();
+    assert_eq!(count, 3);
+    // The section is one cell per (repository × lane × harness-or-fleet), and what is bounded is
+    // the cell: a window with more repositories in it costs proportionally more and nothing else.
+    let cells = count * usize::from(LANES) * (harnesses + 1);
+    let per_cell = scopes.len() / cells;
+    assert!(
+        per_cell < 900,
+        "a scope cell costs {per_cell} bytes; the section is {} of a {} byte body",
+        scopes.len(),
+        body.len(),
+    );
+    // And it is a section, not the document: whatever else grows, the scopes never become most of
+    // the payload on a window with a narrative in it.
+    assert!(
+        scopes.len() < body.len(),
+        "{} of {}",
+        scopes.len(),
+        body.len(),
+    );
+}
+
+/// The page's half of the slice: one control, wired to the payload's own scopes, computing nothing.
+///
+/// There is no JavaScript engine in this harness, so what is pinned here is the shape rather than
+/// the behaviour: the control exists, it reads the payload's scope section, its narrowing is a
+/// comparison of server-written labels, and every `localStorage` access is inside a `try`. The
+/// behaviour itself was verified in Chrome against production — see the issue comment.
+#[test]
+fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
+    let (address, _directory) = spawn_dashboard(scoped_archive());
+    let (head, body) = request(address, "/");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+
+    for anchor in [
+        r#"id="scope-repository""#,
+        r#"id="scope-harness""#,
+        r#"id="scope-note""#,
+        "data.scopes.repositories",
+        "data.scopes.harnesses",
+        "citedInScope",
+        "scopedCostSection",
+        "scopedStandupSection",
+    ] {
+        assert!(body.contains(anchor), "the page has no {anchor}");
+    }
+
+    // Narrowing is a string comparison against labels the server wrote, never a rule re-evaluated
+    // here — the payload is the single source of every number on the page.
+    assert!(
+        body.contains("evidence.repository !== scope.repository"),
+        "findings are narrowed by the payload's own tags",
+    );
+
+    // Remembering the scope is a convenience, so every access to storage is guarded and a page with
+    // nothing stored renders the whole window.
+    assert_eq!(
+        body.matches("localStorage").count(),
+        2,
+        "one read and one write, and nowhere else",
+    );
+    for guarded in [
+        "window.localStorage.getItem(SCOPE_KEY)",
+        "window.localStorage.setItem(SCOPE_KEY",
+    ] {
+        let at = body.find(guarded).expect("the access is there");
+        let before = &body[..at];
+        let opened = before.rfind("try {").expect("an access outside a try");
+        let closed = before.rfind("} catch").map_or(0, |index| index);
+        assert!(opened > closed, "{guarded} is not inside a try");
+    }
+    assert!(
+        body.contains("if (!raw) return { repository: null, harness: null };"),
+        "nothing stored renders the whole window",
+    );
+
+    // And every invariant the page already held, restated over the grown file.
+    assert!(!body.contains("href"), "the page carries no links at all");
+    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert!(
+        !body.contains("innerHTML"),
+        "every value is set as text, never parsed as markup",
+    );
+    assert!(
+        !body.contains("http://") && !body.contains("https://") && !body.contains("//fonts."),
+        "the page loads nothing from anywhere",
+    );
+    // Changing the scope re-renders what is already in hand: no query string, no second route.
+    assert_eq!(
+        body.matches("fetch(").count(),
+        2,
+        "the payload and an excerpt, and nothing a scope control adds",
+    );
+    assert!(
+        !body.contains("?repository=") && !body.contains("/api/data?"),
+        "a scope is never a query string",
+    );
+}
+
+/// The control narrows everything the page shows, which means the scope list has to be the
+/// **union** of what all three sections labelled — and the three have to spell an ordinary
+/// repository the same way, or an option would narrow one section and not the others.
+///
+/// They reach the label by three different routes: the coaching scope clamps then scrubs, the cost
+/// lane clamps, and the standup lane scrubs then clamps — and they group by two different facts,
+/// the archive's projection onto the listed snapshot versus the repository a session's own
+/// `summary.md` names. What this pins is that an ordinary name survives all three identically, so
+/// the disagreement that remains is about *which sessions* a repository holds and never about how
+/// it is written.
+#[test]
+fn the_scope_list_is_the_union_of_what_all_three_sections_labelled() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let payload = payload_of(address);
+    let labels: Vec<&str> = payload["scopes"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["repository"].as_str().unwrap())
+        .collect();
+
+    for row in payload["cost"]["by_repository"].as_array().unwrap() {
+        let label = row["repository"]
+            .as_str()
+            .unwrap_or_else(|| payload["scopes"]["unattributed"].as_str().unwrap());
+        assert!(
+            labels.contains(&label),
+            "the bill names {label}: {labels:?}"
+        );
+    }
+    for group in payload["standup"]["repositories"].as_array().unwrap() {
+        let label = group["repository"].as_str().unwrap();
+        assert!(
+            labels.contains(&label),
+            "the narrative names {label}: {labels:?}",
+        );
+    }
+    assert!(labels.contains(&"surdy/qanungo") && labels.contains(&"surdy/munshi"));
+    // The unattributed bucket is one bucket across all three, spelled once by the payload.
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| **label == "no repository recorded")
+            .count(),
+        1,
+        "{labels:?}",
+    );
+}
+
+/// A repository the *coaching* fold never saw is still a scope, because the narrative names it —
+/// and a control that could not select a repository the page visibly renders would be a control
+/// that lies about what it narrows. It scores nothing, and the payload says so rather than
+/// inventing a reading.
+///
+/// This is the two-facts case in one fixture. Both sessions are **listed** under `surdy/qanungo`,
+/// which is what the coaching scopes and the bill cut by; the second one's own `summary.md` names
+/// `surdy/munshi`, which is what the standup groups by. Neither reading is wrong and the page must
+/// not pretend they are the same, so the scope list holds both labels.
+#[test]
+fn a_repository_only_the_narrative_names_is_still_a_scope_with_nothing_to_score() {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let sessions = vec![
+        ArchivedSession::new(1, "claude-code", &clean, 24)
+            .with_summary(&summary("qanungo-cost.md"))
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(2, "claude-code", &clean, 25)
+            .with_summary(&summary("munshi-tombstone.md"))
+            .in_repository("surdy/qanungo"),
+    ];
+    let (address, _directory) = spawn_dashboard(sessions);
+    let payload = payload_of(address);
+
+    // The archive listed both sessions in one repository; the summaries name two.
+    assert_eq!(scope_of(&payload, "surdy/qanungo")["sessions"]["folded"], 2);
+    let narrated: Vec<&str> = payload["standup"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(narrated, vec!["surdy/munshi", "surdy/qanungo"]);
+
+    let scope = scope_of(&payload, "surdy/munshi");
+    assert_eq!(scope["sessions"]["folded"], 0);
+    assert_eq!(scope["sessions"]["comparison_folded"], 0);
+    for lane in scope["lanes"].as_array().unwrap() {
+        assert_eq!(lane["fleet"]["state"], "no-reading", "{}", lane["key"]);
+        for column in lane["harnesses"].as_array().unwrap() {
+            assert_eq!(column["state"], "no-sessions", "{}", lane["key"]);
+        }
+    }
+    // Every rule that fired in the window still has a row here, carrying a zero: a missing key and
+    // a zero are different statements and only one of them is a reading.
+    for row in scope["findings"].as_array().unwrap() {
+        assert_eq!(row["sessions_affected"], 0, "{}", row["rule"]);
+    }
+    // Busiest first puts a repository with no coaching session behind every repository with one.
+    let labels: Vec<&str> = payload["scopes"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["repository"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, vec!["surdy/qanungo", "surdy/munshi"]);
+}
