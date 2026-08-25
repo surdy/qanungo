@@ -168,8 +168,8 @@ impl StandupReport<'_> {
         let _ = writeln!(
             out,
             "_Instrumentation — sync {} · fold {} · {} sessions · {} read · cache {} hits / {} \
-             misses ({} transferred) · redaction {} · patterns {PATTERN_REVISION} · archive {} · \
-             cache {}_",
+             misses ({} transferred) · snapshots {} indexed / {} fetched · redaction {} · \
+             patterns {PATTERN_REVISION} · archive {} · cache {}_",
             format::elapsed(instrumentation.sync.elapsed),
             format::elapsed(instrumentation.fold_elapsed),
             self.standup.sessions,
@@ -177,6 +177,8 @@ impl StandupReport<'_> {
             instrumentation.sync.cache_hits,
             instrumentation.sync.cache_misses,
             format::bytes(instrumentation.sync.bytes_transferred),
+            instrumentation.sync.snapshots_indexed,
+            instrumentation.sync.snapshots_fetched,
             redaction_counts(&self.standup.redaction),
             instrumentation.patwari_url,
             display_path(&instrumentation.cache_root),

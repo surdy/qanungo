@@ -114,7 +114,7 @@ impl ArchivedSession {
         };
         Self {
             session_id: format!("{index:02x}").repeat(16),
-            snapshot_id: format!("{:02x}", index.wrapping_add(100)).repeat(16),
+            snapshot_id: snapshot_id(index),
             artifact_id: format!("{:02x}", index.wrapping_add(200)).repeat(16),
             source_agent: "claude-code".to_owned(),
             artifact_set_version: 2,
@@ -623,6 +623,14 @@ const SUMMARY: &str = include_str!("fixtures/standup/qanungo-scoring.md");
 const _: () = assert!(MAX_DECLARED_SUMMARY_BYTES < MAX_DECLARED_TRANSCRIPT_BYTES);
 const OTHER_SUMMARY: &str = include_str!("fixtures/standup/munshi-tombstone.md");
 
+/// A snapshot id shaped like the archive's: a lowercase UUID, which is the only shape the cache's
+/// snapshot index will file. Sixteen copies of one byte, hyphenated 8-4-4-4-12.
+fn snapshot_id(index: u8) -> String {
+    let pair = format!("{:02x}", index.wrapping_add(100));
+    let run = |count: usize| pair.repeat(count);
+    format!("{}-{}-{}-{}-{}", run(4), run(2), run(2), run(2), run(6))
+}
+
 fn cache() -> (tempfile::TempDir, BlobCache) {
     let directory = tempfile::tempdir().unwrap();
     let cache = BlobCache::open(directory.path().join("qanungo")).unwrap();
@@ -703,6 +711,108 @@ fn a_first_sync_fetches_every_transcript_and_a_second_serves_them_from_cache() {
         2,
         "a cache hit must not touch the content route"
     );
+    // And, since the snapshot index (qanungo #1), not the snapshot route either: a warm sync is
+    // the listing and nothing else.
+    assert_eq!(first.stats.snapshots_fetched, 2);
+    assert_eq!(first.stats.snapshots_indexed, 0);
+    assert_eq!(second.stats.snapshots_indexed, 2);
+    assert_eq!(second.stats.snapshots_fetched, 0);
+    assert_eq!(
+        requests.lock().unwrap().snapshot_detail_requests(),
+        2,
+        "a warm sync must not re-read a snapshot document it has indexed"
+    );
+}
+
+/// The index can confirm a hit, never decide a download. A session whose snapshot is indexed but
+/// whose blob is gone is resolved from a freshly fetched document, exactly as if there were no
+/// index — so a URL that only the index remembers never reaches the wire.
+#[test]
+fn an_indexed_snapshot_whose_blob_is_missing_is_refetched_live() {
+    let session = ArchivedSession::claude(7, TRANSCRIPT, "zstd");
+    let digest = session.original_sha256.clone();
+    let (base, requests) = spawn_archive(vec![session]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+    let from = "2026-07-18T00:00:00.000Z";
+
+    sync::sync(&client, &cache, Artifact::Transcript, from, 2).unwrap();
+    assert!(cache.contains(&digest));
+    std::fs::remove_file(cache.root().join("blobs").join(&digest[..2]).join(&digest)).unwrap();
+    assert!(!cache.contains(&digest));
+
+    let again = sync::sync(&client, &cache, Artifact::Transcript, from, 2).unwrap();
+    assert_eq!(again.sessions.len(), 1);
+    assert_eq!(again.stats.cache_misses, 1);
+    assert_eq!(again.stats.snapshots_indexed, 0);
+    assert_eq!(again.stats.snapshots_fetched, 1);
+    assert!(cache.contains(&digest));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.snapshot_detail_requests(), 2);
+    assert_eq!(requests.content_requests(), 2);
+}
+
+/// An index entry this build cannot read is a miss, not a failure: the session costs the request
+/// it would have cost before there was an index, and the entry is replaced.
+#[test]
+fn a_corrupt_index_entry_is_a_miss_that_repairs_itself() {
+    let session = ArchivedSession::claude(8, TRANSCRIPT, "identity");
+    let id = session.snapshot_id.clone();
+    let (base, requests) = spawn_archive(vec![session]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+    let from = "2026-07-18T00:00:00.000Z";
+
+    sync::sync(&client, &cache, Artifact::Transcript, from, 2).unwrap();
+    let entry = cache
+        .root()
+        .join("snapshots")
+        .join(&id[..2])
+        .join(format!("{id}.json"));
+    assert!(entry.is_file(), "the first run indexes the document");
+    std::fs::write(&entry, b"{ not a snapshot").unwrap();
+
+    let again = sync::sync(&client, &cache, Artifact::Transcript, from, 2).unwrap();
+    assert_eq!(again.sessions.len(), 1);
+    assert_eq!(again.stats.cache_hits, 1, "the blob was never in doubt");
+    assert_eq!(again.stats.snapshots_indexed, 0);
+    assert_eq!(again.stats.snapshots_fetched, 1);
+    assert_eq!(requests.lock().unwrap().snapshot_detail_requests(), 2);
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&entry).unwrap()).is_ok(),
+        "the live fetch re-indexes the document"
+    );
+
+    let third = sync::sync(&client, &cache, Artifact::Transcript, from, 2).unwrap();
+    assert_eq!(third.stats.snapshots_indexed, 1);
+    assert_eq!(third.stats.snapshots_fetched, 0);
+}
+
+/// A projection the index holds but cannot use on its own — the munshi #78 shape — never
+/// short-circuits the sibling walk. The index is silent about any session the archive has to be
+/// asked about, so the fallback costs on every run exactly what it cost on the first.
+#[test]
+fn the_index_never_settles_a_session_whose_projection_needs_the_sibling_walk() {
+    let mut shadowed = ArchivedSession::claude(45, TRANSCRIPT, "identity");
+    shadowed.has_transcript = false;
+    let complete = ArchivedSession::claude(46, TRANSCRIPT, "zstd")
+        .older_snapshot_of(&shadowed, "2026-08-09T10:00:00.000Z");
+    let (base, requests) = spawn_archive(vec![shadowed, complete]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+    let from = "2026-07-18T00:00:00.000Z";
+
+    for run in 1..=2 {
+        let mirror = sync::sync(&client, &cache, Artifact::Transcript, from, 2).unwrap();
+        assert_eq!(mirror.sessions.len(), 1);
+        assert_eq!(mirror.stats.snapshots_indexed, 0);
+        assert_eq!(
+            mirror.stats.snapshots_fetched, 2,
+            "projection plus one probe, run {run}"
+        );
+        assert_eq!(requests.lock().unwrap().snapshot_listing_requests(), run);
+    }
+    assert_eq!(requests.lock().unwrap().content_requests(), 1);
 }
 
 #[test]
@@ -1538,6 +1648,9 @@ fn a_summary_only_snapshot_needs_no_fallback_in_the_summary_lane() {
 }
 
 /// Files anywhere under a cache root, temporary or not.
+/// Every file under the cache's *blob* tree — staged temporaries included, so an aborted transfer
+/// that left one behind is counted. The snapshot index beside it is not a blob and is not counted:
+/// a refused download still indexes the snapshot document it was refused from.
 fn blob_count(root: &std::path::Path) -> usize {
     fn walk(path: &std::path::Path, count: &mut usize) {
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -1552,7 +1665,7 @@ fn blob_count(root: &std::path::Path) -> usize {
         }
     }
     let mut count = 0;
-    walk(root, &mut count);
+    walk(&root.join("qanungo").join("blobs"), &mut count);
     count
 }
 
@@ -1642,9 +1755,11 @@ fn the_standup_command_runs_end_to_end_against_the_archive() {
     // The summary was fetched, not the transcript beside it: one miss, and the second run below
     // is a hit against the same cache directory.
     assert!(markdown.contains("cache 0 hits / 1 misses"));
+    assert!(markdown.contains("snapshots 0 indexed / 1 fetched"));
 
     let again = run(&["--no-redact"]);
     assert!(again.contains("cache 1 hits / 0 misses"));
+    assert!(again.contains("snapshots 1 indexed / 0 fetched"));
     assert!(again.contains("**not scrubbed for secrets** (`--no-redact`)"));
 }
 

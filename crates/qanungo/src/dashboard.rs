@@ -1386,6 +1386,8 @@ fn lane_cost_value(
         "bytes_transferred": format::bytes(sync.bytes_transferred),
         "cache_hits": sync.cache_hits,
         "cache_misses": sync.cache_misses,
+        "snapshots_indexed": sync.snapshots_indexed,
+        "snapshots_fetched": sync.snapshots_fetched,
     })
 }
 
@@ -1436,6 +1438,8 @@ impl Payload<'_> {
             "bytes_transferred": format::bytes(instrumentation.sync.bytes_transferred),
             "cache_hits": instrumentation.sync.cache_hits,
             "cache_misses": instrumentation.sync.cache_misses,
+            "snapshots_indexed": instrumentation.sync.snapshots_indexed,
+            "snapshots_fetched": instrumentation.sync.snapshots_fetched,
             // The two windows the slice added, each with what folding it cost. The cost lane folds a
             // pair — its own window and the equal-length one before it — and the standup lane folds
             // one, so `comparison_sessions_folded` appears on the first and not on the second.
@@ -1610,6 +1614,8 @@ mod tests {
                     sessions_listed: sessions.len() + previous.len(),
                     cache_hits: 2,
                     cache_misses: 1,
+                    snapshots_indexed: 2,
+                    snapshots_fetched: 1,
                     bytes_transferred: 4096,
                     elapsed: Duration::from_millis(120),
                 },
@@ -1696,6 +1702,8 @@ mod tests {
                 sessions_listed: 3,
                 cache_hits: 3,
                 cache_misses: 0,
+                snapshots_indexed: 3,
+                snapshots_fetched: 0,
                 bytes_transferred: 0,
                 elapsed: Duration::from_millis(240),
             },
@@ -1754,6 +1762,8 @@ mod tests {
                     sessions_listed: 2,
                     cache_hits: 1,
                     cache_misses: 1,
+                    snapshots_indexed: 1,
+                    snapshots_fetched: 1,
                     bytes_transferred: 2048,
                     elapsed: Duration::from_millis(45),
                 },

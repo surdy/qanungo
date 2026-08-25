@@ -59,7 +59,7 @@ impl ArchivedSession {
         let completed = Utc::now() - TimeDelta::hours(hours_ago);
         Self {
             session_id: format!("{index:02x}").repeat(16),
-            snapshot_id: format!("{:02x}", index.wrapping_add(100)).repeat(16),
+            snapshot_id: snapshot_id(index),
             artifact_id: format!("{:02x}", index.wrapping_add(200)).repeat(16),
             source_agent: source_agent.to_owned(),
             original_sha256: sha256_hex(transcript),
@@ -552,6 +552,14 @@ fn canary_archive() -> Vec<ArchivedSession> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A snapshot id shaped like the archive's: a lowercase UUID, which is the only shape the cache's
+/// snapshot index will file. Sixteen copies of one byte, hyphenated 8-4-4-4-12.
+fn snapshot_id(index: u8) -> String {
+    let pair = format!("{:02x}", index.wrapping_add(100));
+    let run = |count: usize| pair.repeat(count);
+    format!("{}-{}-{}-{}-{}", run(4), run(2), run(2), run(2), run(6))
+}
 
 #[test]
 fn the_page_route_serves_the_embedded_page() {

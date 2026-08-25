@@ -485,8 +485,8 @@ impl CostReport<'_> {
         let _ = writeln!(
             out,
             "_Instrumentation — sync {} · fold {} · {} sessions{comparison} · {} records · {} \
-             folded · cache {} hits / {} misses ({} transferred) · price table {} · archive {} · \
-             cache {}_",
+             folded · cache {} hits / {} misses ({} transferred) · snapshots {} indexed / {} \
+             fetched · price table {} · archive {} · cache {}_",
             format::elapsed(instrumentation.sync.elapsed),
             format::elapsed(instrumentation.fold_elapsed),
             instrumentation.sessions_folded,
@@ -495,6 +495,8 @@ impl CostReport<'_> {
             instrumentation.sync.cache_hits,
             instrumentation.sync.cache_misses,
             format::bytes(instrumentation.sync.bytes_transferred),
+            instrumentation.sync.snapshots_indexed,
+            instrumentation.sync.snapshots_fetched,
             PRICE_TABLE_REVISION,
             instrumentation.patwari_url,
             display_path(&instrumentation.cache_root),
@@ -530,6 +532,8 @@ mod tests {
                 sessions_listed: 1,
                 cache_hits: 1,
                 cache_misses: 0,
+                snapshots_indexed: 1,
+                snapshots_fetched: 0,
                 bytes_transferred: 0,
                 elapsed: Duration::from_millis(90),
             },

@@ -165,8 +165,9 @@ parser accepts the other's units, and an interval faster than a minute is refuse
 clamped: a warm three-lane refresh measures about **45 s** against the production archive, and
 polling near that is load on a LAN archive rather than a fresher page.
 
-`--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the blob cache, which otherwise
-lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
+`--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the cache root — the blob cache
+plus the snapshot index beside it — which otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling
+back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
 flags work on every lane. The coaching report renders **aggregates, tool names, and content hashes
 only**, and the cost report adds exactly the model, billing-modifier, and repository identifiers the
 archive itself recorded, each clamped on the way out — never transcript content, in either. The

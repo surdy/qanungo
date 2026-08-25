@@ -3,8 +3,9 @@
 //! A report is a *read* of somebody else's archive server. Patwari is LAN-only, serves roughly
 //! eight concurrent requests, and times out at 30s, so this client is deliberately polite: one
 //! listing traversal that follows only the server's own `next_cursor`, one detail request per
-//! session, one download per transcript that is not already cached, and no retries. A read-side
-//! client that retries into a busy archive turns a slow server into an unavailable one.
+//! session the mirror's snapshot index cannot settle, one download per transcript that is not
+//! already cached, and no retries. A read-side client that retries into a busy archive turns a
+//! slow server into an unavailable one.
 //!
 //! # The three surfaces
 //!
@@ -214,6 +215,39 @@ pub struct SnapshotDetail {
 }
 
 impl SnapshotDetail {
+    /// Reads a snapshot document — whether it arrived off the wire or out of the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest omits the capture provenance that decides how the
+    /// transcript may be interpreted, or the artifact list is not one.
+    pub fn from_document(value: &Value) -> Result<Self, PatwariError> {
+        let source_agent =
+            nested_str(value, &["manifest", "session", "source_agent"]).ok_or_else(|| {
+                PatwariError::Protocol("snapshot manifest missing session.source_agent".to_owned())
+            })?;
+        let artifact_set_version =
+            nested_u64(value, &["manifest", "capture", "artifact_set_version"])
+                .and_then(|version| u16::try_from(version).ok())
+                .ok_or_else(|| {
+                    PatwariError::Protocol(
+                        "snapshot manifest missing capture.artifact_set_version".to_owned(),
+                    )
+                })?;
+        let artifacts = value
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PatwariError::Protocol("snapshot missing artifacts".to_owned()))?
+            .iter()
+            .map(listed_artifact)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            source_agent,
+            artifact_set_version,
+            artifacts,
+        })
+    }
+
     /// The artifact holding the raw transcript, when the set contains one. A snapshot without
     /// one is a real archive state (a summary-only capture), not an error.
     pub fn transcript(&self) -> Option<&ListedArtifact> {
@@ -348,32 +382,21 @@ impl ReadClient {
     /// Returns an error when the snapshot cannot be fetched or its manifest omits the capture
     /// provenance that decides how the transcript may be interpreted.
     pub fn snapshot(&self, snapshot_id: &str) -> Result<SnapshotDetail, PatwariError> {
+        SnapshotDetail::from_document(&self.snapshot_document(snapshot_id)?)
+    }
+
+    /// Fetches one snapshot's document as the archive states it, unparsed.
+    ///
+    /// This is what the mirror indexes (see [`crate::cache::BlobCache::snapshot_document`]): the
+    /// archive's own immutable document, so that what is read back later is parsed by exactly
+    /// the code that would have parsed the response, [`SnapshotDetail::from_document`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot be fetched or is not a JSON document.
+    pub fn snapshot_document(&self, snapshot_id: &str) -> Result<Value, PatwariError> {
         let target = format!("{API_BASE}/snapshots/{}", http::encode_value(snapshot_id));
-        let value = self.get_json(&target)?;
-        let source_agent = nested_str(&value, &["manifest", "session", "source_agent"])
-            .ok_or_else(|| {
-                PatwariError::Protocol("snapshot manifest missing session.source_agent".to_owned())
-            })?;
-        let artifact_set_version =
-            nested_u64(&value, &["manifest", "capture", "artifact_set_version"])
-                .and_then(|version| u16::try_from(version).ok())
-                .ok_or_else(|| {
-                    PatwariError::Protocol(
-                        "snapshot manifest missing capture.artifact_set_version".to_owned(),
-                    )
-                })?;
-        let artifacts = value
-            .get("artifacts")
-            .and_then(Value::as_array)
-            .ok_or_else(|| PatwariError::Protocol("snapshot missing artifacts".to_owned()))?
-            .iter()
-            .map(listed_artifact)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(SnapshotDetail {
-            source_agent,
-            artifact_set_version,
-            artifacts,
-        })
+        self.get_json(&target)
     }
 
     /// Streams one artifact into `sink`, verifying every declaration the archive made about it,

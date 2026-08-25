@@ -1,11 +1,16 @@
-//! The content-addressed blob cache — the whole of qanungo's local mirror.
+//! The content-addressed blob cache and the snapshot index — the whole of qanungo's local mirror.
 //!
-//! The mirror is deliberately minimal (qanungo #7): there is no cursor protocol, no eviction, no
-//! integrity audit, and no event store. A run re-lists the requested window and downloads only
-//! the transcripts it does not already hold, keyed by the content hash Patwari declares. Because
-//! the key *is* the content hash, "already cached" needs no metadata, no expiry, and no
-//! reconciliation — a file under a digest either is those bytes or the archive lied, and the
-//! download path already refuses the latter.
+//! The mirror is deliberately small (qanungo #7, hardened by #1): there is no cursor protocol, no
+//! eviction, no integrity audit, and no event store. A run re-lists the requested window and
+//! downloads only the transcripts it does not already hold, keyed by the content hash Patwari
+//! declares. Because the key *is* the content hash, "already cached" needs no metadata, no
+//! expiry, and no reconciliation — a file under a digest either is those bytes or the archive
+//! lied, and the download path already refuses the latter.
+//!
+//! Beside the blobs sits the **snapshot index**: the archive's own document for each snapshot the
+//! mirror has resolved, keyed by snapshot id. It is cacheable for the same reason the blobs are —
+//! a completed snapshot is immutable — and it is what lets a warm sync cost the listing pages and
+//! nothing else. See [`BlobCache::snapshot_document`] for what it may and may not decide.
 //!
 //! Archived transcripts are somebody's complete working conversation, so the cache is private by
 //! construction: directories are created `0o700` and blob files `0o600`, never widened
@@ -47,6 +52,14 @@ const FILE_MODE: u32 = 0o600;
 /// The cache subdirectory holding content-addressed transcript blobs.
 const BLOB_DIR: &str = "blobs";
 
+/// The cache subdirectory holding the snapshot index: one archive snapshot document per
+/// snapshot id (see [`BlobCache::snapshot_document`]).
+const SNAPSHOT_DIR: &str = "snapshots";
+
+/// Ceiling on one indexed snapshot document. The index holds documents this process wrote from
+/// responses that were themselves bounded, so anything larger is not one of ours.
+const MAX_SNAPSHOT_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
 /// Write buffer in front of a staged blob file. A streaming decoder can emit small writes, and
 /// this keeps them from becoming small `write(2)` calls without holding anything of consequence.
 const STAGE_BUFFER_BYTES: usize = 64 * 1024;
@@ -80,6 +93,7 @@ impl BlobCache {
         let root = root.into();
         create_private_dir(&root)?;
         create_private_dir(&root.join(BLOB_DIR))?;
+        create_private_dir(&root.join(SNAPSHOT_DIR))?;
         let cache = Self { root };
         cache.sweep_orphaned_temporaries();
         Ok(cache)
@@ -99,7 +113,13 @@ impl BlobCache {
     /// Failures here are ignored throughout: a cache that cannot be tidied is still a usable
     /// cache, and this is housekeeping, not the caller's errand.
     fn sweep_orphaned_temporaries(&self) {
-        let Ok(shards) = fs::read_dir(self.root.join(BLOB_DIR)) else {
+        for directory in [BLOB_DIR, SNAPSHOT_DIR] {
+            self.sweep_orphaned_temporaries_under(&self.root.join(directory));
+        }
+    }
+
+    fn sweep_orphaned_temporaries_under(&self, directory: &Path) {
+        let Ok(shards) = fs::read_dir(directory) else {
             return;
         };
         for shard in shards.filter_map(Result::ok) {
@@ -245,6 +265,94 @@ impl BlobCache {
         })
     }
 
+    /// The indexed document for `snapshot_id`, when the index holds one.
+    ///
+    /// # The snapshot index
+    ///
+    /// A Patwari snapshot is immutable once complete — its manifest, its artifact set, and every
+    /// declaration about them never change — so the document `GET /snapshots/{id}` returns is
+    /// as cacheable as the blobs are, and for the same reason: the key names bytes that cannot
+    /// be anything else. The mirror used to spend one such request per listed session on every
+    /// run to learn a content hash it had already been told; against the real archive that was
+    /// ~700 requests, and the whole of a warm sync. Indexed, a warm sync is the listing pages.
+    ///
+    /// What the index is *not*: it is not a source of anything the archive could have changed.
+    /// A snapshot can be tombstoned, but a tombstoned snapshot leaves the listing, and the
+    /// listing is what decides which ids are ever asked about here; an orphaned entry is a few
+    /// kilobytes nobody reads. And the mirror consults the index only for a snapshot whose
+    /// artifact it already holds — a download always runs on a freshly fetched document, so an
+    /// indexed URL never reaches the wire (see [`crate::sync`]).
+    ///
+    /// Anything that is not a well-formed document this process could have written — a missing
+    /// file, an unreadable one, one over `MAX_SNAPSHOT_DOCUMENT_BYTES`, an id that is not a
+    /// UUID — is `None`: the index is an accelerator, and a miss costs exactly the request it
+    /// would have cost before there was one.
+    pub fn snapshot_document(&self, snapshot_id: &str) -> Option<Vec<u8>> {
+        let path = self.snapshot_path(snapshot_id)?;
+        let file = File::open(path).ok()?;
+        if file.metadata().ok()?.len() > MAX_SNAPSHOT_DOCUMENT_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(
+            &mut io::Read::take(file, MAX_SNAPSHOT_DOCUMENT_BYTES),
+            &mut bytes,
+        )
+        .ok()?;
+        Some(bytes)
+    }
+
+    /// Indexes `document` under `snapshot_id`, atomically and owner-only like a blob.
+    ///
+    /// A malformed id is refused rather than written somewhere surprising; a document over the
+    /// ceiling is refused so the index can never hold what
+    /// [`snapshot_document`](Self::snapshot_document) would refuse to read back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the id is not a UUID, the document is over the ceiling, or the file
+    /// cannot be written.
+    pub fn index_snapshot(&self, snapshot_id: &str, document: &[u8]) -> io::Result<()> {
+        let path = self.snapshot_path(snapshot_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot id is not a lowercase UUID",
+            )
+        })?;
+        if document.len() as u64 > MAX_SNAPSHOT_DOCUMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot document is over the index ceiling",
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            create_private_dir(parent)?;
+        }
+        let temporary = path.with_extension(temporary_suffix());
+        let written = (|| {
+            let mut file = private_file(&temporary)?;
+            file.write_all(document)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, &path)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        written
+    }
+
+    /// Where the index entry for `snapshot_id` lives, or `None` for an id that is not a UUID —
+    /// the id comes from a network response and is used to build a path.
+    fn snapshot_path(&self, snapshot_id: &str) -> Option<PathBuf> {
+        is_snapshot_id(snapshot_id).then(|| {
+            self.root
+                .join(SNAPSHOT_DIR)
+                .join(&snapshot_id[..2])
+                .join(format!("{snapshot_id}.json"))
+        })
+    }
+
     /// Rejects anything that is not a bare lowercase sha256 hex digest before it can reach the
     /// filesystem: the digest comes from a network response and is used to build a path.
     fn checked_path(&self, digest: &str) -> io::Result<PathBuf> {
@@ -365,6 +473,16 @@ pub fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A lowercase hyphenated UUID, which is what every Patwari snapshot id is. Nothing else may
+/// name an index entry.
+pub fn is_snapshot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(at, byte)| match at {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
 /// A file-extension suffix unique to one `store` call: the process, plus a process-wide counter
 /// so two workers racing on the same digest never share a temporary path.
 fn temporary_suffix() -> String {
@@ -399,6 +517,70 @@ mod tests {
     use super::*;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    const SNAPSHOT: &str = "01a039ca-30a2-7e52-9d94-692d8fd58773";
+
+    #[test]
+    fn indexes_and_reads_back_a_snapshot_document() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(temporary.path().join("qanungo")).unwrap();
+        assert!(cache.snapshot_document(SNAPSHOT).is_none());
+        cache
+            .index_snapshot(SNAPSHOT, b"{\"artifacts\":[]}")
+            .unwrap();
+        assert_eq!(
+            cache.snapshot_document(SNAPSHOT).as_deref(),
+            Some(&b"{\"artifacts\":[]}"[..])
+        );
+        // Owner-only, like a blob: the document carries the capture manifest.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = cache.snapshot_path(SNAPSHOT).unwrap();
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Replacing is a rename, so a reader sees the old or the new document, never a prefix.
+        cache.index_snapshot(SNAPSHOT, b"{}").unwrap();
+        assert_eq!(
+            cache.snapshot_document(SNAPSHOT).as_deref(),
+            Some(&b"{}"[..])
+        );
+    }
+
+    #[test]
+    fn the_index_refuses_anything_that_is_not_a_uuid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(temporary.path().join("qanungo")).unwrap();
+        for id in [
+            "",
+            "../../etc/passwd",
+            DIGEST,
+            "01A039CA-30A2-7E52-9D94-692D8FD58773",
+        ] {
+            assert!(cache.index_snapshot(id, b"{}").is_err(), "{id:?}");
+            assert!(cache.snapshot_document(id).is_none(), "{id:?}");
+        }
+        assert!(is_snapshot_id(SNAPSHOT));
+        assert!(!is_snapshot_id("01a039ca-30a2-7e52-9d94-692d8fd5877"));
+        assert!(!is_snapshot_id("01a039ca030a2-7e52-9d94-692d8fd58773"));
+    }
+
+    #[test]
+    fn the_index_refuses_a_document_over_its_ceiling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(temporary.path().join("qanungo")).unwrap();
+        let oversized = vec![b' '; usize::try_from(MAX_SNAPSHOT_DOCUMENT_BYTES).unwrap() + 1];
+        assert!(cache.index_snapshot(SNAPSHOT, &oversized).is_err());
+        assert!(cache.snapshot_document(SNAPSHOT).is_none());
+        // And will not read one back that got there some other way.
+        let path = cache.snapshot_path(SNAPSHOT).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &oversized).unwrap();
+        assert!(cache.snapshot_document(SNAPSHOT).is_none());
+    }
 
     #[test]
     fn stores_and_reads_back_a_blob() {

@@ -1,12 +1,23 @@
-//! The minimal mirror: re-list the window, fetch what is not already cached.
+//! The mirror: re-list the window, fetch what is not already cached.
 //!
-//! There is no cursor protocol and no local index (qanungo #7 pulls all of that out of P0). A run
-//! lists the sessions whose latest snapshot landed inside the window, resolves each one's
-//! artifact, and asks the blob cache whether it already holds that content hash. A naive re-sync
-//! is affordable precisely because the expensive part — transferring the bytes — is skipped by
-//! content hash, and the cheap part is one small JSON request per session.
+//! A run lists the sessions whose latest snapshot landed inside the window, resolves each one's
+//! artifact, and asks the blob cache whether it already holds that content hash. There is no
+//! cursor protocol: Patwari's cursors are bound to one traversal (they carry the first page's
+//! high-watermark so a walk is exact while newer rows land), not a token that resumes across
+//! runs, and a window listing is a handful of hundred-row pages anyway. The re-list is the cheap
+//! part.
 //!
-//! The one place that budget stretches is a session whose projected latest snapshot cannot be
+//! What was not cheap was resolving: one `GET /snapshots/{id}` per listed session, every run, to
+//! learn a content hash this client had already been told — ~700 requests against the real
+//! archive, and the whole of a warm sync (qanungo #1). A snapshot is immutable, so that document
+//! is now kept in a **snapshot index** beside the blobs ([`BlobCache::snapshot_document`]) and a
+//! session whose projected snapshot is indexed *and* whose artifact is already held costs no
+//! request at all. The index is consulted only on that hit path: any session the cache cannot
+//! serve outright is resolved from a freshly fetched document, so nothing read out of the index
+//! ever decides a download or reaches the wire. A warm sync is therefore the listing pages, and
+//! a cold one costs exactly what it did.
+//!
+//! The one place the budget stretches is a session whose projected latest snapshot cannot be
 //! used: the mirror then asks for that session's own snapshot listing and takes the newest sibling
 //! that can be. See [`usable_snapshot`].
 //!
@@ -27,10 +38,12 @@
 //! turning a struggling archive into an unavailable one. One session's failure never fails the
 //! run; a failure to list the window does, because there is no report to write without it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 
 use crate::cache::BlobCache;
 use crate::patwari::{
@@ -184,7 +197,20 @@ pub struct SyncStats {
     /// for zstd artifacts, and a footer that conflated them would misreport what a re-sync costs
     /// the network.
     pub bytes_transferred: u64,
+    /// Sessions resolved from the snapshot index alone: no request of any kind.
+    pub snapshots_indexed: u64,
+    /// Snapshot documents actually requested from the archive this run — one per session the
+    /// index could not settle, plus one per sibling probed by a fallback. This is the number
+    /// qanungo #1 exists to drive to zero on a warm run.
+    pub snapshots_fetched: u64,
     pub elapsed: Duration,
+}
+
+/// Per-run request counters shared by the workers.
+#[derive(Default)]
+struct Requests {
+    snapshots_indexed: AtomicU64,
+    snapshots_fetched: AtomicU64,
 }
 
 /// The mirror's result: what can be read, and what could not be.
@@ -226,6 +252,7 @@ pub fn sync(
 
     let queue = Mutex::new(listed.into_iter().enumerate());
     let outcomes: Mutex<Vec<(usize, Outcome)>> = Mutex::new(Vec::new());
+    let requests = Requests::default();
     std::thread::scope(|scope| {
         for _ in 0..concurrency.clamp(1, MAX_CONCURRENCY) {
             scope.spawn(|| {
@@ -233,12 +260,14 @@ pub fn sync(
                     let Some((index, session)) = lock(&queue).next() else {
                         break;
                     };
-                    let outcome = mirror_session(client, cache, artifact, &session);
+                    let outcome = mirror_session(client, cache, artifact, &session, &requests);
                     lock(&outcomes).push((index, outcome));
                 }
             });
         }
     });
+    mirror.stats.snapshots_indexed = requests.snapshots_indexed.load(Ordering::Relaxed);
+    mirror.stats.snapshots_fetched = requests.snapshots_fetched.load(Ordering::Relaxed);
 
     let mut outcomes = outcomes
         .into_inner()
@@ -281,6 +310,7 @@ fn mirror_session(
     cache: &BlobCache,
     artifact: Artifact,
     session: &ListedSession,
+    requests: &Requests,
 ) -> Outcome {
     let skip = |source_agent: &str, reason: SkipReason| {
         Outcome::Skipped(Skip {
@@ -288,7 +318,15 @@ fn mirror_session(
             reason,
         })
     };
-    let snapshot = match client.snapshot(&session.snapshot_id) {
+    if let Some(session) = held_via_index(cache, artifact, session) {
+        requests.snapshots_indexed.fetch_add(1, Ordering::Relaxed);
+        return Outcome::Mirrored {
+            session,
+            lookup: crate::cache::Lookup::Hit,
+            transferred_bytes: 0,
+        };
+    }
+    let snapshot = match fetch_snapshot(client, cache, &session.snapshot_id, requests) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return skip(
@@ -298,7 +336,7 @@ fn mirror_session(
         }
     };
     let source_agent = snapshot.source_agent.clone();
-    let snapshot = match usable_snapshot(client, artifact, session, snapshot) {
+    let snapshot = match usable_snapshot(client, cache, artifact, session, snapshot, requests) {
         Ok(Resolution::Usable(snapshot)) => snapshot,
         Ok(Resolution::Unusable(reason)) => return skip(&source_agent, reason),
         // The listing itself failed, so what this session holds is unknown. Saying "no such
@@ -308,19 +346,7 @@ fn mirror_session(
     let Some(wanted) = artifact.of(&snapshot) else {
         return skip(&source_agent, SkipReason::MissingArtifact(artifact));
     };
-    let mirrored = MirroredSession {
-        source_hash: wanted.original_sha256.clone(),
-        // Both taken from whichever snapshot actually carries the artifact: a fallback sibling
-        // states its own provenance, and a degenerate snapshot's is not evidence about it.
-        source_agent: snapshot.source_agent.clone(),
-        artifact_set_version: snapshot.artifact_set_version,
-        size_bytes: wanted.original_size_bytes,
-        // Taken from the *listing*, which is the row `activity_from` filtered, so the window a
-        // session is placed in is decided by the same timestamp that put it in the listing at all.
-        // A fallback sibling's own completion time would be a different clock reading.
-        archived_at: parse_archive_time(&session.completed_at),
-        repository: session.repository.clone(),
-    };
+    let mirrored = mirrored(session, &snapshot, wanted);
 
     if cache.contains(&mirrored.source_hash) {
         return Outcome::Mirrored {
@@ -369,6 +395,68 @@ fn mirror_session(
     }
 }
 
+/// The mirror's record of a session read from `snapshot`, whichever snapshot that is.
+fn mirrored(
+    session: &ListedSession,
+    snapshot: &SnapshotDetail,
+    wanted: &ListedArtifact,
+) -> MirroredSession {
+    MirroredSession {
+        source_hash: wanted.original_sha256.clone(),
+        // Both taken from whichever snapshot actually carries the artifact: a fallback sibling
+        // states its own provenance, and a degenerate snapshot's is not evidence about it.
+        source_agent: snapshot.source_agent.clone(),
+        artifact_set_version: snapshot.artifact_set_version,
+        size_bytes: wanted.original_size_bytes,
+        // Taken from the *listing*, which is the row `activity_from` filtered, so the window a
+        // session is placed in is decided by the same timestamp that put it in the listing at all.
+        // A fallback sibling's own completion time would be a different clock reading.
+        archived_at: parse_archive_time(&session.completed_at),
+        repository: session.repository.clone(),
+    }
+}
+
+/// The session as the cache alone can state it: its projected snapshot is indexed, usable for
+/// `artifact` on its own, and the artifact's blob is held. Anything short of that — no entry, an
+/// entry this build cannot read, a projection that needs the sibling walk, a blob that is not
+/// there — is `None`, and the session is resolved from the archive exactly as if there were no
+/// index. That is the whole safety argument: the index can only ever *confirm* a hit, never
+/// choose a download.
+fn held_via_index(
+    cache: &BlobCache,
+    artifact: Artifact,
+    session: &ListedSession,
+) -> Option<MirroredSession> {
+    let document = cache.snapshot_document(&session.snapshot_id)?;
+    let document: Value = serde_json::from_slice(&document).ok()?;
+    let snapshot = SnapshotDetail::from_document(&document).ok()?;
+    if !artifact.usable(&snapshot) {
+        return None;
+    }
+    let wanted = artifact.of(&snapshot)?;
+    cache
+        .contains(&wanted.original_sha256)
+        .then(|| mirrored(session, &snapshot, wanted))
+}
+
+/// Fetches a snapshot's document from the archive, indexes it, and parses it.
+///
+/// Indexing is best-effort and precedes parsing: a document is the archive's immutable statement
+/// whether or not this build can read it, and a cache that cannot be written is still a cache.
+fn fetch_snapshot(
+    client: &ReadClient,
+    cache: &BlobCache,
+    snapshot_id: &str,
+    requests: &Requests,
+) -> Result<SnapshotDetail, PatwariError> {
+    requests.snapshots_fetched.fetch_add(1, Ordering::Relaxed);
+    let document = client.snapshot_document(snapshot_id)?;
+    if let Ok(bytes) = serde_json::to_vec(&document) {
+        let _ = cache.index_snapshot(snapshot_id, &bytes);
+    }
+    SnapshotDetail::from_document(&document)
+}
+
 /// What looking through a session's snapshots concluded.
 enum Resolution {
     /// A snapshot carrying the wanted artifact in a form this build can read.
@@ -415,9 +503,11 @@ enum Resolution {
 /// because a summary needs no interpreter to be read.
 fn usable_snapshot(
     client: &ReadClient,
+    cache: &BlobCache,
     artifact: Artifact,
     session: &ListedSession,
     projected: SnapshotDetail,
+    requests: &Requests,
 ) -> Result<Resolution, PatwariError> {
     if artifact.usable(&projected) {
         return Ok(Resolution::Usable(projected));
@@ -437,7 +527,7 @@ fn usable_snapshot(
         .filter(|sibling| sibling.snapshot_id != session.snapshot_id)
         .take(MAX_FALLBACK_PROBES)
     {
-        let detail = client.snapshot(&sibling.snapshot_id)?;
+        let detail = fetch_snapshot(client, cache, &sibling.snapshot_id, requests)?;
         if artifact.usable(&detail) {
             return Ok(Resolution::Usable(detail));
         }

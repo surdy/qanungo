@@ -640,7 +640,8 @@ impl Report<'_> {
         let _ = writeln!(
             out,
             "_Instrumentation — sync {} · fold {} · {} sessions{comparison} · {} folded · cache \
-             {} hits / {} misses ({} transferred) · rule pack {} · archive {} · cache {}_",
+             {} hits / {} misses ({} transferred) · snapshots {} indexed / {} fetched · rule pack \
+             {} · archive {} · cache {}_",
             format::elapsed(instrumentation.sync.elapsed),
             format::elapsed(instrumentation.fold_elapsed),
             instrumentation.sessions_folded,
@@ -648,6 +649,8 @@ impl Report<'_> {
             instrumentation.sync.cache_hits,
             instrumentation.sync.cache_misses,
             format::bytes(instrumentation.sync.bytes_transferred),
+            instrumentation.sync.snapshots_indexed,
+            instrumentation.sync.snapshots_fetched,
             instrumentation.rule_pack.stamp(),
             instrumentation.patwari_url,
             display_path(&instrumentation.cache_root),
@@ -781,6 +784,8 @@ mod tests {
                 sessions_listed: 1,
                 cache_hits: 1,
                 cache_misses: 0,
+                snapshots_indexed: 1,
+                snapshots_fetched: 0,
                 bytes_transferred: 0,
                 elapsed: Duration::from_millis(120),
             },

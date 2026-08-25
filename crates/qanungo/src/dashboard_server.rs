@@ -403,17 +403,23 @@ impl Service {
 ///
 /// # What three lanes actually cost, measured
 ///
-/// Against the production archive on 2026-08-25, warm cache: **45.4 s** for the whole refresh —
-/// coaching sync 16.10 s + fold 6.32 s, cost sync 15.95 s + fold 4.62 s, standup sync 2.37 s + fold
-/// 20 ms. The second refresh in the same process took 45.3 s, so there is no warm-up left to find.
+/// Against the production archive on 2026-08-25, warm cache, before the snapshot index: **45.4 s**
+/// for the whole refresh — coaching sync 16.10 s + fold 6.32 s, cost sync 15.95 s + fold 4.62 s,
+/// standup sync 2.37 s + fold 20 ms. The second refresh in the same process took 45.3 s, so there
+/// was no warm-up left to find.
 ///
 /// The blob cache spares the **transfers** and not the requests, and that is the number worth
 /// stating plainly rather than hoping for. Every one of the three mirrors reported `0 B
 /// transferred` — the cost lane's 705 sessions were all cache hits over a window twice the
-/// coaching lane's — and its sync still cost 15.95 s, because [`crate::sync`] asks the archive for
-/// one snapshot document per listed session whether or not the artifact behind it is already on
-/// disk. So the refresh is very nearly the *sum* of the three lanes' own runs, and an earlier draft
-/// of this comment claiming otherwise was wrong.
+/// coaching lane's — and its sync still cost 15.95 s, because [`crate::sync`] asked the archive
+/// for one snapshot document per listed session whether or not the artifact behind it was already
+/// on disk. So the refresh was very nearly the *sum* of the three lanes' own runs, and an earlier
+/// draft of this comment claiming otherwise was wrong.
+///
+/// That was the friction that pulled qanungo #1's snapshot index (same day): with the documents
+/// indexed, the same refresh measured coaching sync 1.25 s + fold 5.54 s, cost sync 1.14 s + fold
+/// 4.92 s, standup sync 89 ms + fold 19 ms — **~13 s**, of which the archive is ~2.5 s. The
+/// refresh is now fold-bound, which is the term decision 11 said a persistent store would be for.
 ///
 /// What that buys is still worth having. On a cold cache the sharing is real: the standup lane
 /// alone measured 4.94 s cold against 2.37 s warm, and the transcript lanes' cold cost is the
@@ -512,7 +518,7 @@ fn instrumentation_line(folded: &Folded) -> String {
     let instrumentation = &folded.instrumentation;
     format!(
         "sync {} · fold {} · {} sessions (+{} comparison) · {} folded · cache {} hits / {} misses \
-         ({} transferred) · rule pack {}",
+         ({} transferred) · snapshots {} indexed / {} fetched · rule pack {}",
         format::elapsed(instrumentation.sync.elapsed),
         format::elapsed(instrumentation.fold_elapsed),
         instrumentation.sessions_folded,
@@ -521,6 +527,8 @@ fn instrumentation_line(folded: &Folded) -> String {
         instrumentation.sync.cache_hits,
         instrumentation.sync.cache_misses,
         format::bytes(instrumentation.sync.bytes_transferred),
+        instrumentation.sync.snapshots_indexed,
+        instrumentation.sync.snapshots_fetched,
         instrumentation.rule_pack.stamp(),
     )
 }
