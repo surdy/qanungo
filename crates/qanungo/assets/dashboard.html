@@ -187,6 +187,70 @@ summary {
 }
 .empty { color: var(--ink-2); }
 
+/* Evidence. A finding's sessions are a scrolling column of collapsed rows; opening one
+   is what fetches it, so a window with sixty firing sessions costs sixty summaries and
+   nothing else until somebody asks. */
+.sessions { margin-top: 0.4rem; max-height: 24rem; overflow-y: auto; }
+.session { border-top: 1px solid var(--rule); }
+.session > summary {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+.excerpt {
+  margin: 0.35rem 0 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid var(--rule);
+  font-size: 0.82rem;
+}
+.excerpt-where {
+  color: var(--ink-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+.excerpt-field {
+  margin: 0.25rem 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+.excerpt-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  margin-top: 0.4rem;
+}
+.excerpt.failed { border-left-color: var(--down); }
+.excerpt-note { color: var(--ink-muted); font-size: 0.75rem; margin-top: 0.3rem; }
+
+/* Structural evidence: the shape of the work, drawn from timestamps only. */
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.25rem;
+  margin: 0.4rem 0 0.5rem;
+  font-size: 0.82rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.sitting-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.2rem;
+  font-size: 0.75rem;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+.sitting-when { white-space: nowrap; }
+.sitting-track { flex: 1 1 6rem; min-width: 4rem; height: 0.55rem; background: var(--rule); border-radius: 3px; }
+.sitting-bar { height: 100%; background: var(--ink-2); border-radius: 3px; min-width: 2px; }
+
 footer {
   margin-top: 3rem;
   padding-top: 1rem;
@@ -227,7 +291,9 @@ footer .archive { overflow-wrap: anywhere; }
  *
  * It also contains no links. Patwari serves unredacted blobs, so a deep link
  * from this page into the archive would hand every tailnet device a whole
- * transcript. Evidence here is a hash you take to your own shell.
+ * transcript. The only evidence this page can expand is what the payload itself
+ * named — one scrubbed event per anchor, from this server's own route — and a
+ * whole session is still a hash you take to your own shell.
  */
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -326,6 +392,159 @@ function laneTile(lane) {
   return tile;
 }
 
+/* One excerpt, as the server scrubbed it. Every field is set as text: the markers a
+   redactor leaves are shown as they are, because a reader has to be able to see that
+   the scrub fired. */
+function excerptNode(excerpt) {
+  const node = el("div", "excerpt" + (excerpt.outcome === false ? " failed" : ""));
+  const where = [
+    excerpt.tool || "unattributed tool",
+    excerpt.event,
+    excerpt.at,
+    "record " + excerpt.record,
+    "line " + excerpt.line,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  node.appendChild(el("div", "excerpt-where", where));
+  for (const [label, value] of [
+    ["Command", excerpt.command],
+    ["Error", excerpt.error],
+    ["Output", excerpt.output],
+  ]) {
+    if (value === null || value === undefined || value === "") continue;
+    node.appendChild(el("div", "excerpt-label", label));
+    node.appendChild(el("pre", "excerpt-field", value));
+  }
+  const notes = [];
+  if (!excerpt.command && !excerpt.error && !excerpt.output) {
+    notes.push("this event carried no command, error, or output of its own");
+  }
+  if (excerpt.truncated) notes.push("cut to fit; the transcript has the rest");
+  if (excerpt.redaction.total) {
+    notes.push(
+      excerpt.redaction.total +
+        " redacted (" +
+        excerpt.redaction.fired.map((fired) => fired.pattern + " ×" + fired.count).join(", ") +
+        ")"
+    );
+  } else if (!excerpt.redaction.secrets) {
+    notes.push("served raw — this dashboard was started with --no-redact");
+  }
+  if (notes.length) node.appendChild(el("div", "excerpt-note", notes.join(" · ")));
+  return node;
+}
+
+/* Structural evidence: what a session-shaped rule actually measured. Timestamps and
+   counts, and a bar per sitting scaled against the longest one in the same session. */
+function structuralNode(structural) {
+  const node = el("div");
+  const stats = el("div", "stats");
+  const pairs = [
+    ["active", structural.active.rendered],
+    ["span", structural.span.rendered],
+    ["longest sitting", structural.longest_sitting.rendered],
+    ["sittings", structural.sittings],
+    ["user requests", structural.user_requests],
+    ["assistant messages", structural.assistant_messages],
+    ["tool activities", structural.tool_activities],
+  ];
+  for (const [label, value] of pairs) {
+    if (value === null || value === undefined) continue;
+    stats.appendChild(el("span", null, label + " " + value));
+  }
+  node.appendChild(stats);
+
+  const longest = structural.boundaries.reduce(
+    (most, sitting) => Math.max(most, sitting.seconds),
+    0
+  );
+  for (const sitting of structural.boundaries) {
+    const row = el("div", "sitting-row");
+    row.appendChild(el("span", "sitting-when", sitting.from + " → " + sitting.to));
+    const track = el("div", "sitting-track");
+    const bar = el("div", "sitting-bar");
+    bar.style.width = (longest > 0 ? (sitting.seconds / longest) * 100 : 0) + "%";
+    track.appendChild(bar);
+    row.appendChild(track);
+    row.appendChild(el("span", "sitting-when", sitting.rendered));
+    node.appendChild(row);
+  }
+  if (structural.boundaries_elided > 0) {
+    node.appendChild(
+      el(
+        "div",
+        "excerpt-note",
+        structural.boundaries_elided + " further sittings are counted above and not drawn"
+      )
+    );
+  }
+  return node;
+}
+
+async function loadExcerpts(into, sourceHash, anchors) {
+  into.replaceChildren(el("div", "excerpt-note", "Fetching " + anchors.length + " excerpts…"));
+  const nodes = [];
+  for (const anchor of anchors) {
+    try {
+      const response = await fetch("/api/evidence/" + sourceHash + "/" + anchor.locator, {
+        cache: "no-store",
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        nodes.push(el("div", "excerpt-note", "No excerpt for " + anchor.locator + ": " + body.detail));
+        continue;
+      }
+      nodes.push(excerptNode(body));
+    } catch (error) {
+      nodes.push(el("div", "excerpt-note", "Could not fetch the excerpt: " + error.message));
+    }
+  }
+  into.replaceChildren(...nodes);
+}
+
+/* One cited session. Collapsed until asked for, and what asking costs is bounded: the
+   payload already said which events this row can show, and the server will resolve no
+   others. */
+function sessionRow(finding, evidence) {
+  const row = el("details", "session");
+  const anchors = evidence.anchors || [];
+  const label =
+    "sha256:" +
+    evidence.source_hash +
+    (anchors.length ? " — " + anchors.length + " counted events" : "");
+  row.appendChild(el("summary", null, label));
+  const body = el("div");
+  if (evidence.structural) body.appendChild(structuralNode(evidence.structural));
+  if (anchors.length) {
+    const excerpts = el("div");
+    body.appendChild(excerpts);
+    let fetched = false;
+    row.addEventListener("toggle", () => {
+      if (!row.open || fetched) return;
+      fetched = true;
+      loadExcerpts(excerpts, evidence.source_hash, anchors);
+    });
+  } else if (finding.evidence_kind !== "structural") {
+    body.appendChild(
+      el(
+        "div",
+        "excerpt-note",
+        "This session's events are counted but not anchored — the fold's per-session anchor " +
+          "budget was already spent. The counts above are unaffected."
+      )
+    );
+  }
+  row.appendChild(body);
+  return row;
+}
+
+const EVIDENCE_KIND = {
+  event: "the events it counted",
+  structural: "what it measured — timestamps and counts, never an utterance",
+  mixed: "the failures it counted, and the shape it measured",
+};
+
 function findingCard(finding, folded) {
   const card = el("div", "finding");
   card.appendChild(el("h3", null, finding.title));
@@ -345,13 +564,20 @@ function findingCard(finding, folded) {
 
   const details = el("details");
   details.appendChild(
-    el("summary", null, "Evidence — " + finding.source_hashes.length + " transcript hashes")
+    el(
+      "summary",
+      null,
+      "Evidence — " +
+        finding.evidence.length +
+        " sessions, showing " +
+        (EVIDENCE_KIND[finding.evidence_kind] || "what the rule saw")
+    )
   );
-  const hashes = el("ul", "hashes");
-  for (const hash of finding.source_hashes) {
-    hashes.appendChild(el("li", null, "sha256:" + hash));
+  const sessions = el("div", "sessions");
+  for (const evidence of finding.evidence) {
+    sessions.appendChild(sessionRow(finding, evidence));
   }
-  details.appendChild(hashes);
+  details.appendChild(sessions);
   card.appendChild(details);
   return card;
 }
@@ -411,9 +637,13 @@ function render(data) {
       "not that the practice is perfect. Scores move across windows; they do not compare across " +
       "lanes. Fleet is the unweighted mean of the per-harness scores, and carries an arrow only " +
       "when the same harnesses scored the lane in both windows.",
-    "This page renders aggregates, rule ids, counts and transcript content hashes — never " +
-      "transcript text, and never a link into the archive. To read a session, take its hash to " +
-      "your own shell.",
+    "This page renders aggregates, rule ids, counts and transcript content hashes, and will " +
+      "expand a finding into the individual events that rule counted — one event each, " +
+      (provenance.redaction.secrets
+        ? "scrubbed for secrets by pattern set " + provenance.redaction.pattern_revision
+        : "SERVED RAW: this dashboard was started with --no-redact") +
+      ". Nothing else from a transcript is served, and there is no link into the archive. To " +
+      "read a whole session, take its hash to your own shell.",
     "Window " +
       provenance.window +
       " · " +
