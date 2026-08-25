@@ -32,7 +32,9 @@ ADR 0012 anticipated qanungo carrying "application commands such as a prompt-cor
 
 ## The dashboard
 
-A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring munshi-dashboard's read-only, contract-consuming posture. Score cards + anti-pattern findings first, then timeline/heatmaps/output/context-health/chronicle. Every finding, chart point, and session row deep-links into `session-recall` → the verified transcript in Patwari, **redacted** on the way to the browser (redaction is toggleable, default on).
+A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring munshi-dashboard's read-only, contract-consuming posture. Score cards + anti-pattern findings first, then timeline/heatmaps/output/context-health/chronicle. Verbatim evidence is **redacted on the way to the browser** (toggleable, default on) and served by qanungo itself.
+
+> The original plan had every finding, chart point, and session row deep-link into `session-recall` → the verified transcript in Patwari. The 2026-08-24 grilling on [#5](https://github.com/surdy/qanungo/issues/5) **retracted that**: Patwari serves raw blobs and never redacts, so such a link does not hand a browser a redacted transcript — it hands any tailnet device the whole unredacted one. Raw Patwari URLs therefore never appear in dashboard HTML; anything verbatim is cut from the local cache, redacted, and served by qanungo. The recall funnel stays a CLI/harness affordance, where your own shell already has raw access.
 
 ## Skills & agents
 
@@ -110,20 +112,37 @@ munshi's own placeholder each land in **Gaps** with the reason, never in the nar
 silently dropped.
 
 **The dashboard** ([#5](https://github.com/surdy/qanungo/issues/5)) is the fourth lane and the first
-that is not a document. `qanungo dashboard` serves the coaching report's own numbers — five score
-cards, the findings under them, a provenance footer — as one embedded single-file page on a
-hand-rolled `std::net` server, theme-aware and legible from a phone to a TV. It is a *presentation*,
-not a second computation: it calls the same fold `qanungo report` calls, on the same window pair,
-and serializes the result instead of rendering it as Markdown, so the page and the terminal cannot
-come to disagree about a score. A long-lived process re-syncs and re-folds every `--refresh`, swaps
-the served payload atomically, and pushes an SSE event so open pages re-fetch; a request is then a
+that is not a document. `qanungo dashboard` serves the other three lanes' own numbers — five score
+cards, the findings under them, the quarter's bill, the week's narrative, a provenance footer — as
+one embedded single-file page on a hand-rolled `std::net` server, theme-aware and legible from a
+phone to a TV. It is a *presentation*, not a second computation: it calls the same three folds
+`report`, `cost`, and `standup` call, and serializes the results instead of rendering them as
+Markdown, so the page and the terminal cannot come to disagree about a score or a dollar. Each
+section keeps its own lane's window — `--last 30d`, `--cost-last 12w`, `--standup-last 7d` — because
+a score wants a month, a bill wants a quarter, and a standup wants a week you can read to the end of.
+One refresh folds all three and publishes **one** payload, so a reader can never see a bill from one
+refresh beside a standup from another. A long-lived process re-folds every `--refresh`, swaps the
+served payload atomically, and pushes an SSE event so open pages re-fetch; a request is then a
 memcpy. Per the issue's 2026-08-24 grilling the persistent event store stays **deferred** — sync
 dominates the fold, and a store would fix the smaller half — so process memory is the disposable
-materialization. V1 renders **aggregates only**: scores, rule ids, counts, and content hashes, with
-no transcript text and, deliberately, **no link into Patwari**, which serves unredacted blobs; a
-hash is what you take to your own shell. Loopback by default; `--bind` on a tailnet address is how a
-phone reads it, and startup prints one line saying that nothing authenticates a caller and the
-tailnet is therefore the only boundary.
+materialization.
+
+**What the served surface renders is three different claims, and it says which is which.** The
+coaching and cost sections carry aggregates and hashes: scores, rule ids, counts, dollars, token
+counts, the model and repository identifiers the archive itself recorded — each clamped on the way
+out — and `sha256` content hashes. No transcript text reaches either, by construction, exactly as
+their Markdown documents hold that line. The standup section is deliberately different: it renders
+**verbatim-class archived prose**, the same `summary.md` text `qanungo standup` prints, and it
+renders it **scrubbed** — the fold runs the [#8](https://github.com/surdy/qanungo/issues/8) redactor
+on the way into its own types, so no unscrubbed string ever reaches the payload, and the served
+strings are pinned equal to the fold's. A finding will also expand into the individual events its
+rule counted, one scrubbed event each, from this server's own route. Redaction is **on by default**,
+and `--no-redact` is **launch-time only**: it belongs to the process, never to a request, because a
+scrub a browser could flip with a query string is a bypass with a nicer name — and turning it off on
+a non-loopback bind prints its own very loud line. There is deliberately **no link into Patwari**,
+which serves unredacted blobs; a hash is what you take to your own shell. Loopback by default;
+`--bind` on a tailnet address is how a phone reads it, and startup prints one line saying that
+nothing authenticates a caller and the tailnet is therefore the only boundary.
 
 ```sh
 cargo run -- report --last 30d                       # the production archive on the LAN
@@ -132,14 +151,19 @@ cargo run -- cost --last 12w                         # a quarter, in the units t
 cargo run -- standup --last 7d                       # a week you can read to the end of
 cargo run -- standup --last 30d --no-redact          # secrets unscrubbed, and the footer says so
 cargo run -- dashboard --last 30d                    # http://127.0.0.1:8878, refolded every 5m
+cargo run -- dashboard --cost-last 4w --standup-last 3d   # narrow the bill and the narrative
 cargo run -- dashboard --bind 100.64.0.7:8878        # the tailnet, unauthenticated, and it says so
 ```
 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
-minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default. The
-dashboard's `--refresh` is a *disjoint* grammar — `s`, `m`, `h` — so neither parser accepts the
-other's units, and an interval faster than a minute is refused rather than clamped: a warm re-sync
-takes about 17 s, and polling near that is load on a LAN archive rather than a fresher page.
+minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default. All
+three of the dashboard's windows share that grammar — `--last` (default `30d`), `--cost-last`
+(default `12w`), `--standup-last` (default `7d`), each defaulting to what its own command defaults
+to — and they move independently, because narrowing the coaching window says nothing about what the
+bill should cover. The dashboard's `--refresh` is a *disjoint* grammar — `s`, `m`, `h` — so neither
+parser accepts the other's units, and an interval faster than a minute is refused rather than
+clamped: a warm three-lane refresh measures about **45 s** against the production archive, and
+polling near that is load on a LAN archive rather than a fresher page.
 
 `--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the blob cache, which otherwise
 lives in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
@@ -156,8 +180,7 @@ until the footer's fold-cost and rule-firing data say otherwise. The prices in
 figure with a date, changed only by adding a row.
 
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
-dashboard's own later slices — redacted evidence excerpts (the #8-gated surface), standup and cost
-views over the folds that already ship, scope selection, the timeline, and the heatmap once
-munshi#77 types the capture machine's local offset. Full research + rationale:
+dashboard's own remaining slices — scope selection by repository and harness, the timeline, and the
+heatmap once munshi#77 types the capture machine's local offset. Full research + rationale:
 `~/repos/research/ai-coach/`. See
 issues for the phased plan.

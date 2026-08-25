@@ -991,9 +991,12 @@ impl Payload<'_> {
                     self.standup.standup.bytes_read,
                 ),
             },
-            // What a refresh of the whole page costs, which is not the sum of the three lanes'
-            // syncs: they share one blob cache, so the second and third mirrors skip every transfer
-            // the first already made. Measured rather than added.
+            // What a refresh of the whole page costs, wall-clock, across all three folds. Measured
+            // rather than added — though against production it lands within a tenth of a second of
+            // the sum of the three lanes above (45.4 s warm), because the shared blob cache spares
+            // the *bytes* and not the requests: `crate::sync` asks the archive for one snapshot
+            // document per listed session before it ever consults the cache. It is measured because
+            // whether it equals that sum is a fact about the mirror that can change.
             "refresh_elapsed": format::elapsed(self.folds_elapsed),
             "refresh_elapsed_millis": u64::try_from(self.folds_elapsed.as_millis())
                 .unwrap_or(u64::MAX),
@@ -1615,8 +1618,11 @@ mod tests {
             "a narrative folds one window; there is no arrow to draw",
         );
 
-        // What a whole refresh costs, measured rather than summed: the three mirrors share one blob
-        // cache, so adding their syncs would over-report what the page actually pays.
+        // What a whole refresh costs, wall-clock across the three folds — taken from the clock
+        // rather than reconstructed from the footers, which is why this fixture's 370 ms is nothing
+        // like the sum of the lane figures above it. Against production the two do very nearly
+        // agree (the cache spares bytes, not requests); this asserts the field reports the
+        // measurement it was handed and not an arithmetic over its neighbours.
         assert_eq!(provenance["refresh_elapsed"], "370 ms");
         assert_eq!(provenance["refresh_elapsed_millis"], 370);
 

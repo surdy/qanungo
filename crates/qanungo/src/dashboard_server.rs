@@ -30,12 +30,16 @@
 //! - **It folds its own numbers instead of shelling out.** munshi-dashboard invokes `munshi
 //!   ... --json` per panel. There is no `qanungo report --json`, and inventing one so a dashboard
 //!   could parse it back would be two serializations and a subprocess where a function call does.
-//!   It calls [`command::fold_coaching`] directly — the same call `qanungo report` makes.
-//! - **It refreshes in the background.** A fold of thirty days is 17 s of sync plus 5 s of fold
-//!   against the production archive; on the request path that is not a dashboard, it is a wait. So
-//!   the fold happens on a timer, the payload is serialized once per refresh, and a request is a
-//!   memcpy. This is the "in-memory service" half of the 2026-08-24 grilling: process memory is the
-//!   disposable materialization, and the persistent event store stays deferred.
+//!   It calls [`command::fold_coaching`], [`command::fold_cost`], and [`command::fold_standup`]
+//!   directly — the same three calls `qanungo report`, `qanungo cost`, and `qanungo standup` make.
+//! - **It refreshes in the background.** The three lanes together are **45 s** against the
+//!   production archive, warm (measured 2026-08-25), and very nearly the sum of the three CLI runs:
+//!   the shared blob cache spares the bytes and not the requests, because [`crate::sync`] asks the
+//!   archive for one snapshot document per listed session before it consults the cache. On the
+//!   request path that is not a dashboard, it is a wait — so the folds happen on a timer, the
+//!   payload is serialized once per refresh, and a request is a memcpy. This is the "in-memory
+//!   service" half of the 2026-08-24 grilling: process memory is the disposable materialization,
+//!   and the persistent event store stays deferred.
 //! - **It pushes.** `/api/events` is Server-Sent Events, so an open page learns about a refresh
 //!   instead of polling for one. A poll would either be slower than the refresh interval or busier
 //!   than it, and neither is what a page that changes every five minutes wants.
@@ -576,6 +580,16 @@ fn refresh_loop(
 /// Patching the serialized document rather than rebuilding it keeps the failure path from needing
 /// the [`Folded`] that produced it, which would mean holding a second window's worth of session
 /// metrics alive for the whole life of the process against the chance the archive goes away.
+///
+/// **What a re-stamp costs now.** It bumps the generation on purpose — a page's numbers going stale
+/// is a change worth pushing — and since the standup-and-cost slice the body every open tab then
+/// re-fetches is ~744 KiB against production rather than the ~162 KiB it was, for a payload whose
+/// only changed bytes are one timestamp. On a tailnet with a handful of tabs that is not worth a
+/// mechanism, and inventing a patch protocol so a stale-stamp could be pushed without a re-fetch
+/// would be a second way for a page and a payload to disagree about a generation. The honest fix is
+/// upstream of this function: the standup section is 71% of that body, and bounding what a served
+/// narrative renders is the follow-up where it gets addressed — see [`crate::dashboard`]'s
+/// "One route, measured".
 fn republish_as_stale(service: &Service, generation: u64, since: DateTime<Utc>) {
     let current = service.snapshot();
     let stale = format!(r#""stale_since":"{}""#, crate::report::stamp(since));
