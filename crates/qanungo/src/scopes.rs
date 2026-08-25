@@ -99,12 +99,14 @@ pub struct RepositoryScope<'a> {
 
 impl RepositoryScope<'_> {
     /// How many sessions each harness contributed to this scope's reported window, by rendered
-    /// label — the same clamp the lane columns use.
-    pub fn by_harness(&self) -> BTreeMap<String, usize> {
+    /// label — the *same* rendering the lane columns and the evidence tags use, clamped and then
+    /// scrubbed. A count keyed on a label the control spells differently is a count nobody can
+    /// line up with anything.
+    pub fn by_harness(&self, redactor: &Redactor) -> BTreeMap<String, usize> {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for session in &self.sessions {
             *counts
-                .entry(crate::format::identifier(&session.source_agent))
+                .entry(identifier_field(&session.source_agent, redactor))
                 .or_default() += 1;
         }
         counts
@@ -268,7 +270,7 @@ mod tests {
         assert!(!scopes[3].attributed);
         assert_eq!(scopes[3].sessions.len(), 1);
         assert_eq!(
-            scopes[0].by_harness(),
+            scopes[0].by_harness(&Redactor::new()),
             BTreeMap::from([("claude-code".to_owned(), 2), ("copilot-cli".to_owned(), 1),]),
         );
     }

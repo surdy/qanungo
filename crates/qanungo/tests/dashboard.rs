@@ -2444,37 +2444,44 @@ impl RuleKey for serde_json::Value {
 }
 
 /// A repository name is an archive-stated identifier on a surface that renders verbatim, so it is
-/// clamped **and then** scrubbed — and the label it becomes is what the scope control, the evidence
-/// tags, and the group key all use, so there is nowhere for the raw value to survive.
+/// clamped **and then** scrubbed — on **every** path that spells it.
+///
+/// The review of this slice found the path that did not. The cost lane rendered its repository
+/// through the clamp alone, and the scope key went through clamp-then-scrub, so a repository named
+/// like a credential came out as two different strings: the marker on the coaching side and the
+/// raw token on the bill. That put the secret on the wire *and* split one repository into two
+/// options, each narrowing half the page — which is precisely what a scope control must never do.
+///
+/// Every session here carries **priced usage**, because that is what puts a repository in
+/// `cost.by_repository` at all. The earlier version of this test used a transcript with no billing
+/// records in it, so the cost path was never taken and the test could not fail.
 #[test]
 fn a_hostile_repository_name_never_reaches_a_scope_control() {
-    let clean = transcript("rules/marathon-session.jsonl");
-    let sessions: Vec<ArchivedSession> = (0..6u8)
-        .map(|index| {
-            let session = ArchivedSession::new(index, "claude-code", &clean, 24);
-            match index % 3 {
-                // A live-shaped credential inside the clamp's ceiling: it reaches the scrub and
-                // leaves as a marker.
-                0 => session.in_repository("ghp_FAKEfake0123456789ABCDEFabcdef012345"),
-                // A table pipe and a backtick: not shaped like an identifier at all, so it is
-                // replaced wholesale rather than truncated — a prefix of arbitrary text is still
-                // arbitrary text.
-                1 => session.in_repository("surdy/evil|table`break"),
-                _ => session.in_repository("surdy/qanungo"),
-            }
-        })
-        .collect();
+    // The billing fixture once per repository, with its message ids rewritten each time:
+    // `CostTotals::fold` deduplicates by message id across the whole window, so verbatim copies
+    // would price once and only one repository would get a row.
+    let billing = |tag: &str| {
+        String::from_utf8(transcript("cost/claude-billing.jsonl"))
+            .expect("the fixture is utf-8")
+            .replace("msg_", &format!("msg_{tag}_"))
+            .into_bytes()
+    };
+    let planted = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+    // Not shaped like an identifier at all — a table pipe and a backtick — so the clamp replaces it
+    // wholesale rather than truncating: a prefix of arbitrary text is still arbitrary text.
+    let unrenderable = "surdy/evil|table`break";
+    let sessions = vec![
+        ArchivedSession::new(1, "claude-code", &billing("a"), 24).in_repository(planted),
+        ArchivedSession::new(2, "claude-code", &billing("b"), 25).in_repository(unrenderable),
+        ArchivedSession::new(3, "claude-code", &billing("c"), 26).in_repository("surdy/qanungo"),
+    ];
     let (address, _directory) = spawn_dashboard(sessions);
     let (_head, body) = request(address, "/api/data");
 
-    for raw in [
-        "ghp_FAKEfake0123456789ABCDEFabcdef012345",
-        "surdy/evil|table",
-        "table`break",
-    ] {
+    for raw in [planted, "surdy/evil|table", "table`break"] {
         assert!(
             !body.contains(raw),
-            "a raw repository name reached the wire: {raw}"
+            "a raw repository name reached the wire: {raw}",
         );
     }
     let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -2489,10 +2496,145 @@ fn a_hostile_repository_name_never_reaches_a_scope_control() {
         labels.contains(&"invalid-identifier"),
         "the unrenderable name is replaced wholesale: {labels:?}",
     );
-    assert!(
-        labels.iter().any(|label| label.contains("REDACTED")),
-        "the credential-shaped name is scrubbed rather than clamped away: {labels:?}",
+    let scrubbed = labels
+        .iter()
+        .find(|label| label.contains("REDACTED"))
+        .unwrap_or_else(|| panic!("the credential-shaped name is not scrubbed: {labels:?}"));
+
+    // The regression itself: three repositories, three scopes. A repository spelled one way by the
+    // coaching fold and another by the bill would be **four**, two of them half-empty.
+    assert_eq!(labels.len(), 3, "{labels:?}");
+    let priced: Vec<&str> = payload["cost"]["by_repository"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            row["repository"]
+                .as_str()
+                .unwrap_or_else(|| payload["scopes"]["unattributed"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        priced.len(),
+        3,
+        "every repository priced something: {priced:?}"
     );
+    for label in &priced {
+        assert!(
+            labels.contains(label),
+            "the bill spells a repository the control cannot select: {label}",
+        );
+    }
+    // And the one that provoked the fix carries *both* halves under one label: the session the
+    // coaching fold placed, and the money the cost fold priced.
+    assert_eq!(scope_of(&payload, scrubbed)["sessions"]["folded"], 1);
+    assert!(
+        priced.contains(scrubbed),
+        "the scrubbed label has no row on the bill: {priced:?}",
+    );
+}
+
+/// The same discipline on the other label a scope control is built from — and the reason it turns
+/// out to be belt-and-braces rather than a hole.
+///
+/// A harness label reaches the control only through a session the fold *folded*, and folding one
+/// requires an interpreter: `metrics::source_for_agent` is an allowlist, so a harness the archive
+/// invented is skipped and named as a gap rather than becoming a column. **An arbitrary harness
+/// string can therefore never be an option in the scope select at all**, which is a stronger
+/// property than scrubbing it would be.
+///
+/// It is scrubbed anyway ([`qanungo::evidence::identifier_field`], the ordering the anchor's tool
+/// name settled), for the reason that ordering exists: the label is now option text and the key an
+/// evidence tag is matched against, and it costs nothing. What this test pins is the equality that
+/// follows — the control's vocabulary, the lane columns, the fleet roster, both `by_harness` maps,
+/// the per-scope finding splits, and the evidence tags all spell a harness the same way. One
+/// harness, one string, or a control and the rows it narrows come apart.
+///
+/// The gaps lines are deliberately **not** covered by this: `command::summarize` clamps without
+/// scrubbing and is shared verbatim with the CLI's own Gaps section, so an archive-invented harness
+/// label is rendered there as the archive wrote it. That is a pre-existing property of main, it is
+/// prose rather than a control, and tightening it means giving the coaching and cost folds a
+/// redactor and re-proving the CLI's bytes — its own change, not this one's.
+#[test]
+fn a_harness_is_spelled_the_same_way_everywhere_and_an_invented_one_never_becomes_an_option() {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let invented = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+    let mut sessions: Vec<ArchivedSession> = (0..6u8)
+        .map(|index| {
+            ArchivedSession::new(index, "claude-code", &clean, 24).in_repository("surdy/qanungo")
+        })
+        .collect();
+    sessions.extend((6..9u8).map(|index| {
+        ArchivedSession::new(index, invented, &clean, 25).in_repository("surdy/qanungo")
+    }));
+    let (address, _directory) = spawn_dashboard(sessions);
+    let payload = payload_of(address);
+
+    let vocabulary: Vec<String> = payload["scopes"]["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|label| label.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(vocabulary, vec!["claude-code".to_owned()]);
+    assert!(
+        payload["provenance"]["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no interpreter for this harness")),
+        "the sessions it could not read are named, not dropped",
+    );
+
+    // Every other place a harness is named uses the control's own spelling.
+    let named = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("a by_harness map")
+            .keys()
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let scope = scope_of(&payload, "surdy/qanungo");
+    for (where_, labels) in [
+        (
+            "window by_harness",
+            named(&payload["sessions"]["by_harness"]),
+        ),
+        ("scope by_harness", named(&scope["sessions"]["by_harness"])),
+    ] {
+        assert!(!labels.is_empty(), "{where_} is empty");
+        for label in labels {
+            assert!(vocabulary.contains(&label), "{where_}: {label}");
+        }
+    }
+    let empty = Vec::new();
+    for lanes in [&payload["lanes"], &scope["lanes"]] {
+        for lane in lanes.as_array().unwrap() {
+            for column in lane["harnesses"].as_array().unwrap() {
+                let label = column["source_agent"].as_str().unwrap().to_owned();
+                assert!(vocabulary.contains(&label), "lane column: {label}");
+            }
+            for blended in lane["fleet"]["harnesses"].as_array().unwrap_or(&empty) {
+                let label = blended.as_str().unwrap().to_owned();
+                assert!(vocabulary.contains(&label), "fleet roster: {label}");
+            }
+        }
+    }
+    for row in scope["findings"].as_array().unwrap() {
+        for label in named(&row["by_harness"]) {
+            assert!(vocabulary.contains(&label), "scope finding split: {label}");
+        }
+    }
+    for finding in payload["findings"].as_array().unwrap() {
+        for evidence in finding["evidence"].as_array().unwrap() {
+            let label = evidence["harness"].as_str().unwrap().to_owned();
+            assert!(vocabulary.contains(&label), "evidence tag: {label}");
+        }
+    }
 }
 
 /// The scopes section is bounded by the shape of the window rather than by its size.

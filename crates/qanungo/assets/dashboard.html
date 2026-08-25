@@ -1425,6 +1425,20 @@ function labelAt(labels, raw) {
   return Number.isInteger(index) && index >= 0 && index < labels.length ? labels[index] : null;
 }
 
+/* How many folded sessions the chosen scope actually holds — the denominator every
+   count on the page is "of".
+ *
+ * A harness selection narrows the sessions too, so the whole window's total is the
+ * wrong number to divide by whenever one is picked: the per-harness counts are in
+ * `by_harness`, keyed by the same label the control is built from, so this reads one
+ * rather than deriving it. `0` for a harness that contributed nothing to the scope is
+ * a real answer and is what makes "0 of 0" say what it means. */
+function scopedFolded(data, entry, column) {
+  const base = entry ? entry.sessions : data.sessions;
+  if (column < 0) return base.folded;
+  return base.by_harness[data.scopes.harnesses[column]] || 0;
+}
+
 function scopeSentence(data, entry, column) {
   if (!entry && column < 0) {
     return (
@@ -1434,18 +1448,16 @@ function scopeSentence(data, entry, column) {
     );
   }
   const parts = [];
-  if (entry) {
-    parts.push(
-      entry.repository +
-        " — " +
-        entry.sessions.folded +
-        " of " +
-        data.sessions.folded +
-        " folded sessions"
-    );
-  }
+  if (entry) parts.push(entry.repository);
   if (column >= 0) parts.push(data.scopes.harnesses[column]);
-  let sentence = "Scoped to " + parts.join(" · ") + ". ";
+  let sentence =
+    "Scoped to " +
+    parts.join(" · ") +
+    " — " +
+    scopedFolded(data, entry, column) +
+    " of " +
+    data.sessions.folded +
+    " folded sessions. ";
   sentence +=
     column >= 0
       ? "A harness scope shows that harness's own score rather than the fleet blend, and narrows " +
@@ -1468,14 +1480,18 @@ function paint() {
   const entry = chosenScope(data);
   const column = chosenColumn(data);
   const scopedSessions = entry ? entry.sessions : data.sessions;
+  const folded = scopedFolded(data, entry, column);
+  // With a harness picked, the split below it is that one harness — listing the others
+  // beside a count that excludes them would be two numbers describing different sets.
   const harnesses = Object.entries(scopedSessions.by_harness)
+    .filter(([name]) => column < 0 || name === data.scopes.harnesses[column])
     .map(([name, count]) => name + " (" + count + ")")
     .join(", ");
   document.getElementById("subtitle").textContent =
     "Scored over the last " +
     data.window.last +
     " — " +
-    scopedSessions.folded +
+    folded +
     " sessions since " +
     data.window.opens_at +
     " (UTC)" +
@@ -1508,7 +1524,7 @@ function paint() {
   const cards = data.findings
     .map((finding) => ({ finding, cited: finding.evidence.filter(citedInScope) }))
     .filter(({ cited }) => cited.length > 0)
-    .map(({ finding, cited }) => findingCard(finding, cited, scopedSessions.folded));
+    .map(({ finding, cited }) => findingCard(finding, cited, folded));
   if (cards.length === 0) {
     findings.replaceChildren(
       el(

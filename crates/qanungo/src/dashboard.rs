@@ -92,10 +92,17 @@
 //!
 //! # One route, measured
 //!
-//! `/api/data` stays the single payload. Against production on 2026-08-25 it is **744 KiB**:
-//! standup 529 KiB (71%), findings-with-anchors 195 KiB (26%), cost 15 KiB (2%), everything else
-//! under 6 KiB. That is 4.6x the V1 payload, and the standup section is essentially all of the
-//! growth — 100 sessions of prose, which is the same 353 KiB `qanungo standup --last 7d` prints.
+//! `/api/data` stays the single payload. When the standup and cost sections landed it measured
+//! **744 KiB** against production: standup 529 KiB (71%), findings-with-anchors 195 KiB (26%), cost
+//! 15 KiB (2%), everything else under 6 KiB — 4.6x the V1 payload, with the standup section
+//! essentially all of the growth (100 sessions of prose, the same 353 KiB `qanungo standup
+//! --last 7d` prints).
+//!
+//! **Every figure in this section is a snapshot of a moving archive.** The archive gains tens of
+//! sessions a day, and the same command measured 946.8 KiB days later with nothing about this code
+//! changed. These numbers are here for the *shape* — which section dominates, and what each one
+//! scales with — so each is stamped with the day it was taken and none is worth chasing. The same
+//! caution applies to any session or rule-firing count quoted anywhere in this crate's docs.
 //!
 //! Splitting the standup onto its own route was the obvious alternative and is not worth what it
 //! costs. The saving is one 744 KiB fetch per refresh interval becoming one 215 KiB fetch plus a
@@ -336,10 +343,10 @@ impl Payload<'_> {
                 "generated_at": stamp(folded.generated_at),
                 "compared": folded.compared,
             },
-            "sessions": sessions_value(folded),
+            "sessions": sessions_value(folded, self.redactor),
             "lanes": Lane::ALL
                 .iter()
-                .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns))
+                .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns, self.redactor))
                 .collect::<Vec<_>>(),
             "findings": folded
                 .findings
@@ -380,7 +387,7 @@ impl Payload<'_> {
             },
             "priced": priced_total_value(totals),
             "by_model": by_model_value(totals),
-            "by_repository": by_repository_value(totals),
+            "by_repository": by_repository_value(totals, self.redactor),
             "caching": caching_value(&totals.priced),
             "comparison": self.cost_comparison(),
             "copilot": copilot_value(totals),
@@ -515,37 +522,56 @@ impl Payload<'_> {
             "unattributed": NO_REPOSITORY,
             "harnesses": columns
                 .iter()
-                .map(|column| format::identifier(column))
+                .map(|column| evidence::identifier_field(column, self.redactor))
                 .collect::<Vec<_>>(),
             "repositories": scopes
                 .iter()
-                .map(|scope| scope_value(scope, compared, &columns, &folded.findings, tags))
+                .map(|scope| {
+                    scope_value(
+                        scope,
+                        compared,
+                        &columns,
+                        &folded.findings,
+                        tags,
+                        self.redactor,
+                    )
+                })
                 .collect::<Vec<_>>(),
         })
     }
 
-    /// Repository labels the *other* two sections put on the page, each already rendered by the
-    /// lane that owns it.
+    /// Repository labels the *other* two sections put on the page, each rendered exactly as the
+    /// section that owns it renders it.
     ///
-    /// They join the scope list so the control can narrow everything the page shows. It has to be
-    /// the other lanes' own strings rather than a re-rendering of the archive's: the cost table's
-    /// cells and the standup's headings are what a reader is comparing the control against, and a
-    /// scope that spelled the same repository differently would be an option that narrowed nothing.
+    /// They join the scope list so the control can narrow everything the page shows: the bill
+    /// covers a quarter and the narrative a week, so both hold repositories a 30-day coaching
+    /// window does not, and a control that could not select a repository the page visibly renders
+    /// would be a control that lies about what it narrows.
     ///
-    /// The three lanes agree on every ordinary repository name, and the windows are what actually
-    /// differ — the bill covers a quarter and the narrative a week, so both hold repositories a
-    /// 30-day coaching window does not. Where the *renderings* could differ is a repository name
-    /// that is not shaped like one (the cost lane clamps without scrubbing, the standup lane scrubs
-    /// before it clamps, and [`crate::scopes`] clamps before it scrubs), and such a name would
-    /// simply appear as more than one option, each narrowing the section that spelled it that way.
-    /// Nothing unrendered reaches the wire on any of the three paths, which is the property that
-    /// matters; `tests/dashboard.rs` pins the agreement on ordinary names.
+    /// # One repository, one string
+    ///
+    /// The equality this rests on is not a coincidence to be documented — it is a property to be
+    /// held, and the review of this slice found the place it was not. The cost section used to
+    /// render its repository through [`format::identifier`] alone while the scope key went through
+    /// [`scopes::repository_label`]'s clamp-then-scrub, so a repository whose name was shaped like
+    /// a credential came out as **two different strings**: the marker on the coaching side and the
+    /// raw token on the bill. That is worse than either failure on its own. The raw secret was on
+    /// the wire and in a dropdown, and the same repository appeared as two options, each narrowing
+    /// half the page — the exact cross-labelling this control exists not to do.
+    ///
+    /// So [`by_repository_value`] now renders through [`evidence::identifier_field`] too, and the
+    /// three paths are one path: the archive's bytes are judged by the clamp, what survives is
+    /// scrubbed, and the result is the group key, the cost cell, and the option text. The standup
+    /// lane reaches the same place from the other direction — it scrubs into its own types and
+    /// clamps the result — and its labels are the fold's own strings, which is why they are taken
+    /// verbatim here rather than re-rendered.
     fn foreign_labels(&self) -> Vec<String> {
-        let cost = self.cost.totals.by_repository.keys().map(|repository| {
-            repository
-                .as_deref()
-                .map_or_else(|| NO_REPOSITORY.to_owned(), format::identifier)
-        });
+        let cost = self
+            .cost
+            .totals
+            .by_repository
+            .keys()
+            .map(|repository| scopes::repository_label(repository.as_deref(), self.redactor));
         let standup = self
             .standup
             .standup
@@ -563,6 +589,7 @@ fn scope_value(
     columns: &[String],
     findings: &[Finding],
     tags: &ScopeTags,
+    redactor: &Redactor,
 ) -> Value {
     let now = Scorecard::fold_refs(&scope.sessions);
     let before = compared.then(|| Scorecard::fold_refs(&scope.previous));
@@ -572,11 +599,11 @@ fn scope_value(
         "sessions": {
             "folded": scope.sessions.len(),
             "comparison_folded": scope.previous.len(),
-            "by_harness": scope.by_harness(),
+            "by_harness": scope.by_harness(redactor),
         },
         "lanes": Lane::ALL
             .iter()
-            .map(|lane| lane_value(*lane, &now, before.as_ref(), columns))
+            .map(|lane| lane_value(*lane, &now, before.as_ref(), columns, redactor))
             .collect::<Vec<_>>(),
         "findings": scope_findings_value(scope, findings, tags),
     })
@@ -682,7 +709,22 @@ fn by_model_value(totals: &CostTotals) -> Value {
 /// The same money, cut by the repository the archive recorded. A session captured outside a
 /// checkout has no repository and is its own row: `repository` is `null` there rather than being
 /// folded into somebody else's, exactly as the report gives it its own `(no repository)` line.
-fn by_repository_value(totals: &CostTotals) -> Value {
+///
+/// The name is clamped **and scrubbed** — [`evidence::identifier_field`] — rather than clamped
+/// alone. Two reasons, and the second is the one that made this a defect rather than a preference.
+///
+/// A repository name is an archive-stated identifier, and decision 9 blessed those for an
+/// aggregate surface; that blessing has already been withdrawn once, for the tool name on an
+/// anchor, on the grounds that a *rendering control* is not an aggregate line. A repository name is
+/// now the text of an option in the scope select, which is the same argument reaching the same
+/// answer.
+///
+/// And this cell has to be **the same string** as the scope key built from the same archive value
+/// ([`Payload::foreign_labels`]). Clamping here while clamping-then-scrubbing there gave a
+/// credential-shaped repository two spellings — the marker on the coaching side, the raw token on
+/// the bill — which put the secret on the wire *and* split one repository into two options that
+/// each narrowed half the page. One rendering, one label, one option.
+fn by_repository_value(totals: &CostTotals, redactor: &Redactor) -> Value {
     let mut rows: Vec<_> = totals.by_repository.iter().collect();
     rows.sort_by(|(left_name, left), (right_name, right)| {
         right
@@ -693,7 +735,11 @@ fn by_repository_value(totals: &CostTotals) -> Value {
     rows.into_iter()
         .map(|(repository, priced)| {
             let mut row = priced_row_value(priced);
-            row["repository"] = json!(repository.as_deref().map(format::identifier));
+            row["repository"] = json!(
+                repository
+                    .as_deref()
+                    .map(|repository| evidence::identifier_field(repository, redactor))
+            );
             row
         })
         .collect()
@@ -857,16 +903,19 @@ fn redaction_value(report: &RedactionReport) -> Value {
 /// How much of the window each harness contributed, so a reader can weigh a per-harness score
 /// against the sample behind it.
 ///
-/// Harness labels are the *archive's* strings, so they go through [`format::identifier`] on the way
-/// out — the same clamp the report's Gaps lines pass through, for the same reason: a manifest can
-/// state whatever it likes, and a served page is a rendering surface a peer does not get to choose
-/// characters on.
-fn sessions_value(folded: &Folded) -> Value {
+/// Harness labels are the *archive's* strings, so they are clamped **and scrubbed** on the way out
+/// — [`evidence::identifier_field`], the same treatment and the same ordering the anchor's tool
+/// name gets. A manifest states whatever it likes, and this label is no longer only a table
+/// heading: it is the text of an option in the scope control and the key the page matches an
+/// evidence tag against, so it gets the treatment a rendering control gets. Every surface that
+/// spells a harness in this payload spells it this way, because a control and the rows it narrows
+/// disagreeing about a label is how one harness becomes two.
+fn sessions_value(folded: &Folded, redactor: &Redactor) -> Value {
     let totals = Totals::fold(&folded.sessions);
     let by_harness: BTreeMap<String, usize> = totals
         .by_agent
         .iter()
-        .map(|(agent, count)| (format::identifier(agent), *count))
+        .map(|(agent, count)| (evidence::identifier_field(agent, redactor), *count))
         .collect();
     json!({
         "folded": folded.instrumentation.sessions_folded,
@@ -887,6 +936,7 @@ fn lane_value(
     now: &Scorecard,
     before: Option<&Scorecard>,
     columns: &[String],
+    redactor: &Redactor,
 ) -> Value {
     let fleet = match now.fleet(lane) {
         Some(blend) => {
@@ -894,7 +944,11 @@ fn lane_value(
             json!({
                 "state": "scored",
                 "score": blend.score,
-                "harnesses": blend.harnesses.iter().map(|agent| format::identifier(agent)).collect::<Vec<_>>(),
+                "harnesses": blend
+                    .harnesses
+                    .iter()
+                    .map(|agent| evidence::identifier_field(agent, redactor))
+                    .collect::<Vec<_>>(),
                 "trend": trend_value(Trend::between(blend.score, comparable)),
             })
         }
@@ -908,7 +962,7 @@ fn lane_value(
         "fleet": fleet,
         "harnesses": columns
             .iter()
-            .map(|column| harness_value(lane, column, now, before))
+            .map(|column| harness_value(lane, column, now, before, redactor))
             .collect::<Vec<_>>(),
     })
 }
@@ -923,8 +977,9 @@ fn harness_value(
     source_agent: &str,
     now: &Scorecard,
     before: Option<&Scorecard>,
+    redactor: &Redactor,
 ) -> Value {
-    let label = format::identifier(source_agent);
+    let label = evidence::identifier_field(source_agent, redactor);
     let Some(harness) = now.harness(source_agent) else {
         return json!({
             "source_agent": label,
@@ -1024,7 +1079,7 @@ impl Payload<'_> {
                             session.repository.as_deref(),
                             self.redactor,
                         ),
-                        harness: format::identifier(&session.source_agent),
+                        harness: evidence::identifier_field(&session.source_agent, self.redactor),
                     },
                 )
             })
