@@ -42,6 +42,19 @@
 //! scores" is not a bug anybody can act on. The split is deliberately a *move*, not a rewrite: the
 //! rendering half of `report` receives exactly the fields the old body computed, in the same order,
 //! so the Markdown on stdout is byte-for-byte what it was.
+//!
+//! The dashboard's standup-and-cost slice makes the same cut in the other two lanes: [`fold_cost`]
+//! and [`fold_standup`] are the bodies `cost` and `standup` used to have, and each command is now
+//! that call plus its renderer. The same reasoning applies unchanged and the same discipline was
+//! held — the fields handed to [`CostReport`] and [`StandupReport`] are the ones the old bodies
+//! computed, in the same order, so both documents are byte-for-byte what they were.
+//!
+//! The standup seam carries one extra property the other two do not need. [`Standup::fold`] scrubs
+//! **on the way in**, so [`FoldedStandup`] holds no pre-scrub string at all: [`ReadSummary`] — the
+//! parsed, unscrubbed record — is a local of [`fold_standup`] and is dropped before it returns.
+//! Any surface reading a [`FoldedStandup`] therefore inherits qanungo #8's guarantee rather than
+//! having to re-apply it, which is what lets the dashboard serve standup prose without a second
+//! redactor call anywhere on that path.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Write};
@@ -57,6 +70,7 @@ use crate::cost_report::{CostInstrumentation, CostReport};
 use crate::format;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
+use crate::redaction::Redactor;
 use crate::report::{Instrumentation, Report, SkippedNote};
 use crate::rules::{self, Finding};
 use crate::scoring::RulePack;
@@ -184,23 +198,37 @@ pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandErro
         .map_err(CommandError::Output)
 }
 
-/// Runs `qanungo cost`, writing Markdown to `out`.
+/// Everything the cost lane computes, before anything renders it.
 ///
-/// The same mirror, the same window pair, a different fold: [`cost::fold_cost`] reads only what
-/// each assistant record says about the API message behind it, deduplicated by message id, and
-/// [`CostTotals`] prices the result as of each session's own archive time.
+/// The cost half of what [`Folded`] is for the coaching lane, and it exists for the same reason:
+/// [`cost()`] turns one of these into Markdown and [`crate::dashboard`] turns the *same* one into a
+/// JSON section, so a served dollar figure is the CLI's dollar figure rather than a second
+/// arithmetic that agrees with it today.
+pub struct FoldedCost {
+    /// When this fold was taken — the instant both windows are cut relative to.
+    pub generated_at: DateTime<Utc>,
+    pub totals: CostTotals,
+    /// The equal-length window immediately before it, priced by the same table. `None` when no
+    /// comparison window was asked for at all — a window so long that doubling it overflows —
+    /// which is a different fact from one that came back empty, and every surface says which.
+    pub previous: Option<CostTotals>,
+    pub skipped: Vec<SkippedNote>,
+    pub instrumentation: CostInstrumentation,
+}
+
+/// Runs the cost lane's `sync → fold → price` over the window pair.
+///
+/// The same mirror and the same window pair the coaching lane uses, a different fold:
+/// [`cost::fold_cost`] reads only what each assistant record says about the API message behind it,
+/// deduplicated by message id, and [`CostTotals`] prices the result as of each session's own
+/// archive time.
 ///
 /// # Errors
 ///
-/// Returns an error on the same three conditions [`report`] does, and for the same reason: a
-/// single unreadable session is a gap the document states, never a failed run.
-pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(
-        &args.archive,
-        &args.last,
-        Artifact::Transcript,
-        Reach::WindowPair,
-    )?;
+/// Returns an error when the cache is unusable or the archive window cannot be listed. A single
+/// unreadable session is a reported gap, not a failure.
+pub fn fold_cost(archive: &ArchiveArgs, window: &Window) -> Result<FoldedCost, CommandError> {
+    let prepared = Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowPair)?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -241,13 +269,30 @@ pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
         patwari_url: prepared.patwari_url.clone(),
         cache_root: prepared.cache.root().to_path_buf(),
     };
+    Ok(FoldedCost {
+        generated_at: prepared.generated_at,
+        totals,
+        previous: earlier,
+        skipped: summarize(&skipped, placed.unplaceable),
+        instrumentation,
+    })
+}
+
+/// Runs `qanungo cost`, writing Markdown to `out`.
+///
+/// # Errors
+///
+/// Returns an error on the same three conditions [`report`] does, and for the same reason: a
+/// single unreadable session is a gap the document states, never a failed run.
+pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let folded = fold_cost(&args.archive, &args.last)?;
     let markdown = CostReport {
         window: &args.last,
-        generated_at: prepared.generated_at,
-        totals: &totals,
-        previous: earlier.as_ref(),
-        skipped: &summarize(&skipped, placed.unplaceable),
-        instrumentation: &instrumentation,
+        generated_at: folded.generated_at,
+        totals: &folded.totals,
+        previous: folded.previous.as_ref(),
+        skipped: &folded.skipped,
+        instrumentation: &folded.instrumentation,
     }
     .render();
 
@@ -255,25 +300,42 @@ pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
         .map_err(CommandError::Output)
 }
 
-/// Runs `qanungo standup`, writing Markdown to `out`.
+/// Everything the standup lane computes, before anything renders it.
 ///
-/// The same mirror and the same window machinery, pointed at each session's `summary.md` instead
-/// of its transcript, and the first lane whose document renders text somebody typed into a
-/// terminal. Everything it renders is scrubbed by [`Standup::fold`] before the renderer sees it,
-/// with the redactor the flags asked for and secrets on unless `--no-redact` said otherwise; the
-/// footer states which passes ran and what they fired.
+/// **Nothing in here is unscrubbed.** [`Standup::fold`] runs the redactor on the way into its own
+/// types, and the [`ReadSummary`] values it folded — the parsed archive records, still carrying
+/// whatever the harness wrote — are locals of [`fold_standup`] that never leave it. So a consumer
+/// of this type cannot render a pre-scrub string by mistake: there is no such string in scope. That
+/// is the property the dashboard's standup section rests on, and it is a property of *construction*
+/// rather than of anybody remembering to call a redactor twice.
+pub struct FoldedStandup {
+    /// When this fold was taken — the instant the window is cut relative to.
+    pub generated_at: DateTime<Utc>,
+    pub standup: Standup,
+    pub instrumentation: StandupInstrumentation,
+}
+
+/// Runs the standup lane's `sync → read → scrub → group` over one window.
+///
+/// The same mirror and the same window machinery the other lanes use, pointed at each session's
+/// `summary.md` instead of its transcript, and the first lane whose output carries text somebody
+/// typed into a terminal. Everything it produces is scrubbed by [`Standup::fold`] with the
+/// `redactor` passed in, and [`Standup::redaction`] carries what fired as counts so a footer can
+/// say so.
+///
+/// One window rather than a pair: a narrative has no trend arrow to draw, so a second would double
+/// the listing and the transfers to produce nothing any surface renders.
 ///
 /// # Errors
 ///
-/// Returns an error on the same three conditions the other lanes do. A session with no summary, an
-/// unparseable one, and a placeholder are each a stated gap, never a failed run.
-pub fn standup(args: &StandupArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(
-        &args.archive,
-        &args.last,
-        Artifact::Summary,
-        Reach::WindowOnly,
-    )?;
+/// Returns an error when the cache is unusable or the archive window cannot be listed. A session
+/// with no summary, an unparseable one, and a placeholder are each a stated gap, never a failure.
+pub fn fold_standup(
+    archive: &ArchiveArgs,
+    window: &Window,
+    redactor: Redactor,
+) -> Result<FoldedStandup, CommandError> {
+    let prepared = Prepared::mirror(archive, window, Artifact::Summary, Reach::WindowOnly)?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -288,21 +350,36 @@ pub fn standup(args: &StandupArgs, out: &mut impl Write) -> Result<(), CommandEr
             }),
         }
     }
-    let folded = Standup::fold(&read, &gaps, placed.unplaceable, &args.redaction.redactor());
+    let standup = Standup::fold(&read, &gaps, placed.unplaceable, &redactor);
     let fold_elapsed = fold_started.elapsed();
 
     let instrumentation = StandupInstrumentation {
         sync: prepared.mirror.stats.clone(),
         fold_elapsed,
-        redactor: args.redaction.redactor(),
+        redactor,
         patwari_url: prepared.patwari_url.clone(),
         cache_root: prepared.cache.root().to_path_buf(),
     };
+    Ok(FoldedStandup {
+        generated_at: prepared.generated_at,
+        standup,
+        instrumentation,
+    })
+}
+
+/// Runs `qanungo standup`, writing Markdown to `out`.
+///
+/// # Errors
+///
+/// Returns an error on the same three conditions the other lanes do. A session with no summary, an
+/// unparseable one, and a placeholder are each a stated gap, never a failed run.
+pub fn standup(args: &StandupArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let folded = fold_standup(&args.archive, &args.last, args.redaction.redactor())?;
     let markdown = StandupReport {
         window: &args.last,
-        generated_at: prepared.generated_at,
-        standup: &folded,
-        instrumentation: &instrumentation,
+        generated_at: folded.generated_at,
+        standup: &folded.standup,
+        instrumentation: &folded.instrumentation,
     }
     .render();
 
