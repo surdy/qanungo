@@ -458,9 +458,14 @@ fn handle(mut stream: TcpStream, service: &Service) {
         return;
     };
 
+    // Routing reads the request line's real bytes; every log line below reads this instead. Named
+    // once rather than clamped at five call sites, so a log line added later cannot be the one that
+    // forgets.
+    let request = logged_request(method, target);
+
     match route(method, target) {
         Route::Page => {
-            eprintln!("qanungo dashboard: {peer} - {method} {target} 200");
+            eprintln!("qanungo dashboard: {peer} - {request} 200");
             let _ = write_response(
                 &mut stream,
                 "200 OK",
@@ -471,7 +476,7 @@ fn handle(mut stream: TcpStream, service: &Service) {
         Route::Data => {
             let served = service.snapshot();
             eprintln!(
-                "qanungo dashboard: {peer} - {method} {target} 200 (refresh {})",
+                "qanungo dashboard: {peer} - {request} 200 (refresh {})",
                 served.generation,
             );
             let _ = write_response(&mut stream, "200 OK", "application/json", &served.body);
@@ -481,7 +486,7 @@ fn handle(mut stream: TcpStream, service: &Service) {
             // stream costs a status rather than a thread that parks forever.
             if service.streams.fetch_add(1, Ordering::Relaxed) >= MAX_EVENT_STREAMS {
                 service.streams.fetch_sub(1, Ordering::Relaxed);
-                eprintln!("qanungo dashboard: {peer} - {method} {target} 503");
+                eprintln!("qanungo dashboard: {peer} - {request} 503");
                 let _ = write_response(
                     &mut stream,
                     "503 Service Unavailable",
@@ -490,13 +495,13 @@ fn handle(mut stream: TcpStream, service: &Service) {
                 );
                 return;
             }
-            eprintln!("qanungo dashboard: {peer} - {method} {target} 200 (event stream opened)");
+            eprintln!("qanungo dashboard: {peer} - {request} 200 (event stream opened)");
             let _ = stream_events(service, &mut stream);
             service.streams.fetch_sub(1, Ordering::Relaxed);
             eprintln!("qanungo dashboard: {peer} - event stream closed");
         }
         Route::NotFound => {
-            eprintln!("qanungo dashboard: {peer} - {method} {target} 404");
+            eprintln!("qanungo dashboard: {peer} - {request} 404");
             let _ = write_response(
                 &mut stream,
                 "404 Not Found",
@@ -550,6 +555,26 @@ fn sse_event(name: &str, data: &str) -> String {
         "an SSE data line may not carry a newline: {data:?}",
     );
     format!("event: {name}\ndata: {data}\n\n")
+}
+
+/// How one request is named in the access log.
+///
+/// Both halves are bytes an unknown caller chose, and the access log's reader is a terminal — a
+/// rendering surface with an interpreter behind it. It gets the same clamp every other rendering
+/// surface in this crate gets ([`format::logged`]): nothing that is not printable ASCII survives,
+/// so a request line cannot set a window title, ring a bell, hide the lines above it, or forge a
+/// second log line. Escaped rather than replaced, because a log exists to say what was asked for
+/// and the strange request is the one worth reading.
+///
+/// A free function for the same reason [`sse_event`] is one: the guarantee is worth pinning
+/// directly, and the debug assertion states it rather than leaving it true by luck.
+fn logged_request(method: &str, target: &str) -> String {
+    let request = format!("{} {}", format::logged(method), format::logged(target));
+    debug_assert!(
+        !request.chars().any(char::is_control),
+        "a log line may not carry a control character: {request:?}",
+    );
+    request
 }
 
 /// Which of the three routes a request is for.
@@ -790,6 +815,46 @@ mod tests {
             format!("event: refresh\ndata: {notice}\n\n"),
             "one notice is one event",
         );
+    }
+
+    /// The access log is a rendering surface — the operator's terminal — and this lane exists to be
+    /// `--bind`-exposed to an unauthenticated tailnet, so a peer must not choose bytes on it. A
+    /// request line carrying an ESC, a BEL, and a newline produces a log line carrying none of the
+    /// three, and stays one line.
+    #[test]
+    fn a_request_line_cannot_put_control_bytes_on_the_operators_terminal() {
+        let hostile = "GET /\u{1b}]0;pwned\u{7}/fake\nSPOOFED-LOG-LINE HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (method, target) = parse_request_line(hostile).expect("a request line, of a sort");
+        let request = logged_request(method, target);
+
+        for byte in ['\u{1b}', '\u{7}', '\n', '\r'] {
+            assert!(!request.contains(byte), "{byte:?} survived: {request:?}");
+        }
+        assert!(
+            !request.chars().any(char::is_control),
+            "no control character at all: {request:?}",
+        );
+        assert_eq!(
+            request.lines().count(),
+            1,
+            "one request, one line: {request:?}"
+        );
+        // The bytes are escaped rather than dropped: an access log that hid the strange request
+        // would be useless at the only moment anybody reads it.
+        assert!(
+            request.starts_with("GET /\\u{1b}]0;pwned\\u{7}/fake\\n"),
+            "{request:?}"
+        );
+        assert!(request.contains("SPOOFED-LOG-LINE"), "{request:?}");
+
+        // Routing still reads the real bytes, so the clamp changes what is *printed* and nothing
+        // about what is served.
+        assert_eq!(route(method, target), Route::NotFound);
+
+        // And an ordinary request is logged exactly as it arrived.
+        let (method, target) =
+            parse_request_line("GET /api/data?x=1 HTTP/1.1\r\n\r\n").expect("a request line");
+        assert_eq!(logged_request(method, target), "GET /api/data?x=1");
     }
 
     /// A routable bind is allowed and *named*: the tailnet case is the point of the lane, so the
