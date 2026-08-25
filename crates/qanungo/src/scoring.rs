@@ -494,6 +494,97 @@ pub struct Blend {
     pub harnesses: Vec<String>,
 }
 
+impl Blend {
+    /// The earlier blend's score, when the two may be compared at all — **only a blend taken over
+    /// the same harnesses**.
+    ///
+    /// A roster change moves an unweighted mean on its own, with nobody's behaviour behind it, and
+    /// reporting that as behaviour is the exact failure the blend rule exists to avoid. The rule
+    /// lives here rather than at each rendering site because two surfaces now draw the same blend
+    /// — the report's table and the dashboard's fleet tile — and a surface that re-derived it
+    /// could quietly re-derive it wrong.
+    pub fn comparable(&self, earlier: Option<Self>) -> Option<u8> {
+        earlier
+            .filter(|earlier| earlier.harnesses == self.harnesses)
+            .map(|earlier| earlier.score)
+    }
+}
+
+/// Which way a score moved between two windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+    Flat,
+}
+
+impl Direction {
+    /// A stable machine name, for a payload that is read by something other than a person.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Flat => "flat",
+        }
+    }
+
+    /// The glyph a rendering surface draws it with.
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Up => "▲",
+            Self::Down => "▼",
+            Self::Flat => "=",
+        }
+    }
+}
+
+/// One score's movement against the comparison window, before any surface decides how to draw it.
+///
+/// A type rather than a rendered arrow because two surfaces draw the same movement differently —
+/// the report writes `▲ 3` into a table cell, the dashboard puts a direction and a magnitude into
+/// a JSON field — while the *rule about when a movement may be shown at all* has to be the same
+/// one in both places. [`Trend::between`] is that rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Trend {
+    /// The reported window's score.
+    pub now: u8,
+    /// The comparison window's score.
+    pub was: u8,
+}
+
+impl Trend {
+    /// The movement from `before` to `now`, or `None` when the comparison window did not measure
+    /// the lane.
+    ///
+    /// **No earlier score, no trend.** An arrow drawn against a window that could not measure the
+    /// lane would be reporting the archive's shape as behaviour, which is the one thing a trend
+    /// must never do.
+    pub const fn between(now: u8, before: Option<u8>) -> Option<Self> {
+        match before {
+            Some(was) => Some(Self { now, was }),
+            None => None,
+        }
+    }
+
+    /// Which way it went.
+    pub const fn direction(self) -> Direction {
+        if self.now > self.was {
+            Direction::Up
+        } else if self.now < self.was {
+            Direction::Down
+        } else {
+            Direction::Flat
+        }
+    }
+
+    /// How far it went, in points. Always non-negative — the sign lives in
+    /// [`Trend::direction`], so no caller has to agree with any other caller about which way is
+    /// positive.
+    pub const fn magnitude(self) -> u8 {
+        self.now.abs_diff(self.was)
+    }
+}
+
 /// Every harness's lanes over one window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scorecard {
@@ -1056,5 +1147,53 @@ mod tests {
     fn near_identical_floats_do_not_share_a_stamp() {
         assert_ne!(float(0.2), float(0.2 + f64::EPSILON));
         assert_eq!(float(0.2), float(0.2));
+    }
+
+    /// The rule every surface draws an arrow by: no earlier score, no trend — and a magnitude that
+    /// is always the distance, with the sign carried by the direction rather than by a convention
+    /// each caller has to remember.
+    #[test]
+    fn a_trend_needs_both_windows_and_keeps_its_sign_in_the_direction() {
+        assert_eq!(Trend::between(80, None), None);
+
+        let improved = Trend::between(80, Some(50)).expect("both windows measured it");
+        assert_eq!(improved.direction(), Direction::Up);
+        assert_eq!(improved.magnitude(), 30);
+
+        let worsened = Trend::between(50, Some(80)).expect("both windows measured it");
+        assert_eq!(worsened.direction(), Direction::Down);
+        assert_eq!(worsened.magnitude(), 30);
+
+        let flat = Trend::between(70, Some(70)).expect("both windows measured it");
+        assert_eq!(flat.direction(), Direction::Flat);
+        assert_eq!(flat.magnitude(), 0);
+
+        for direction in [Direction::Up, Direction::Down, Direction::Flat] {
+            assert!(!direction.key().is_empty());
+            assert!(!direction.glyph().is_empty());
+        }
+    }
+
+    /// Two blends compare only when they are means over the *same* harnesses. A roster change
+    /// moves an unweighted mean with nobody's behaviour behind it.
+    #[test]
+    fn two_blends_over_different_harnesses_never_compare() {
+        let blend = |score: u8, harnesses: &[&str]| Blend {
+            score,
+            harnesses: harnesses.iter().map(|name| (*name).to_owned()).collect(),
+        };
+        let both = blend(75, &["claude-code", "copilot-cli"]);
+        assert_eq!(
+            both.comparable(Some(blend(60, &["claude-code", "copilot-cli"]))),
+            Some(60),
+        );
+        assert_eq!(both.comparable(None), None);
+        assert_eq!(both.comparable(Some(blend(60, &["claude-code"]))), None);
+        // Order is part of the identity, because the list is built in label order on both sides:
+        // two lists that differ only in order did not come from the same fold.
+        assert_eq!(
+            both.comparable(Some(blend(60, &["copilot-cli", "claude-code"]))),
+            None,
+        );
     }
 }

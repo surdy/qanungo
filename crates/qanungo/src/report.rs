@@ -36,7 +36,6 @@
 //! comparable to another report's at all (qanungo ADR 0001). A report without either would make
 //! a decision unmeasurable.
 
-use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,7 +46,7 @@ use crate::cli::Window;
 use crate::format;
 use crate::metrics::{Cadence, SessionMetrics, Totals};
 use crate::rules::Finding;
-use crate::scoring::{Lane, LaneScore, RulePack, Scorecard};
+use crate::scoring::{Direction, Lane, LaneScore, RulePack, Scorecard, Trend};
 use crate::sync::SyncStats;
 
 /// How many tools the tool-use table names. The long tail of once-used tools says nothing.
@@ -402,10 +401,7 @@ impl Report<'_> {
                     // Only a blend over the *same* harnesses can carry an arrow: a roster change
                     // moves an unweighted mean on its own, and reporting that as behaviour is the
                     // exact failure this blend rule exists to avoid.
-                    let comparable = before
-                        .and_then(|card| card.fleet(lane))
-                        .filter(|earlier| earlier.harnesses == blend.harnesses)
-                        .map(|earlier| earlier.score);
+                    let comparable = blend.comparable(before.and_then(|card| card.fleet(lane)));
                     format!("{}{}", blend.score, arrow(blend.score, comparable))
                 }
                 // A lane nothing types a signal for reads differently from one whose signals were
@@ -678,8 +674,9 @@ pub(crate) fn stamp(at: DateTime<Utc>) -> String {
 ///
 /// The union rather than the reported window's own: a harness that stopped appearing is a fact
 /// worth showing a column for, and hiding it would make a fleet blend silently change what it is
-/// a mean of.
-fn harness_columns(now: &Scorecard, before: Option<&Scorecard>) -> Vec<String> {
+/// a mean of. Shared with [`crate::dashboard`], whose per-harness split is the same set of columns
+/// under a different rendering.
+pub(crate) fn harness_columns(now: &Scorecard, before: Option<&Scorecard>) -> Vec<String> {
     let mut columns: Vec<String> = now
         .harnesses
         .iter()
@@ -703,14 +700,16 @@ fn cell(score: &LaneScore, before: Option<u8>) -> String {
 /// A score's movement against the comparison window — **rendered only when both windows measured
 /// the lane**. An arrow drawn against a window that could not measure it would be reporting the
 /// archive's shape as behaviour.
+///
+/// The *rule* is [`Trend::between`]'s, shared with the dashboard, which draws the same movement as
+/// a direction and a magnitude rather than as a glyph. This function is only the Markdown of it.
 fn arrow(now: u8, before: Option<u8>) -> String {
-    let Some(before) = before else {
+    let Some(trend) = Trend::between(now, before) else {
         return String::new();
     };
-    match now.cmp(&before) {
-        Ordering::Greater => format!(" ▲ {}", now - before),
-        Ordering::Less => format!(" ▼ {}", before - now),
-        Ordering::Equal => " =".to_owned(),
+    match trend.direction() {
+        Direction::Flat => " =".to_owned(),
+        direction => format!(" {} {}", direction.glyph(), trend.magnitude()),
     }
 }
 

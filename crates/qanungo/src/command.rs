@@ -29,6 +29,19 @@
 //! The standup lane asks for one window rather than two ([`Reach`]). A narrative has no trend
 //! arrow to draw, so the second window would be a doubling of the listing, the fetching, and the
 //! cache traffic to produce nothing the document renders.
+//!
+//! # The fold is not the document
+//!
+//! `report` used to be one function from the archive to Markdown. It is now two — [`fold_coaching`]
+//! and the rendering — because the dashboard (qanungo #5) is a *presentation* of the coaching
+//! lane's numbers and not a second computation of them. It calls the same [`fold_coaching`], on the
+//! same [`Reach::WindowPair`], and serializes the [`Folded`] it gets back instead of rendering it.
+//!
+//! That seam is the whole guarantee. A dashboard with its own fold would drift from the report
+//! beside it the first time either one changed, and "the web page and the CLI disagree about my
+//! scores" is not a bug anybody can act on. The split is deliberately a *move*, not a rewrite: the
+//! rendering half of `report` receives exactly the fields the old body computed, in the same order,
+//! so the Markdown on stdout is byte-for-byte what it was.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Write};
@@ -45,7 +58,7 @@ use crate::format;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
 use crate::report::{Instrumentation, Report, SkippedNote};
-use crate::rules;
+use crate::rules::{self, Finding};
 use crate::scoring::RulePack;
 use crate::standup::{Gap, ReadSummary, Standup};
 use crate::standup_report::{StandupInstrumentation, StandupReport};
@@ -65,19 +78,41 @@ pub enum CommandError {
     Output(#[source] io::Error),
 }
 
-/// Runs `qanungo report`, writing Markdown to `out`.
+/// Everything the coaching lane computes, before anything renders it.
+///
+/// The two folded windows, the findings over the reported one, the gaps, and what the run cost —
+/// which is to say the whole of `sync → fold → evaluate` with `emit` deliberately left off the
+/// end. [`report`] turns one of these into Markdown; [`crate::dashboard`] turns the *same* one
+/// into a JSON payload.
+///
+/// It is a type rather than a second copy of the pipeline because a dashboard that recomputed its
+/// own numbers would eventually disagree with the report it claims to be a view of, and there is
+/// no honest way to explain that to somebody reading both. The scores, the arrows, and the
+/// findings on the served page are not "like" the CLI's: they are the CLI's, serialized instead of
+/// written.
+pub struct Folded {
+    /// When this fold was taken — the instant both windows are cut relative to.
+    pub generated_at: DateTime<Utc>,
+    /// The reported window's sessions.
+    pub sessions: Vec<SessionMetrics>,
+    /// The equal-length window immediately before it, folded for the trend arrows.
+    pub previous: Vec<SessionMetrics>,
+    /// Whether a comparison window was asked for at all — a different fact from one that came back
+    /// empty. See [`Report::compared`].
+    pub compared: bool,
+    pub findings: Vec<Finding>,
+    pub skipped: Vec<SkippedNote>,
+    pub instrumentation: Instrumentation,
+}
+
+/// Runs the coaching lane's `sync → fold → evaluate` over the window pair.
 ///
 /// # Errors
 ///
-/// Returns an error when the cache is unusable, the archive window cannot be listed, or the
-/// report cannot be written. A single unreadable session is a reported gap, not a failure.
-pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let prepared = Prepared::mirror(
-        &args.archive,
-        &args.last,
-        Artifact::Transcript,
-        Reach::WindowPair,
-    )?;
+/// Returns an error when the cache is unusable or the archive window cannot be listed. A single
+/// unreadable session is a reported gap, not a failure.
+pub fn fold_coaching(archive: &ArchiveArgs, window: &Window) -> Result<Folded, CommandError> {
+    let prepared = Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowPair)?;
 
     let fold_started = Instant::now();
     let placed = prepared.placement();
@@ -114,15 +149,34 @@ pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandErro
         patwari_url: prepared.patwari_url.clone(),
         cache_root: prepared.cache.root().to_path_buf(),
     };
+    Ok(Folded {
+        generated_at: prepared.generated_at,
+        compared: prepared.comparison_opens_at.is_some(),
+        skipped: summarize(&skipped, placed.unplaceable),
+        sessions,
+        previous,
+        findings,
+        instrumentation,
+    })
+}
+
+/// Runs `qanungo report`, writing Markdown to `out`.
+///
+/// # Errors
+///
+/// Returns an error when the cache is unusable, the archive window cannot be listed, or the
+/// report cannot be written. A single unreadable session is a reported gap, not a failure.
+pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let folded = fold_coaching(&args.archive, &args.last)?;
     let markdown = Report {
         window: &args.last,
-        generated_at: prepared.generated_at,
-        sessions: &sessions,
-        previous: &previous,
-        compared: prepared.comparison_opens_at.is_some(),
-        findings: &findings,
-        skipped: &summarize(&skipped, placed.unplaceable),
-        instrumentation: &instrumentation,
+        generated_at: folded.generated_at,
+        sessions: &folded.sessions,
+        previous: &folded.previous,
+        compared: folded.compared,
+        findings: &folded.findings,
+        skipped: &folded.skipped,
+        instrumentation: &folded.instrumentation,
     }
     .render();
 
