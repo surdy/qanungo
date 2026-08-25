@@ -44,6 +44,14 @@
 //! nothing observed. The lane picks Copilot up the day that surface is typed. See
 //! [`review_observable`](crate::metrics::ReviewActivity) for the per-harness reasoning.
 //!
+//! **Read Code Review's component line, not its score.** It is the first lane in the pack whose
+//! reading sits *above* [`constants::FIRE_RATE_FLOOR`] rather than far below it — 92% against a
+//! 25% floor — so its penalty is saturated and the lane reads 0 anywhere in the top three quarters
+//! of the range. The 0 is the clamp speaking, not the measurement, and it will not move until the
+//! unreviewed rate falls below a quarter. The raw rate rides in the component line beside it and is
+//! the number that tracks the habit. The floor is deliberately not special-cased for this lane;
+//! see [`constants::FIRE_RATE_FLOOR`] for why that is a pack-wide decision rather than this one.
+//!
 //! # A lane with one component
 //!
 //! Context Management is fed by a single reading today, and the formula below needs no special case
@@ -151,6 +159,19 @@ pub mod constants {
     /// floors chosen to normalize those apart would be five unmeasured knobs pretending to be a
     /// difficulty scale. The lanes are not comparable to each other anyway — see the module docs
     /// — so the honest move is one floor, stated once.
+    ///
+    /// **What one floor costs: the penalty saturates, and above the floor the score stops
+    /// carrying information.** A component clamps at 1.0, so every fire rate from 25% to 100%
+    /// spends the same full share and reads the same. That was invisible while every rule in the
+    /// pack fired between 0% and 10% — a whole order of magnitude below the floor — and the Code
+    /// Review lane is the first to sit *above* it, at 92%: its lane score is 0 and would still be
+    /// 0 at 30%, so the number cannot show improvement until the habit passes a threefold change.
+    /// The report is built for this — **every component renders its raw reading beside its cost**
+    /// ("fired on 174 of 189 … (92%)"), and that line is what moves — but a reader watching only
+    /// the lane number would see a flat 0 through real progress. Raising the floor is not the fix
+    /// and is not done here: it is a pack-wide constant on a shared scale, so moving it re-scores
+    /// every lane and is a decision of its own, with its own measurement, not a side effect of
+    /// waking one lane.
     pub const FIRE_RATE_FLOOR: f64 = 0.25;
 
     /// Pooled tool failure rate at which the tool-error component spends its whole share.
@@ -328,7 +349,7 @@ impl Signal {
             // sentence a reader meets when Copilot's Code Review renders no reading. "only 0
             // sessions that shipped on a harness whose review surfaces are all typed" says the
             // harness could not be looked at; "only 0 sessions that shipped" would have implied
-            // Copilot never ships, which is false — it committed in 113 sessions of the mirror.
+            // Copilot never ships, which is false — it committed in 121 sessions of the mirror.
             // See [`RuleId::verdict`](crate::rules::RuleId::verdict).
             Self::FireRate(RuleId::UnreviewedShip) => {
                 "sessions that shipped on a harness whose review surfaces are all typed".to_owned()

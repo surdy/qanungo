@@ -620,7 +620,9 @@ function sessionRow(finding, evidence) {
 const EVIDENCE_KIND = {
   event: "the events it counted",
   structural: "what it measured — timestamps and counts, never an utterance",
-  mixed: "the failures it counted, and the shape it measured",
+  // Kind-neutral on purpose: two rules are Mixed and their halves differ. Fire-and-forget
+  // anchors failures beside a ratio; unreviewed-ship anchors commits beside an absence.
+  mixed: "the events it anchored, and the shape it measured",
 };
 
 function findingCard(finding, folded) {

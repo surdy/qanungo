@@ -753,11 +753,15 @@ fn a_review_named_slash_command_is_not_a_review_pass() {
     let session = claude("munshi/claude-code-2.1.235-invocation.jsonl");
     let reviews = &session.reviews;
     assert!(reviews.observable);
-    // The fixture's skill surface holds `code-review` and `security-review` among decoys.
-    assert!(
-        reviews.review_passes >= 2,
-        "the Skill-invoked reviews are counted: {}",
-        reviews.review_passes,
+    // Exactly two, and the exactness is the whole point of the test. The fixture's skill surface
+    // holds `code-review` and `security-review` — those two are counted — beside `simplify`,
+    // `artifact-design` and `run`, which are not, and beside the two traps this test is named for:
+    // a `SlashCommand` *tool* invoking `/code-review`, and a typed
+    // `<command-name>/security-review</command-name>`. A `>=` bound would pass even if both traps
+    // started counting, which is precisely the regression it exists to catch.
+    assert_eq!(
+        reviews.review_passes, 2,
+        "exactly the two Skill-invoked reviews, and neither slash-shaped decoy",
     );
     // It ships nothing, so it is not in the rate at all however much it reviewed.
     assert_eq!(reviews.commits, 0, "`cargo test` is not a commit");

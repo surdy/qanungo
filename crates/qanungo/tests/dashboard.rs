@@ -517,6 +517,17 @@ fn canary_archive() -> Vec<ArchivedSession> {
             3,
         ),
         ArchivedSession::new(3, "codex-cli", &transcript("rules/retry-loop.jsonl"), 4),
+        // The Code Review lane's shape, so the recursive no-verbatim/no-href walk below runs over
+        // a payload in which unreviewed-ship actually fires. It is the one rule whose anchors point
+        // at operator-written commit messages, and one of those messages carries a planted
+        // credential — so a payload that leaked either the message or the secret fails here rather
+        // than only in the excerpt-route test.
+        ArchivedSession::new(
+            4,
+            "claude-code",
+            &transcript("rules/unreviewed-ship.jsonl"),
+            5,
+        ),
     ]
 }
 

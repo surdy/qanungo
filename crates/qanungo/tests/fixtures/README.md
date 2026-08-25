@@ -87,11 +87,33 @@ munshi#77 pull B). They are the same short session twice, differing in one recor
 `code-review` skill ran before the commit. The unreviewed one fires **Shipped without review**
 and nothing else; the reviewed one fires nothing at all.
 
-`unreviewed-ship.jsonl` carries the ship parser's whole test surface in four `Bash` calls — the
+`unreviewed-ship.jsonl` carries the ship parser's **positive** surface in four `Bash` calls — the
 compound `git add -A && git status --porcelain && git commit -q -m …` shape the archive actually
 writes, a `git -C /work/fixture commit --amend` with a global flag before the subcommand, a plain
 `git commit`, and — the one that matters — `git log --oneline -5 | grep -i commit`, which contains
 the words and runs no commit. A substring test passes three of those four and is wrong.
+
+That is the surface the fixture covers, **not** the whole behaviour of the parser, and the
+difference is worth writing down. `is_commit_command` is a token test over unquoted `&&` / `;` /
+`|` / newline splits, not a shell parser. Its **known negatives**, probed against the mirror and
+left unfixed on purpose:
+
+| Shape | Reads as | Right? |
+| --- | --- | --- |
+| `git commit --dry-run`, `git commit --help` | ship | no — runs no commit |
+| `echo "… && git commit"`, a heredoc body line starting `git commit` | ship | no — quoting and heredocs are not modelled |
+| `(git commit …)`, `command git commit`, `bash -c '… git commit …'` | not a ship | no |
+| `GIT_EDITOR=true git commit`, `timeout 60 git commit` | not a ship | no — only `sudo` is stepped over |
+| `git --work-tree x commit` | not a ship | no — only `-C`/`-c` are stepped over |
+| `git commit --amend` | ship | yes — amending is shipping |
+| `gh …`, `jj commit`, `hg commit` | not a ship | yes — only `git` ships |
+
+Total disagreement across the whole mirror is **one session**, and the errors run in both
+directions at about the same size, so this bounds the reported rate rather than biasing it. The
+unit test `the_commit_parser_has_documented_known_negatives` in `metrics.rs` pins every wrong row
+above as *current behaviour*, so the disagreement is a recorded decision a future change has to
+walk past deliberately rather than a surprise. Growing the parser into a shell tokenizer would need
+its own test suite to be trustworthy and buys a single session, which is why it has not been done.
 
 It is also the anchor slice's canary for this rule. The first commit message carries a planted,
 live-*shaped* GitHub token, so the test that resolves each anchor through the excerpt route asserts

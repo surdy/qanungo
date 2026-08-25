@@ -444,34 +444,50 @@ const fn compaction_observable(source: Source) -> bool {
 ///
 /// # Shipping is a commit, not an edit
 ///
-/// Two definitions were measured over the 2026-08-25 mirror (739 transcripts) before this one was
-/// picked, and both are defensible enough that the choice had to be argued rather than assumed:
+/// Two definitions were measured over the 2026-08-25 mirror (740 transcripts) before this one was
+/// picked, and both are defensible enough that the choice had to be argued rather than assumed.
+/// **Every figure below was measured with [`is_commit_command`] and [`is_review_pass`] exactly as
+/// this module ships them**, over the whole mirror — an earlier pass quoted numbers from a
+/// prototype parser that did not split on newlines and an edit list that had lost Copilot's `edit`
+/// tool, and it undercounted both columns:
 ///
-/// | | claude-code | copilot-cli |
+/// | | claude-code (352) | copilot-cli (388) |
 /// | --- | --- | --- |
-/// | sessions with an edit/write tool event | 210 | 146 |
-/// | sessions with a `git commit` in a typed `command` | 149 | 113 |
-/// | edited but never committed | 77 | 46 |
-/// | committed without an edit event | 16 | 13 |
+/// | sessions with an edit/write tool event | 210 | 161 |
+/// | sessions with a `git commit` in a typed `command` | 189 | 121 |
+/// | edited but never committed | 39 | 43 |
+/// | committed without an edit event | 18 | 3 |
+/// | **unreviewed, by commit** | 174/189 = **92.1%** | 121/121 = 100% |
+/// | **unreviewed, by edit** | 193/210 = **91.9%** | 161/161 = 100% |
 ///
 /// **A commit is a ship; an edit alone is work in progress.** A session that edited a file and
 /// stopped has not put anything anywhere — it is the middle of a piece of work, and calling it a
-/// ship would put every abandoned experiment in the denominator of a rate about shipping
-/// discipline. The 77 claude-code sessions that edited without committing are exactly that
-/// population, and they are not sessions that shipped without review.
+/// ship would put abandoned experiments in the denominator of a rate about shipping discipline.
+/// The 39 claude-code sessions that edited without committing are exactly that population.
 ///
-/// The second reason is mechanical and matters more for the fold's future: **the commit definition
-/// reads one typed field with one meaning on both harnesses**, while the edit definition needs a
-/// hand-maintained list of per-harness edit-tool names (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`
-/// against Copilot's `edit`/`create`/`apply_patch`) that goes stale silently the day a harness
-/// adds a tool. A definition that decays without failing is the worse of two readings even when
-/// the numbers agree — and here they nearly do: the unreviewed rate is 91.9% by edit and 89.9% by
-/// commit on claude-code, so nothing about this choice was made to move a score.
+/// **On the true numbers the two definitions very nearly agree, and that is worth saying plainly
+/// rather than claiming a population argument the data does not support.** 92.1% against 91.9% is
+/// two tenths of a point; the first measurement's apparent two-point gap was the prototype
+/// parser's undercount, not a real difference. So the population argument above is *directionally*
+/// right but carries almost no weight here — the choice rests on the mechanical reason instead:
+/// **the commit definition reads one typed field with one meaning on both harnesses**, while the
+/// edit definition needs a hand-maintained list of per-harness tool names
+/// (`Edit`/`Write`/`MultiEdit`/`NotebookEdit` against Copilot's `edit`/`create`/`apply_patch`)
+/// that goes stale silently the day a harness adds a tool. The prototype's lost `edit` entry is
+/// that decay happening once already, inside this very crate, which is the strongest available
+/// argument for not depending on such a list.
 ///
-/// The 16 sessions that committed with no edit event are real and stay in: committing work done
+/// **Nothing here was or could have been chosen to move a score**, and that is now provable rather
+/// than asserted: both readings sit at roughly 92%, which is more than three times
+/// [`FIRE_RATE_FLOOR`](crate::scoring::constants::FIRE_RATE_FLOOR). Each therefore clamps to a
+/// full penalty and the lane scores **0 under either definition**, so there was no score to gain.
+///
+/// The 18 sessions that committed with no edit event are real and stay in: committing work done
 /// by hand, by a subagent, or in an earlier session is still shipping.
 ///
 /// # Two things were measured and deliberately not built
+///
+/// Both were re-measured with the shipped parser, and both survived it unchanged.
 ///
 /// **Commit failure is not filtered.** The compaction fold spells its failure filter
 /// `succeeded != Some(false)` for a good reason, so the same question was asked here: across the
@@ -603,6 +619,31 @@ pub fn is_review_pass(skill: &str) -> bool {
 /// Compound lines are split on `&&`, `;` and `|` because the archive's real shipping lines are
 /// compound almost without exception — `git add -A && git status --porcelain && git commit -q -m …`
 /// is the shape most of them take.
+///
+/// # What this does not model, stated rather than implied
+///
+/// This is a **token test over unquoted `&&` / `;` / `|` / newline splits**, not a shell parser,
+/// and the boundary is worth writing down because "parsed rather than substring-matched" would
+/// otherwise read as a stronger claim than the code makes:
+///
+/// - **Quoting and heredocs are not modelled.** A segment inside quotes or inside a heredoc body
+///   is split and tested like any other, so `echo "x && git commit"` and a commit message whose
+///   own body contains a line beginning `git commit` both count. The archive's commit messages are
+///   written by this tooling and none of them does that.
+/// - **Intent is not modelled.** `git commit --dry-run` and `git commit --help` count as ships;
+///   they run no commit. `--amend` also counts, and there the answer is right — amending is
+///   shipping.
+/// - **Wrappers and prefixes are not stepped over.** `(git commit …)`, `GIT_EDITOR=true git
+///   commit`, `timeout 60 git commit`, `command git commit`, and `bash -c '… git commit …'` all
+///   read as non-commits, as does `git --work-tree x commit` (only `-C`/`-c` are stepped over).
+///   `sudo` is the one prefix handled.
+/// - **Only `git` ships.** `gh`, `jj`, and `hg` do not, however they are spelled.
+///
+/// Every one of these was probed against the mirror and the total disagreement is **one session**,
+/// which is why the parser is left alone rather than grown into a shell tokenizer that would need
+/// its own test suite to be trustworthy. Both directions of error exist, they are roughly the same
+/// size, and the rate is reported to a whole percent — so this bounds the figure rather than
+/// biasing it. The fixture README lists the known negatives as known.
 ///
 /// This reads a string the fold never keeps: like [`CommandChurn`], what survives here is a count.
 pub(crate) fn is_commit_command(command: &str) -> bool {
@@ -2091,6 +2132,47 @@ mod tests {
             "",
         ] {
             assert!(!is_commit_command(command), "{command} does not ship");
+        }
+    }
+
+    /// The parser's **known negatives**, pinned as *current behaviour* rather than as correct
+    /// behaviour.
+    ///
+    /// [`is_commit_command`] is a token test over unquoted separators, not a shell parser, and its
+    /// rustdoc says where that boundary falls. These cases are the boundary: each one is wrong,
+    /// each is documented in the fixture README, and together they disagree with a real shell on
+    /// **one session** of the whole mirror — which is why the parser is not being grown into a
+    /// tokenizer. The test exists so the disagreement is a recorded decision that a future change
+    /// has to walk past deliberately, instead of a surprise.
+    #[test]
+    fn the_commit_parser_has_documented_known_negatives() {
+        // Over-matches: intent is not modelled, and quoting is not either.
+        for command in [
+            "git commit --dry-run",
+            "git commit --help",
+            // A quoted segment is split like any other, so the tail reads as a bare command.
+            "echo \"a && git commit -m x\"",
+        ] {
+            assert!(
+                is_commit_command(command),
+                "{command} is a known over-match; if this now fails the parser improved — \
+                 update the rustdoc and the fixture README rather than deleting the case",
+            );
+        }
+        // Under-matches: wrappers, env prefixes and other global flags are not stepped over.
+        for command in [
+            "(git commit -m y)",
+            "command git commit -m y",
+            "bash -c 'git commit -m y'",
+            "GIT_EDITOR=true git commit",
+            "timeout 60 git commit -m y",
+            "git --work-tree /w commit -m y",
+        ] {
+            assert!(
+                !is_commit_command(command),
+                "{command} is a known under-match; if this now fails the parser improved — \
+                 update the rustdoc and the fixture README rather than deleting the case",
+            );
         }
     }
 

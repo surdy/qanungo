@@ -864,12 +864,21 @@ fn compaction_detail(session: &SessionMetrics) -> String {
 /// [`is_review_pass`](crate::metrics::is_review_pass) and is argued there.
 ///
 /// **The rate this fires at is very high and is not being sanded down.** On the 2026-08-25 mirror
-/// it selects 134 of 149 eligible claude-code sessions — near 90%, where the pack's other rules sit
-/// between 3% and 5%. The module docs open by saying that a rule firing constantly is evidence its
-/// threshold is wrong; that argument does not apply to a rule with no threshold. What a 90% rate
-/// says is that running a review pass before committing is not the working habit, which is a
-/// finding about the practice and precisely what a coaching report exists to surface. Making the
-/// number comfortable would have meant inventing a constant for the purpose.
+/// it selects **174 of 189** eligible claude-code sessions — **92.1%**, where the pack's other
+/// rules sit between 3% and 5%. The module docs open by saying that a rule firing constantly is
+/// evidence its threshold is wrong; that argument does not apply to a rule with no threshold. What
+/// a 92% rate says is that running a review pass before committing is not the working habit, which
+/// is a finding about the practice and precisely what a coaching report exists to surface. Making
+/// the number comfortable would have meant inventing a constant for the purpose.
+///
+/// **The lane's `0` is the clamp's reading, not the rate.** Any fire rate at or above
+/// [`FIRE_RATE_FLOOR`](crate::scoring::constants::FIRE_RATE_FLOOR) — 25% — spends a component's
+/// whole share, so this lane reads 0 anywhere from 25% to 100% and will not move until the rate
+/// falls below a quarter. That is a real limitation of a saturated component, and it is why the
+/// score is not the thing to read here: **the component line beside it carries the raw rate**
+/// ("fired on 174 of 189 … (92%)"), which is the number that actually moves as the habit changes.
+/// See [`FIRE_RATE_FLOOR`](crate::scoring::constants::FIRE_RATE_FLOOR), where the trade-off is
+/// stated for the pack as a whole.
 fn unreviewed_ship(sessions: &[SessionMetrics]) -> Option<Finding> {
     let evidence: Vec<_> = sessions
         .iter()
