@@ -770,7 +770,9 @@ mod tests {
 
     use super::*;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes, ToolTally};
+    use crate::metrics::{
+        Activity, CommandChurn, Compactions, ReviewActivity, ToolOutcomes, ToolTally,
+    };
     use crate::rules;
 
     fn instrumentation() -> Instrumentation {
@@ -849,6 +851,7 @@ mod tests {
                 observable: true,
                 ..Compactions::default()
             },
+            reviews: ReviewActivity::default(),
             bytes_folded: 4096,
         }
     }
@@ -917,6 +920,7 @@ mod tests {
                         observable: true,
                         ..Compactions::default()
                     },
+                    reviews: ReviewActivity::default(),
                     bytes_folded: 1024,
                 }
             })
@@ -1044,28 +1048,37 @@ mod tests {
         assert!(markdown.contains("| Bash | 20 | 9 | 45% |"));
     }
 
-    /// A lane no signal feeds says so, in every column, and never carries a number. The one row
-    /// below is the whole no-signal-no-claim discipline as a reader sees it — Context Management
-    /// was the other until munshi#77 typed compaction, and the pair of assertions here is what
-    /// keeps the difference between a dark lane and a lit one visible in the rendered document.
+    /// A harness that could not look renders **no reading**, never a number — and the reason is
+    /// legible in the document rather than only in the source.
+    ///
+    /// The fixture harness types no review surface, so Code Review is the copilot case here: the
+    /// row reads "no reading" and the component line names the eligibility that was never met.
+    /// The "not scored" copy is gone from the whole document, because no lane is unfed any more —
+    /// Context Management left that state when munshi#77 typed compaction, Code Review when it
+    /// typed invocations — and the negative assertion below is what keeps the phrase from
+    /// reappearing by accident.
     #[test]
-    fn an_unfed_lane_renders_as_not_scored_in_every_column() {
+    fn a_lane_no_harness_could_look_at_renders_as_no_reading() {
         let markdown = render(&hygiene_window(20, 5), &[]);
         assert!(
-            markdown.contains("| Code Review | not scored | not scored |"),
+            markdown.contains("| Code Review | no reading | no reading |"),
             "{markdown}"
         );
         assert!(
-            markdown.contains("**Code Review — not scored.** no signal typed for this lane yet"),
+            markdown.contains(
+                "- Shipped without review: only 0 sessions that shipped on a harness whose \
+                 review surfaces are all typed, fewer than the 5 a fire rate needs — no say in \
+                 the score"
+            ),
             "{markdown}"
         );
-        // The woken lane renders like any other scored one, and never as "not scored" again.
+        assert!(
+            !markdown.contains("not scored"),
+            "no lane is unfed any more: {markdown}"
+        );
+        // The lane munshi#77 woke first renders like any other scored one.
         assert!(
             markdown.contains("| Context Management | 100 | 100 |"),
-            "{markdown}"
-        );
-        assert!(
-            !markdown.contains("**Context Management — not scored.**"),
             "{markdown}"
         );
         assert!(
@@ -1085,6 +1098,51 @@ mod tests {
                 "- Marathon session: fired on 5 of 20 sessions with a measurable \
                                sitting (25%) — 50.0 points off"
             ),
+            "{markdown}"
+        );
+    }
+
+    /// The woken lane, **scored**, in the rendered document: the table cell carries the number and
+    /// the "why" section carries the reading that produced it, with the denominator said in words.
+    ///
+    /// The finding renders beside it, and the detail line is aggregates only — a count of commits
+    /// and a count of skill invocations, never a commit message.
+    #[test]
+    fn a_scored_code_review_lane_renders_its_number_and_its_reading() {
+        let mut sessions = hygiene_window(20, 0);
+        for (index, session) in sessions.iter_mut().enumerate() {
+            session.reviews = ReviewActivity {
+                observable: true,
+                commits: 2,
+                // Four of the twenty reviewed before shipping; sixteen did not.
+                review_passes: u64::from(index < 4),
+                skill_invocations: 2,
+            };
+        }
+        let markdown = render(&sessions, &[]);
+
+        // 16 of 20 is an 80% fire rate, far past the 25% floor, so the one component spends the
+        // whole lane.
+        assert!(markdown.contains("| Code Review | 0 | 0 |"), "{markdown}");
+        assert!(
+            markdown.contains(
+                "- Shipped without review: fired on 16 of 20 sessions that shipped on a harness \
+                 whose review surfaces are all typed (80%) — 100.0 points off"
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("### Shipped without review"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "16 of 20 folded sessions committed code without running a review pass first."
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("committed 2 times; no review pass among 2 skill invocations"),
             "{markdown}"
         );
     }

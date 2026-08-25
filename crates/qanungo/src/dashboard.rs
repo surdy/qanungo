@@ -1048,7 +1048,7 @@ mod tests {
     use crate::cost::SessionCost;
     use crate::cost_report::CostInstrumentation;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ReviewActivity, ToolOutcomes};
     use crate::report::Instrumentation;
     use crate::rules;
     use crate::scoring::RulePack;
@@ -1112,6 +1112,7 @@ mod tests {
                         observable: true,
                         ..Compactions::default()
                     },
+                    reviews: ReviewActivity::default(),
                     anchors: SessionAnchors::default(),
                     bytes_folded: 1024,
                 }
@@ -1394,21 +1395,95 @@ mod tests {
         );
     }
 
-    /// A lane nothing types a signal for is never a zero and never a hundred: it is `not-scored`,
-    /// in every column, carrying the sentence that names the pull it is waiting for.
+    /// The woken lane in the payload, both halves: the lane's own score, and the finding under it
+    /// carrying `evidence_kind: "mixed"` with anchors on the commits.
+    ///
+    /// The `evidence_kind` assertion is the load-bearing one. The page renders anchors only where
+    /// the rule says it has events to point at, and this rule half-does: the commits anchor, the
+    /// missing review does not. A payload that claimed `structural` would hide real evidence, and
+    /// one that claimed `event` would promise a locus for an absence.
     #[test]
-    fn an_unfed_lane_is_not_scored_everywhere_and_says_what_it_waits_for() {
+    fn a_scored_code_review_lane_carries_its_score_and_a_mixed_evidence_kind() {
+        let mut sessions = hygiene_window("claude-code", 20, 0);
+        for (index, session) in sessions.iter_mut().enumerate() {
+            session.reviews = ReviewActivity {
+                observable: true,
+                commits: 2,
+                review_passes: u64::from(index < 4),
+                skill_invocations: 2,
+            };
+            session.anchors.commits = vec![EventAnchor {
+                locator: 3,
+                record: 4,
+                line: 4,
+                at: None,
+                tool: Some("Bash".to_owned()),
+            }];
+        }
+        let payload = built(sessions, Vec::new());
+
+        let review = lane(&payload, "code-review");
+        assert_eq!(review["fleet"]["state"], "scored");
+        assert_eq!(
+            review["fleet"]["score"], 0,
+            "16 of 20 is far past the floor"
+        );
+        assert_eq!(review["reason"], Value::Null);
+        let harness = &review["harnesses"][0];
+        assert_eq!(harness["components"][0]["label"], "Shipped without review");
+        assert_eq!(harness["components"][0]["cost"], 100.0);
+        assert!(
+            harness["components"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("fired on 16 of 20"),
+        );
+
+        let finding = payload["findings"]
+            .as_array()
+            .expect("findings are an array")
+            .iter()
+            .find(|finding| finding["rule"] == "unreviewed-ship")
+            .expect("the rule fired");
+        assert_eq!(finding["evidence_kind"], "mixed");
+        assert_eq!(
+            finding["evidence"][0]["anchors"]
+                .as_array()
+                .expect("the ship half anchors")
+                .len(),
+            1,
+        );
+    }
+
+    /// The payload keeps the three lane states apart, and **`not-scored` is now unreachable**:
+    /// every lane in the pack is typed, so a lane a harness cannot be read for serializes as
+    /// `no-reading` with a null score and a null reason, like any other silent signal.
+    ///
+    /// This is the copilot shape of Code Review, asserted on the payload the page renders from — a
+    /// reader of the JSON must be able to tell "nothing could look" from "nothing happened", and
+    /// the component detail is where that distinction lives.
+    #[test]
+    fn a_lane_no_harness_could_look_at_serializes_as_no_reading() {
         let payload = built(hygiene_window("claude-code", 20, 5), Vec::new());
         let review = lane(&payload, "code-review");
-        assert_eq!(review["fleet"]["state"], "not-scored");
+        assert_eq!(review["fleet"]["state"], "no-reading");
         assert_eq!(review["fleet"]["score"], Value::Null);
-        assert_eq!(review["harnesses"][0]["state"], "not-scored");
+        assert_eq!(review["harnesses"][0]["state"], "no-reading");
         assert_eq!(review["harnesses"][0]["score"], Value::Null);
+        assert_eq!(
+            review["reason"],
+            Value::Null,
+            "no lane is untyped any more, so none carries a waiting-for reason",
+        );
+        assert_eq!(
+            review["harnesses"][0]["components"][0]["label"],
+            "Shipped without review",
+        );
         assert!(
-            review["reason"]
+            review["harnesses"][0]["components"][0]["detail"]
                 .as_str()
-                .expect("an unfed lane says why")
-                .contains("no signal typed for this lane yet"),
+                .expect("a silent component still says why")
+                .contains("review surfaces are all typed"),
         );
 
         // Context Management was the other one until munshi#77 typed compaction. It now carries a

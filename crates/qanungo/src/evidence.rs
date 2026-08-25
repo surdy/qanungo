@@ -149,6 +149,14 @@ pub struct SessionAnchors {
     pub unattributed_errors: Vec<EventAnchor>,
     /// Runs of the session's busiest command value — the events the retry-loop rule counted.
     pub command_runs: Vec<EventAnchor>,
+    /// The session's `git commit` invocations — the ships the unreviewed-ship rule counted, in
+    /// file order and capped at [`MAX_ANCHORS_PER_FINDING`].
+    ///
+    /// The *ship* half of that rule is genuinely event-shaped: a commit is a tool event with an
+    /// ordinal in this locator space and a verbatim the excerpt route can serve, so it anchors
+    /// like any counted event. The rule's other half — that nothing reviewed it — is an absence,
+    /// and an absence has no locus; see [`EvidenceKind::Mixed`].
+    pub commits: Vec<EventAnchor>,
 }
 
 impl SessionAnchors {
@@ -226,8 +234,14 @@ pub enum EvidenceKind {
     Event,
     /// Every component is structural; the evidence is timestamps and counts.
     Structural,
-    /// One component counts events and the rest are structural — fire-and-forget, whose error
-    /// component counts failures and whose ratio component is a shape.
+    /// One component counts events and the rest have nothing to point at — fire-and-forget, whose
+    /// error component counts failures and whose ratio component is a shape, and unreviewed-ship,
+    /// whose commits are countable events and whose second half is an **absence**.
+    ///
+    /// An absence is the sharpest case this enum has to describe: a rule that fires *because no
+    /// review pass exists* has no event to anchor, not because the event is unanchorable but
+    /// because there is none. `Mixed` is what says one half can be shown and the other can only be
+    /// stated.
     Mixed,
 }
 

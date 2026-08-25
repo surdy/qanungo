@@ -14,11 +14,13 @@ deliberately fire **no** rule.
 | `copilot-1.0.76-tool-activity.jsonl` | `fixtures/copilot-tool-activity/aaaaaaaa-…/events.jsonl` |
 | `claude-code-2.1.235-compaction.jsonl` | `fixtures/claude-code-compaction/transcript/0c1a0de0-…-000000077003.jsonl` |
 | `copilot-1.0.76-compaction.jsonl` | `fixtures/copilot-compaction/dddddddd-…/events.jsonl` |
+| `claude-code-2.1.235-invocation.jsonl` | `fixtures/claude-code-invocation/transcript/0c1a0de0-…-000000077004.jsonl` |
+| `copilot-1.0.76-invocation.jsonl` | `fixtures/copilot-invocation/eeeeeeee-…/events.jsonl` |
 
-The last two are the exception to that note, and they are borrowed rather than synthesized on
-purpose: they are the fixtures munshi cut for issue #77's compaction promotion, so the marker shapes
-in them are the ones the interpreter was actually certified against, traps included. Each fires
-**Compaction churn** and nothing else.
+The last four are the exception to that note, and they are borrowed rather than synthesized on
+purpose: they are the fixtures munshi cut for issue #77's promotions, so the record shapes in them
+are the ones the interpreter was actually certified against, traps included. The two compaction
+files fire **Compaction churn** and nothing else.
 
 They pin the two counting rules a consumer cannot get right by guessing. The Copilot file writes
 five `session.compaction_start` records and five `session.compaction_complete` records — ten markers
@@ -31,6 +33,27 @@ string, a `compactMetadata` that is a number, a marker with no metadata at all, 
 `compaction_complete` whose `data` is unreadable — so the pre-compaction totals the finding carries
 as context are stated on fewer compactions than there are, which is the shape a rendering path has
 to handle rather than assume away.
+
+The two **invocation** files are pull B's, and they are borrowed for the same reason plus one more:
+the classification of which names are review passes is qanungo's to make, so the fixture that tests
+it should be the one written by somebody who was not making it. Between them they carry every
+decoy the classifier has to survive.
+
+The Claude Code file invokes eight skills, including `code-review` and `security-review` (both
+review passes), `simplify` (the quality pass this consumer deliberately **excludes** — it disclaims
+bug-hunting and redirects to `code-review`), and `artifact-design`/`run` (not reviews). It also
+carries the two traps that decide whether the classifier is right: a `SlashCommand` **tool**
+invoking `/code-review`, and a typed `<command-name>/security-review</command-name>` slash command.
+Neither counts — in this harness a review is invoked through the `Skill` tool, and the slash surface
+exists in this lane only to make the harness *observable*. Its one shell command is `cargo test`, so
+it ships nothing and is not eligible for the review rate at all. It is deliberately **not** in the
+"munshi fixtures fire nothing" list: it carries 15+ user records to exercise the slash-command edge
+cases, which is the Babysitting shape by construction.
+
+The Copilot file is the observability case in one record: `/chronicle improve` sits in a
+`user.message` as prose with no marker of any kind, beside a real `skill.invoked`. That is exactly
+why Copilot is **couldn't-look** for this rule — its skill surface is typed and its slash surface is
+not, and partial observability cannot support the sentence "Copilot ran no review".
 
 ## `rules/`
 
@@ -58,6 +81,24 @@ field on a tool event, and repeated-command churn is folded from that field alon
 `local_shell_call` records run three distinct commands, one of them six times — enough to cross
 `RETRY_LOOP_REPEATS` — with the one-offs interleaved so that grouping by value, rather than
 counting events, is what makes the test pass.
+
+`unreviewed-ship.jsonl` and `reviewed-ship.jsonl` are the Code Review lane's pair (qanungo #4,
+munshi#77 pull B). They are the same short session twice, differing in one record: whether a
+`code-review` skill ran before the commit. The unreviewed one fires **Shipped without review**
+and nothing else; the reviewed one fires nothing at all.
+
+`unreviewed-ship.jsonl` carries the ship parser's whole test surface in four `Bash` calls — the
+compound `git add -A && git status --porcelain && git commit -q -m …` shape the archive actually
+writes, a `git -C /work/fixture commit --amend` with a global flag before the subcommand, a plain
+`git commit`, and — the one that matters — `git log --oneline -5 | grep -i commit`, which contains
+the words and runs no commit. A substring test passes three of those four and is wrong.
+
+It is also the anchor slice's canary for this rule. The first commit message carries a planted,
+live-*shaped* GitHub token, so the test that resolves each anchor through the excerpt route asserts
+the credential comes back scrubbed while `CANARY_COMMIT_SUBJECT` around it survives. That pairing is
+the evidence argument in executable form: a commit message is operator-written text, which is
+exactly why anchoring it is worth doing *and* why it goes out through the redactor. As everywhere
+else in this tree, the token has never been real and has `CANARY` spelled through its body.
 
 `error-with-planted-secret.jsonl` is the evidence-excerpt slice's canary (qanungo #5). It is the
 error-rate shape again — twelve `Bash` calls, the first six failing — with two of those failures

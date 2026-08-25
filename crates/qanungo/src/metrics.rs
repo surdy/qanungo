@@ -434,6 +434,206 @@ const fn compaction_observable(source: Source) -> bool {
     }
 }
 
+/// Review activity for one session: whether it shipped, and whether anything reviewed it first.
+///
+/// The reading behind qanungo #4's **Code Review** lane, and the fold half of the
+/// review-before-done rate — *of the sessions that shipped code, how many ran a review pass*.
+/// munshi#77 pull B typed the two invocation surfaces this reads; what a name on one of them
+/// **means** is decided here, because the interpreter deliberately declines to
+/// ([`ToolEvent::skill`] says so in as many words).
+///
+/// # Shipping is a commit, not an edit
+///
+/// Two definitions were measured over the 2026-08-25 mirror (739 transcripts) before this one was
+/// picked, and both are defensible enough that the choice had to be argued rather than assumed:
+///
+/// | | claude-code | copilot-cli |
+/// | --- | --- | --- |
+/// | sessions with an edit/write tool event | 210 | 146 |
+/// | sessions with a `git commit` in a typed `command` | 149 | 113 |
+/// | edited but never committed | 77 | 46 |
+/// | committed without an edit event | 16 | 13 |
+///
+/// **A commit is a ship; an edit alone is work in progress.** A session that edited a file and
+/// stopped has not put anything anywhere — it is the middle of a piece of work, and calling it a
+/// ship would put every abandoned experiment in the denominator of a rate about shipping
+/// discipline. The 77 claude-code sessions that edited without committing are exactly that
+/// population, and they are not sessions that shipped without review.
+///
+/// The second reason is mechanical and matters more for the fold's future: **the commit definition
+/// reads one typed field with one meaning on both harnesses**, while the edit definition needs a
+/// hand-maintained list of per-harness edit-tool names (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`
+/// against Copilot's `edit`/`create`/`apply_patch`) that goes stale silently the day a harness
+/// adds a tool. A definition that decays without failing is the worse of two readings even when
+/// the numbers agree — and here they nearly do: the unreviewed rate is 91.9% by edit and 89.9% by
+/// commit on claude-code, so nothing about this choice was made to move a score.
+///
+/// The 16 sessions that committed with no edit event are real and stay in: committing work done
+/// by hand, by a subagent, or in an earlier session is still shipping.
+///
+/// # Two things were measured and deliberately not built
+///
+/// **Commit failure is not filtered.** The compaction fold spells its failure filter
+/// `succeeded != Some(false)` for a good reason, so the same question was asked here: across the
+/// whole mirror, the number of shipping sessions in which *every* `git commit` event explicitly
+/// reported failure is **zero**, on both harnesses. A filter that changes nothing is a branch
+/// nobody can test against reality, so the count is of commit *invocations* and this note says so
+/// rather than the code pretending to a precision it never exercises.
+///
+/// **Ordering is not enforced.** "Review before done" could mean *before the last commit*, and the
+/// ordinals to check it are right here in file order. Measured: of the 15 claude-code sessions
+/// that both shipped and reviewed, **15** reviewed before their last commit and **0** reviewed
+/// only after. The stricter rule and the simpler one select the same sessions on this archive, so
+/// the simpler one is what runs — the anti-pattern being named is *shipped without ever
+/// reviewing*, not *reviewed in the wrong order*. If a later window separates them, this is the
+/// note that says where to look.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewActivity {
+    /// Whether this harness types **every** surface a review pass could arrive on. `false` is
+    /// *nobody could look*; `true` with no review pass is *nothing reviewed it*. See
+    /// [`review_observable`], which is where that judgement is made and defended.
+    pub observable: bool,
+    /// Tool events whose typed `command` runs `git commit` — the session's ships.
+    pub commits: u64,
+    /// Skill invocations this consumer classifies as a review pass ([`is_review_pass`]).
+    pub review_passes: u64,
+    /// Skill invocations of any name. Context for the finding's detail line, so a reader can see
+    /// whether a session used skills at all before being told none of them reviewed anything.
+    pub skill_invocations: u64,
+}
+
+impl ReviewActivity {
+    /// Whether this session shipped: at least one commit invocation.
+    pub const fn shipped(&self) -> bool {
+        self.commits > 0
+    }
+
+    /// Whether anything in this session reviewed the work.
+    pub const fn reviewed(&self) -> bool {
+        self.review_passes > 0
+    }
+
+    /// Whether this session belongs in the review-before-done denominator at all: its harness
+    /// types every review surface, **and** it shipped something to review.
+    pub const fn shipped_observably(&self) -> bool {
+        self.observable && self.shipped()
+    }
+}
+
+/// Whether this interpreter can see **every** way a review pass could have been invoked for a
+/// harness — the eligibility question, asked of the reader rather than of the transcript, exactly
+/// as [`compaction_observable`] asks it.
+///
+/// This is the one place the Code Review lane's honesty lives, so the reasoning is per harness:
+///
+/// - **Claude Code — fully observable.** Both surfaces are typed. Skills arrive as
+///   `ToolEvent::skill`, and the mirror holds 102 invocations across 10 names. Slash commands
+///   arrive as `Record::slash_command`, and the mirror holds 177 across 11 names — *every one of
+///   them a built-in CLI command* (`/model` alone is 129, beside `/effort`, `/compact`, `/exit`,
+///   `/tasks`, `/context`, `/status`, `/login`, `/statusline`, `/claude-api`, `/auto-mode-setup`).
+///   Nothing review-shaped hides on that surface, and because the surface is *typed* that is a
+///   fact read off the archive rather than an assumption. So a Claude Code session with no review
+///   skill in it is a session nothing reviewed, and it is a clean denominator.
+///
+/// - **Copilot CLI — partially observable, which is not enough.** Its *skill* surface is typed (19
+///   invocations, 3 names: `device-debugging`, `inteltechniques-search`, `notesmith-memory`, none
+///   review-shaped). Its *slash-command* surface is **prose with no marker of any kind** —
+///   `munshi-transcript` reads none and its rustdoc instructs consumers to treat that rate as
+///   *unknown, never zero*. A Copilot operator who reviews through a slash command is therefore
+///   invisible to this fold, so "Copilot ran no review" is a sentence this crate cannot say. It is
+///   the cost lane's precedent applied unchanged — **no signal, no claim** — and it means Copilot
+///   leaves the rate entirely rather than scoring a 100% failure it did not earn. The lane scores
+///   Copilot the day that surface is typed, and not before.
+///
+/// - **Codex — could not look**, for the reason every Codex gap here has: zero archived sessions,
+///   so no surface of it has ever been certified.
+///
+/// **Copilot is unscored here by observability, not by behaviour.** That distinction is the whole
+/// point of returning `false` rather than counting it and letting a 100% fire rate stand.
+const fn review_observable(source: Source) -> bool {
+    match source {
+        Source::ClaudeCode => true,
+        Source::Copilot | Source::Codex => false,
+    }
+}
+
+/// Whether a skill name is a **review pass** — qanungo's classification, which
+/// `munshi-transcript` explicitly leaves to its consumer.
+///
+/// The test is `review` as a **whole token**, splitting on the separators a skill name uses. That
+/// admits `code-review` (43 invocations in the mirror, the only review pass it holds),
+/// `security-review`, a bare `review`, and any `*-review` a later session invents, without the
+/// consumer maintaining a list that silently under-counts every new name.
+///
+/// **Substring matching would be wrong, and not hypothetically**: `interview-prep` contains
+/// `review`. A skill about interviews is not a code review, and a classifier that says it is would
+/// quietly inflate the reviewed count with sessions that reviewed nothing.
+///
+/// # `simplify` is deliberately excluded
+///
+/// It is a quality pass over the diff, which makes it a near miss worth stating rather than
+/// ignoring. It is excluded because its own contract disclaims the job this lane measures: it
+/// reviews changed code for reuse and simplification and *does not hunt for bugs*, redirecting to
+/// `code-review` for that. A review-before-done gate that a self-declared non-review could satisfy
+/// would be measuring something other than what it reports. The archive holds **zero** `simplify`
+/// invocations, so this changes no number today — it is written down because the decision is
+/// definitional, not measured, and a later reader deserves the reason rather than the outcome.
+///
+/// # Slash commands are not a review surface here
+///
+/// This reads skill names only. In Claude Code a review is invoked through the `Skill` tool and
+/// arrives as `ToolEvent::skill`; the slash surface carries built-in CLI commands, and
+/// `munshi-transcript`'s own rustdoc says a consumer looking there for review passes will find
+/// none. That surface is still what makes the harness *observable* — reading it is how we know
+/// nothing review-shaped is on it — but it is never itself counted as a review.
+pub fn is_review_pass(skill: &str) -> bool {
+    skill
+        .split(['-', '_', '/', '.', ' '])
+        .any(|token| token.eq_ignore_ascii_case("review"))
+}
+
+/// Whether a typed shell `command` ships: it runs `git commit`.
+///
+/// Parsed rather than substring-matched, because a substring test would count the *word* wherever
+/// it fell — inside a commit message body, a grep pattern, or a branch name. A segment counts only
+/// when `git` is the command being run and `commit` is its subcommand, after stepping over `git`'s
+/// own leading flags (`-C <path>`, `-c <cfg>`). `git commit-tree` is a different subcommand and
+/// does not match.
+///
+/// Compound lines are split on `&&`, `;` and `|` because the archive's real shipping lines are
+/// compound almost without exception — `git add -A && git status --porcelain && git commit -q -m …`
+/// is the shape most of them take.
+///
+/// This reads a string the fold never keeps: like [`CommandChurn`], what survives here is a count.
+pub(crate) fn is_commit_command(command: &str) -> bool {
+    command
+        .split(['\n', '\r'])
+        .flat_map(|line| line.split("&&"))
+        .flat_map(|part| part.split(';'))
+        .flat_map(|part| part.split('|'))
+        .any(|part| {
+            let part = part.trim_start();
+            let part = part.strip_prefix("sudo ").unwrap_or(part).trim_start();
+            let mut words = part.split_whitespace();
+            if words.next() != Some("git") {
+                return false;
+            }
+            // Step over git's own options so `git -C /repo commit` still reads as a commit.
+            let mut words = words.peekable();
+            while let Some(word) = words.peek() {
+                if !word.starts_with('-') {
+                    break;
+                }
+                let flag = *word;
+                words.next();
+                if matches!(flag, "-C" | "-c") {
+                    words.next();
+                }
+            }
+            words.next() == Some("commit")
+        })
+}
+
 /// Gap-aware activity for one session: how much of its span was actually worked, and in how many
 /// separate sittings.
 ///
@@ -632,6 +832,8 @@ pub struct SessionMetrics {
     pub commands: CommandChurn,
     /// Context compactions, undefined for a harness this interpreter reads no marker for.
     pub compactions: Compactions,
+    /// Ships and review passes, undefined for a harness whose review surfaces are not all typed.
+    pub reviews: ReviewActivity,
     /// Where the events a rule will count were. Strictly additive — see [`crate::evidence`].
     pub anchors: SessionAnchors,
     /// Transcript bytes read, for the fold-cost footer.
@@ -700,6 +902,7 @@ pub struct Fold {
     pub activity: Activity,
     pub commands: CommandChurn,
     pub compactions: Compactions,
+    pub reviews: ReviewActivity,
     pub anchors: SessionAnchors,
 }
 
@@ -721,6 +924,9 @@ pub fn fold_transcript(
     // Decided by the interpreter this fold is reading with, before a single record is seen: what a
     // *missing* marker means is a property of the harness, not of the transcript.
     fold.compactions.observable = compaction_observable(source);
+    // Decided the same way and for the same reason: whether a *missing* review pass is a reading
+    // at all is a property of which surfaces the harness types, not of this transcript.
+    fold.reviews.observable = review_observable(source);
     let mut names: HashMap<String, String> = HashMap::new();
     let mut commands = CommandRuns::default();
     // The locator every anchor is keyed by: the tool event's ordinal in file order. It is counted
@@ -763,7 +969,26 @@ pub fn fold_transcript(
                     // function, and nothing downstream of the fold can render it. What survives is
                     // the anchor — where the run was, never what it ran.
                     if let Some(command) = tool.fields.get("command") {
+                        // A ship, read off the same string and kept the same way: a count, plus
+                        // a bounded list of where — never the command itself.
+                        if is_commit_command(command) {
+                            fold.reviews.commits = fold.reviews.commits.saturating_add(1);
+                            if fold.anchors.commits.len() < MAX_ANCHORS_PER_FINDING {
+                                fold.anchors.commits.push(anchor(tool.name()));
+                            }
+                        }
                         commands.observe(command, anchor(tool.name()));
+                    }
+                    // munshi#77 pull B: `skill()` is the cross-harness question. Folding on
+                    // `name()` instead would score every Claude Code invocation as one skill
+                    // called `Skill`, which the interpreter's rustdoc warns about by name.
+                    if let Some(skill) = tool.skill() {
+                        fold.reviews.skill_invocations =
+                            fold.reviews.skill_invocations.saturating_add(1);
+                        if is_review_pass(skill) {
+                            fold.reviews.review_passes =
+                                fold.reviews.review_passes.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -1058,6 +1283,7 @@ mod tests {
             activity: fold.activity,
             commands: fold.commands,
             compactions: fold.compactions,
+            reviews: fold.reviews,
             anchors: fold.anchors,
             bytes_folded: 0,
         }
@@ -1512,6 +1738,7 @@ mod tests {
             activity: activity(gaps),
             commands: CommandChurn::default(),
             compactions: Compactions::default(),
+            reviews: ReviewActivity::default(),
             anchors: SessionAnchors::default(),
             bytes_folded: 0,
         };
@@ -1607,6 +1834,7 @@ mod tests {
             activity: Activity::over([start, start + TimeDelta::milliseconds(900)]),
             commands: CommandChurn::default(),
             compactions: Compactions::default(),
+            reviews: ReviewActivity::default(),
             anchors: SessionAnchors::default(),
             bytes_folded: 0,
         };
@@ -1828,5 +2056,64 @@ mod tests {
     #[test]
     fn an_unsupported_artifact_set_version_refuses_the_fold() {
         assert!(fold_transcript(Source::ClaudeCode, 99, &b""[..]).is_err());
+    }
+
+    /// The ship test, on the shapes the archive writes and the shapes that would fool a substring
+    /// match. The negatives are the point: `commit` appears as a word in plenty of lines that run
+    /// no commit at all.
+    #[test]
+    fn a_commit_is_parsed_rather_than_matched_as_a_substring() {
+        for command in [
+            "git commit",
+            "git commit -q -m \"subject\"",
+            "git add -A && git status --porcelain && git commit -q -m 'x'",
+            "git -C /work/repo commit --amend --no-edit",
+            "git -c user.name=x commit -m y",
+            "sudo git commit -m y",
+            "cargo test; git commit -m y",
+            "cargo check | head && git commit -am y",
+            "git add -A &&\ngit commit -m y",
+        ] {
+            assert!(is_commit_command(command), "{command} ships");
+        }
+        for command in [
+            // The word, in a line that runs no commit.
+            "git log --oneline -5 | grep -i commit",
+            "git show --stat HEAD~1",
+            "echo 'git commit -m x'",
+            "rg \"git commit\" docs/",
+            // A different subcommand that merely starts the same way.
+            "git commit-tree $TREE -m x",
+            // Not git at all.
+            "jj commit -m y",
+            "hg commit",
+            "cargo test --all",
+            "",
+        ] {
+            assert!(!is_commit_command(command), "{command} does not ship");
+        }
+    }
+
+    /// Review-pass classification is a **whole-token** test, which is what keeps `interview-prep`
+    /// out of a count of code reviews.
+    #[test]
+    fn review_classification_reads_whole_tokens_only() {
+        assert!(is_review_pass("code-review"));
+        assert!(is_review_pass("security-review"));
+        assert!(is_review_pass("review"));
+        assert!(is_review_pass("REVIEW"));
+        assert!(!is_review_pass("interview-prep"));
+        assert!(!is_review_pass("simplify"));
+        assert!(!is_review_pass("artifact-design"));
+        assert!(!is_review_pass(""));
+    }
+
+    /// Observability is a property of the harness, decided before a record is read — and Copilot's
+    /// `false` is the whole reason the Code Review lane scores one harness today.
+    #[test]
+    fn only_claude_code_types_every_review_surface() {
+        assert!(review_observable(Source::ClaudeCode));
+        assert!(!review_observable(Source::Copilot));
+        assert!(!review_observable(Source::Codex));
     }
 }

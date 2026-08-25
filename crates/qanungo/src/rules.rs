@@ -160,12 +160,13 @@ pub enum RuleId {
     Babysitting,
     FireAndForget,
     CompactionChurn,
+    UnreviewedShip,
 }
 
 impl RuleId {
     /// Every rule, in the order [`evaluate`] runs them — which is also report order, and the
     /// order the rule-pack stamp hashes them in.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::HighToolErrorRate,
         Self::RetryLoop,
         Self::MarathonSession,
@@ -173,6 +174,7 @@ impl RuleId {
         Self::Babysitting,
         Self::FireAndForget,
         Self::CompactionChurn,
+        Self::UnreviewedShip,
     ];
 
     /// The finding's heading in the report.
@@ -185,6 +187,7 @@ impl RuleId {
             Self::Babysitting => "Babysitting pattern",
             Self::FireAndForget => "Fire-and-forget extreme",
             Self::CompactionChurn => "Compaction churn",
+            Self::UnreviewedShip => "Shipped without review",
         }
     }
 
@@ -199,6 +202,7 @@ impl RuleId {
             Self::Babysitting => "babysitting",
             Self::FireAndForget => "fire-and-forget",
             Self::CompactionChurn => "compaction-churn",
+            Self::UnreviewedShip => "unreviewed-ship",
         }
     }
 
@@ -223,6 +227,19 @@ impl RuleId {
     /// second locator space nothing else uses. The rule counted records rather than utterances, and
     /// what it shows is the count.
     ///
+    /// **Unreviewed-ship is `Mixed`, and the two halves split cleanly.** Its *ship* half counts
+    /// `git commit` tool events, which is the anchorable case in full: a commit is a tool event,
+    /// so it has an ordinal in the very locator space an [`EventAnchor`] is defined over — unlike
+    /// a compaction marker — and it carries a real verbatim the excerpt route can serve, so
+    /// pointing a reader at the commits is honest evidence that the session shipped. Its *review*
+    /// half is an **absence**, and an absence has no locus: there is no event to anchor, because
+    /// the finding is precisely that none exists. Nothing is minted for it and the detail line
+    /// states it in words instead.
+    ///
+    /// A commit message is operator-written text, so those excerpts go out through the same
+    /// redaction the route applies to every excerpt — which is the reason the anchors are worth
+    /// having rather than a reason to withhold them.
+    ///
     /// This decides nothing about firing. It is a statement about what a fired rule may *show*.
     pub const fn evidence_kind(self) -> EvidenceKind {
         match self {
@@ -231,7 +248,7 @@ impl RuleId {
             | Self::ResumedSession
             | Self::Babysitting
             | Self::CompactionChurn => EvidenceKind::Structural,
-            Self::FireAndForget => EvidenceKind::Mixed,
+            Self::FireAndForget | Self::UnreviewedShip => EvidenceKind::Mixed,
         }
     }
 
@@ -300,6 +317,27 @@ impl RuleId {
                 .compactions
                 .count()
                 .map(|completed| completed >= thresholds::COMPACTION_CHURN_COMPLETIONS),
+            // Eligibility is **two** conditions, and both are load-bearing.
+            //
+            // First, the harness must type every surface a review could have arrived on. Claude
+            // Code does — skills and slash commands are both typed, and the slash surface was read
+            // and holds nothing review-shaped — so a Claude Code session with no review pass in it
+            // is a session nothing reviewed. **Copilot does not**: its skill surface is typed but
+            // its slash surface is unmarked prose that `munshi-transcript` refuses to guess at, so
+            // "Copilot ran no review" is unsayable and every Copilot session leaves this rate.
+            // That is observability, not behaviour — Copilot is not scoring badly here, it is not
+            // scoring — and it is the cost lane's no-signal-no-claim precedent applied unchanged.
+            // Codex could not look for the usual reason: zero archived sessions.
+            //
+            // Second, the session must have shipped. This rate is *review before done*, so its
+            // denominator is the sessions that had something to review, never every session: a
+            // session that read code and answered a question did not skip a review, it had no ship
+            // to review. See [`ReviewActivity`](crate::metrics::ReviewActivity) for why a ship is a
+            // commit rather than an edit.
+            Self::UnreviewedShip => session
+                .reviews
+                .shipped_observably()
+                .then(|| !session.reviews.reviewed()),
         }
     }
 
@@ -365,6 +403,7 @@ pub fn evaluate(sessions: &[SessionMetrics]) -> Vec<Finding> {
         babysitting(sessions),
         fire_and_forget(sessions),
         compaction_churn(sessions),
+        unreviewed_ship(sessions),
     ]
     .into_iter()
     .flatten()
@@ -810,6 +849,84 @@ fn compaction_detail(session: &SessionMetrics) -> String {
     detail
 }
 
+/// **Shipped without review.** Fires when a session committed code and nothing in it ran a review
+/// pass.
+///
+/// The consumer half of munshi#77 pull B, and qanungo #4's **Code Review** lane: the lane's score
+/// is this rule's fire rate, so the number the report prints is *of the sessions that shipped, the
+/// share that shipped unreviewed*.
+///
+/// **There is no threshold to tune, and that is deliberate.** Every other rule in this pack picks a
+/// number — six repeats, four compactions, two hours — and every one of those numbers is arbitrary
+/// until measured. This rule's trigger is a *zero*: not one review pass, on a session that shipped.
+/// A count of none needs no constant, so there is none to write down and none to defend, and the
+/// only judgement the rule makes is which names count as a review — which lives in
+/// [`is_review_pass`](crate::metrics::is_review_pass) and is argued there.
+///
+/// **The rate this fires at is very high and is not being sanded down.** On the 2026-08-25 mirror
+/// it selects 134 of 149 eligible claude-code sessions — near 90%, where the pack's other rules sit
+/// between 3% and 5%. The module docs open by saying that a rule firing constantly is evidence its
+/// threshold is wrong; that argument does not apply to a rule with no threshold. What a 90% rate
+/// says is that running a review pass before committing is not the working habit, which is a
+/// finding about the practice and precisely what a coaching report exists to surface. Making the
+/// number comfortable would have meant inventing a constant for the purpose.
+fn unreviewed_ship(sessions: &[SessionMetrics]) -> Option<Finding> {
+    let evidence: Vec<_> = sessions
+        .iter()
+        .filter(fired(RuleId::UnreviewedShip))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            // Mixed, per [`RuleId::evidence_kind`]: the commits are real tool events with real
+            // ordinals, so they anchor; the missing review has nothing to point at.
+            anchors: session.anchors.commits.clone(),
+            detail: unreviewed_detail(session),
+        })
+        .collect();
+    (!evidence.is_empty()).then(|| Finding {
+        rule: RuleId::UnreviewedShip,
+        problem: format!(
+            "{} of {} folded sessions committed code without running a review pass first.",
+            evidence.len(),
+            sessions.len(),
+        ),
+        action: "A review pass is the cheapest place to catch what the writing missed, and it is \
+                 cheapest before the commit rather than after it: once the work is committed the \
+                 next reader is a diff nobody asked for. Run the review skill against the diff \
+                 before committing — the same session, while the context that wrote the code is \
+                 still loaded — rather than trusting the pass that wrote it to also be the pass \
+                 that checks it."
+            .to_owned(),
+        evidence,
+    })
+}
+
+/// One unreviewed ship's evidence line: what it shipped, and what it ran instead of a review.
+///
+/// The skill count is context rather than decoration. "Committed 4 times; no review pass among 7
+/// skill invocations" and "committed 4 times; no skill was invoked at all" describe two different
+/// habits — one reached for tooling and none of it reviewed, the other reached for none — and the
+/// line says which without the reader opening the transcript.
+fn unreviewed_detail(session: &SessionMetrics) -> String {
+    let reviews = &session.reviews;
+    let plural = if reviews.commits == 1 { "" } else { "s" };
+    let mut detail = format!("committed {} time{plural}", reviews.commits);
+    if reviews.skill_invocations == 0 {
+        detail.push_str("; no skill was invoked at all");
+    } else {
+        let plural = if reviews.skill_invocations == 1 {
+            ""
+        } else {
+            "s"
+        };
+        let _ = write!(
+            detail,
+            "; no review pass among {} skill invocation{plural}",
+            reviews.skill_invocations,
+        );
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -819,7 +936,7 @@ mod tests {
 
     use super::*;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ReviewActivity, ToolOutcomes};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -880,6 +997,7 @@ mod tests {
                 observable: true,
                 ..Compactions::default()
             },
+            reviews: ReviewActivity::default(),
             bytes_folded: 0,
         }
     }

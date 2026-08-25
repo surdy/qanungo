@@ -1,11 +1,12 @@
 //! Practice-lane scores, and the rule-pack stamp that says when two of them may be compared.
 //!
 //! The five lanes are the ones qanungo #4 names — Prompt Quality, Session Hygiene, Code Review,
-//! Tool Mastery, Context Management — and four of them are fed by something the fold types today.
-//! **A lane with no feeding signal is not scored.** It renders as unscored, with the
-//! signal it is waiting for named. It never gets a default, a proxy, or a zero: the same
+//! Tool Mastery, Context Management — and as of munshi#77 pull B **all five** are fed by something
+//! the fold types. **A lane with no feeding signal is not scored.** It renders as unscored, with
+//! the signal it is waiting for named. It never gets a default, a proxy, or a zero: the same
 //! no-signal-no-claim discipline [`CommandChurn`](crate::metrics::CommandChurn) applies to one
-//! session's churn, applied to a whole lane.
+//! session's churn, applied to a whole lane. No lane is in that state today; the rule stands for
+//! the next one that is.
 //!
 //! # The mapping, and why each half of it is defensible
 //!
@@ -14,16 +15,34 @@
 //! | Tool Mastery | pooled tool error rate; retry-loop fire rate | both are readings of *how well the tools are being driven* — calls that failed, and commands re-run until they stopped disagreeing |
 //! | Session Hygiene | marathon fire rate; heavily-resumed fire rate | both are readings of *how the work is packaged into sessions* — one unbroken push, and one transcript standing in for many work items |
 //! | Prompt Quality | babysitting fire rate; fire-and-forget fire rate | both are readings of *how the ask was shaped* — a hundred small steering turns, or one enormous unattended run with no checkpoint in it |
-//! | Code Review | nothing | no typed signal reports review activity at all |
+//! | Code Review | unreviewed-ship fire rate | of the sessions that *shipped*, the share that shipped with nothing having reviewed the work — read off the invocations themselves, not off a proxy for care |
 //! | Context Management | compaction-churn fire rate | a session that compacted its window over and over is *managing context badly*, read off the window itself rather than off anything standing in for it |
 //!
-//! Code Review's empty row is the interesting one now. Marathon *sounds* like it belongs to
-//! Context Management — a context window accumulating without a break — and heavily-resumed
-//! *sounds* like it too. Both were declined here on purpose while the lane was dark, and both stay
-//! declined now that it is lit: what those two measure is sitting length and calendar dilution, not
-//! context. Scoring Context Management off them would be scoring an implication, and one signal
-//! counted into two lanes is one behaviour reported as two findings. The lane waited for munshi#77
-//! to type the compaction markers themselves, and that is what it is scored from.
+//! Marathon *sounds* like it belongs to Context Management — a context window accumulating without
+//! a break — and heavily-resumed *sounds* like it too. Both were declined there on purpose while
+//! that lane was dark, and both stay declined now that it is lit: what those two measure is sitting
+//! length and calendar dilution, not context. Scoring Context Management off them would be scoring
+//! an implication, and one signal counted into two lanes is one behaviour reported as two findings.
+//! The lane waited for munshi#77 to type the compaction markers themselves, and that is what it is
+//! scored from.
+//!
+//! **Code Review was the last dark lane, and it was lit the same way rather than by a proxy.** The
+//! row it used to carry named the proxies that were available all along and declined — files edited
+//! versus read, revert-and-retry cycles — and every one of them measures the *shape* of editing
+//! rather than whether anything reviewed the work. munshi#77 pull B typed the invocations
+//! themselves, so the lane reads the act it is named for: a review pass, invoked, in a session that
+//! shipped.
+//!
+//! # One lane that is scored for one harness only
+//!
+//! Code Review scores **claude-code alone today, and that is an observability statement rather
+//! than a judgement about Copilot.** Claude Code types both surfaces a review could be invoked on;
+//! Copilot types its skills but records slash commands as unmarked prose, so "Copilot ran no
+//! review" is a sentence the fold cannot say and Copilot leaves the rate entirely — its Code Review
+//! renders [`LaneScore::NoReading`], never a zero. Reading it as a zero would have been the single
+//! most flattering-to-nobody mistake available here: it would have scored a harness 0 for a habit
+//! nothing observed. The lane picks Copilot up the day that surface is typed. See
+//! [`review_observable`](crate::metrics::ReviewActivity) for the per-harness reasoning.
 //!
 //! # A lane with one component
 //!
@@ -219,7 +238,7 @@ impl Lane {
                 Signal::FireRate(RuleId::RetryLoop),
             ],
             Self::ContextManagement => &[Signal::FireRate(RuleId::CompactionChurn)],
-            Self::CodeReview => &[],
+            Self::CodeReview => &[Signal::FireRate(RuleId::UnreviewedShip)],
         }
     }
 
@@ -227,14 +246,23 @@ impl Lane {
     ///
     /// Stated as the signal that is missing rather than as an apology: the sentence a reader
     /// needs is which pull would light the lane up, not that it is dark.
+    ///
+    /// **Every lane returns `None` today.** Code Review was the last holdout and munshi#77 pull B
+    /// lit it, so nothing in this pack is dark any more. The mechanism stays because a sixth lane
+    /// may arrive before the signal that feeds it, and because deleting it would mean the next
+    /// dark lane silently rendering as a zero — which is the outcome the whole no-signal-no-claim
+    /// discipline exists to prevent. Note that a lane can still be unscored *for one harness*
+    /// without being untyped: that is [`LaneScore::NoReading`], and it is what Copilot's Code
+    /// Review renders as.
+    /// Left exhaustive rather than collapsed to a bare `None` so that a lane added later cannot
+    /// inherit "typed" by omission — it has to say so here.
     pub const fn untyped(self) -> Option<&'static str> {
         match self {
-            Self::CodeReview => Some(
-                "no signal typed for this lane yet — nothing in the event stream reports review \
-                 activity (files edited versus read, diffs reviewed, revert-and-retry cycles), so \
-                 the lane has no reading and takes no default",
-            ),
-            _ => None,
+            Self::PromptQuality
+            | Self::SessionHygiene
+            | Self::CodeReview
+            | Self::ToolMastery
+            | Self::ContextManagement => None,
         }
     }
 }
@@ -295,6 +323,15 @@ impl Signal {
             // [`RuleId::verdict`](crate::rules::RuleId::verdict).
             Self::FireRate(RuleId::CompactionChurn) => {
                 "sessions whose harness records compactions".to_owned()
+            }
+            // Both halves of the eligibility are in the phrase on purpose, because this is the
+            // sentence a reader meets when Copilot's Code Review renders no reading. "only 0
+            // sessions that shipped on a harness whose review surfaces are all typed" says the
+            // harness could not be looked at; "only 0 sessions that shipped" would have implied
+            // Copilot never ships, which is false — it committed in 113 sessions of the mirror.
+            // See [`RuleId::verdict`](crate::rules::RuleId::verdict).
+            Self::FireRate(RuleId::UnreviewedShip) => {
+                "sessions that shipped on a harness whose review surfaces are all typed".to_owned()
             }
         }
     }
@@ -838,7 +875,7 @@ mod tests {
 
     use super::*;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ReviewActivity, ToolOutcomes};
 
     fn at(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -877,6 +914,7 @@ mod tests {
                 observable: true,
                 ..Compactions::default()
             },
+            reviews: ReviewActivity::default(),
             bytes_folded: 0,
         }
     }
@@ -975,27 +1013,131 @@ mod tests {
         assert_eq!(once, Scorecard::fold(&shuffled));
     }
 
-    /// A lane nothing types a signal for refuses to score, and says which pull would light it up.
-    /// It is never a zero and never a default.
-    ///
-    /// Code Review is the last one: Context Management left this list when munshi#77 typed the
-    /// compaction markers, which is the loop this discipline exists to make visible.
+    /// **No lane in the pack is dark any more.** Code Review was the last one, and munshi#77 pull
+    /// B lit it — so the `Untyped` state, which exists to keep an unfed lane from rendering as a
+    /// zero, is now carried by nothing. The loop this asserts is the point: a lane leaves this
+    /// list only when a real signal arrives for it.
     #[test]
-    fn an_unfed_lane_refuses_to_score() {
+    fn no_lane_is_untyped_now_that_code_review_is_lit() {
+        for lane in Lane::ALL {
+            assert_eq!(lane.untyped(), None, "{lane:?} still claims to be unfed");
+        }
+        assert_eq!(
+            Lane::CodeReview.signals().len(),
+            1,
+            "Code Review is scored from the unreviewed-ship fire rate alone",
+        );
+    }
+
+    /// A harness whose review surfaces are not all typed reads **no reading** in this lane — never
+    /// a zero, and never a hundred.
+    ///
+    /// This is the copilot case in miniature, and it is the whole reason the rule's eligibility is
+    /// two conditions rather than one. A session that shipped is only in the rate if something
+    /// could have seen a review; when nothing could, the lane has no say, and the component's
+    /// detail is what tells a reader it was observability rather than behaviour.
+    #[test]
+    fn a_harness_whose_review_surface_is_untyped_reads_nothing() {
         let sessions = hygiene_window(20, 0);
         let score = lane_of(&sessions, Lane::CodeReview);
         assert_eq!(score.score(), None, "Code Review must not carry a score");
-        let LaneScore::Untyped(reason) = score else {
-            panic!("Code Review has no typed signal");
-        };
-        assert!(reason.contains("no signal typed for this lane yet"));
+        assert!(
+            matches!(score, LaneScore::NoReading { .. }),
+            "an unobservable harness has no reading, not a zero: {score:?}",
+        );
+        let component = &score.components()[0];
+        assert_eq!(component.cost, None, "a silent component has no say");
+        assert!(
+            component
+                .detail
+                .contains("sessions that shipped on a harness whose review surfaces are all typed"),
+            "the detail must name observability as the reason: {}",
+            component.detail,
+        );
+    }
 
-        // And the lane that woke up is no longer in that state at all.
-        assert_eq!(Lane::ContextManagement.untyped(), None);
-        assert!(matches!(
-            lane_of(&sessions, Lane::ContextManagement),
-            LaneScore::Scored { .. }
-        ));
+    /// The lane, scored. A window of observable sessions that all shipped and none reviewed is a
+    /// 100% fire rate, four times the shared floor, so the one component spends the whole lane and
+    /// Code Review scores **0**.
+    ///
+    /// The uncomfortable number is the assertion on purpose: this rule has no threshold to soften,
+    /// so a window that never reviews what it ships scores zero and the report says so.
+    #[test]
+    fn a_window_that_never_reviews_what_it_ships_scores_zero() {
+        let sessions = review_window(20, 20);
+        let LaneScore::Scored { score, components } = lane_of(&sessions, Lane::CodeReview) else {
+            panic!("an observable window that shipped has a reading");
+        };
+        assert_eq!(score, 0);
+        assert_eq!(components.len(), 1);
+        assert!(
+            components[0].detail.starts_with("fired on 20 of 20"),
+            "{}",
+            components[0].detail,
+        );
+    }
+
+    /// The other end of the same lane: every ship reviewed is a zero fire rate and a clean 100.
+    #[test]
+    fn a_window_that_reviews_every_ship_scores_a_clean_hundred() {
+        let sessions = review_window(20, 0);
+        assert_eq!(lane_of(&sessions, Lane::CodeReview).score(), Some(100));
+    }
+
+    /// The shared floor applies here like anywhere else: 5 of 20 unreviewed is 25%, exactly
+    /// [`constants::FIRE_RATE_FLOOR`], so the single component spends the entire lane. A tenth of
+    /// the floor costs a tenth of it.
+    #[test]
+    fn the_fire_rate_floor_applies_to_this_lane_like_any_other() {
+        assert_eq!(
+            lane_of(&review_window(20, 5), Lane::CodeReview).score(),
+            Some(0)
+        );
+        assert_eq!(
+            lane_of(&review_window(40, 1), Lane::CodeReview).score(),
+            Some(90)
+        );
+    }
+
+    /// Sessions that shipped nothing are not in the denominator at all, however many of them
+    /// there are — a session that read code and answered a question did not skip a review.
+    #[test]
+    fn sessions_that_shipped_nothing_leave_the_rate_entirely() {
+        let mut sessions = review_window(6, 6);
+        for _ in 0..40 {
+            let mut idle = session("claude-code", &continuous(10));
+            idle.reviews = ReviewActivity {
+                observable: true,
+                commits: 0,
+                review_passes: 0,
+                skill_invocations: 3,
+            };
+            sessions.push(idle);
+        }
+        let score = lane_of(&sessions, Lane::CodeReview);
+        assert_eq!(score.score(), Some(0));
+        assert!(
+            score.components()[0].detail.starts_with("fired on 6 of 6"),
+            "{}",
+            score.components()[0].detail,
+        );
+    }
+
+    /// `count` observable claude-code sessions that all shipped, the first `unreviewed` of which
+    /// ran no review pass.
+    fn review_window(count: usize, unreviewed: usize) -> Vec<SessionMetrics> {
+        (0..count)
+            .map(|index| {
+                let mut session = session("claude-code", &continuous(10));
+                session.reviews = ReviewActivity {
+                    observable: true,
+                    commits: 2,
+                    review_passes: u64::from(index >= unreviewed),
+                    skill_invocations: 1,
+                };
+                session
+            })
+            .collect()
     }
 
     /// The lane munshi#77 woke: a window of sessions that never compacted scores a clean hundred,

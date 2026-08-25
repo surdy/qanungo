@@ -1,4 +1,4 @@
-//! Fixture-backed proof that each of the seven rules fires — and that a report built from a
+//! Fixture-backed proof that each of the eight rules fires — and that a report built from a
 //! transcript stuffed with canary strings contains none of them.
 
 use std::fs::File;
@@ -43,6 +43,7 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
         activity: folded.activity,
         commands: folded.commands,
         compactions: folded.compactions,
+        reviews: folded.reviews,
         anchors: folded.anchors,
         bytes_folded: bytes.len() as u64,
     }
@@ -338,10 +339,17 @@ fn munshi_own_fixtures_are_healthy_sessions_and_fire_nothing() {
         claude("munshi/claude-code-2.1.44-normal.jsonl"),
         fold("munshi/copilot-1.0.70-envelope.jsonl", "copilot-cli"),
         fold("munshi/copilot-1.0.76-tool-activity.jsonl", "copilot-cli"),
+        // The Copilot pull-B fixture belongs here; its Claude Code twin deliberately does not.
+        // That one carries 15+ user records to exercise every slash-command edge case, which is
+        // the Babysitting shape by construction — a property of how munshi built the fixture, not
+        // a coaching finding. Its review behaviour is asserted directly instead, below.
+        fold("munshi/copilot-1.0.76-invocation.jsonl", "copilot-cli"),
     ];
+    let fired = rules::evaluate(&sessions);
     assert!(
-        rules::evaluate(&sessions).is_empty(),
-        "short healthy sessions must not trip a coaching rule"
+        fired.is_empty(),
+        "short healthy sessions must not trip a coaching rule: {:?}",
+        fired.iter().map(|finding| finding.rule).collect::<Vec<_>>(),
     );
 }
 
@@ -670,4 +678,216 @@ fn session_shaped_rules_anchor_nothing() {
 fn extract(bytes: &[u8], source: Source, locator: u64) -> Option<qanungo::evidence::RawExcerpt> {
     qanungo::evidence::extract(source, 2, std::io::BufReader::new(bytes), locator)
         .expect("v2 is supported")
+}
+
+// ---------------------------------------------------------------------------
+// Shipped without review (qanungo #4, munshi#77 pull B)
+// ---------------------------------------------------------------------------
+
+/// **Ship detection.** The commit surface, on the three shapes the archive actually writes: the
+/// compound `git add -A && … && git commit …` line, a `git -C <path> commit` with a global flag
+/// before the subcommand, and a plain `git commit`.
+///
+/// The negative in the same fixture is the one that matters: `git log --oneline -5 | grep -i
+/// commit` runs no commit, and a substring test for "git commit" would have counted it. So would
+/// one that only looked at the head of the line.
+#[test]
+fn a_commit_is_detected_on_every_shape_the_archive_writes() {
+    let session = claude("rules/unreviewed-ship.jsonl");
+    let reviews = &session.reviews;
+    assert!(reviews.observable, "claude-code types every review surface");
+    assert_eq!(
+        reviews.commits, 3,
+        "three commits: compound, -C-prefixed, and plain — and not the `git log | grep commit`",
+    );
+    assert!(reviews.shipped());
+    assert_eq!(reviews.review_passes, 0, "nothing reviewed it");
+    assert_eq!(
+        reviews.skill_invocations, 1,
+        "one skill ran, and it was not a review"
+    );
+}
+
+/// The classifier itself, at the unit level — the decision `munshi-transcript` explicitly hands
+/// to this consumer.
+#[test]
+fn review_pass_classification_admits_review_tokens_and_nothing_else() {
+    for name in [
+        "code-review",
+        "security-review",
+        "review",
+        "pr-review",
+        "Code-Review",
+    ] {
+        assert!(metrics::is_review_pass(name), "{name} is a review pass");
+    }
+    for name in [
+        // Real skill names from the mirror that are not reviews.
+        "artifact-design",
+        "session-recall",
+        "run",
+        "claude-api",
+        "update-config",
+        // The quality pass that is deliberately excluded: it disclaims bug-hunting.
+        "simplify",
+        // The substring trap. `interview-prep` contains "review".
+        "interview-prep",
+        "interview",
+        "previewer",
+    ] {
+        assert!(
+            !metrics::is_review_pass(name),
+            "{name} is not a review pass"
+        );
+    }
+}
+
+/// **Slash commands never count as a review pass**, even when they are named like one.
+///
+/// The borrowed munshi fixture carries `<command-name>/security-review</command-name>` as a typed
+/// slash command and a `SlashCommand` *tool* invoking `/code-review`. Neither is a review pass
+/// here: in this harness a review is invoked through the `Skill` tool. The slash surface's job in
+/// this lane is to make the harness *observable*, never to be counted.
+#[test]
+fn a_review_named_slash_command_is_not_a_review_pass() {
+    let session = claude("munshi/claude-code-2.1.235-invocation.jsonl");
+    let reviews = &session.reviews;
+    assert!(reviews.observable);
+    // The fixture's skill surface holds `code-review` and `security-review` among decoys.
+    assert!(
+        reviews.review_passes >= 2,
+        "the Skill-invoked reviews are counted: {}",
+        reviews.review_passes,
+    );
+    // It ships nothing, so it is not in the rate at all however much it reviewed.
+    assert_eq!(reviews.commits, 0, "`cargo test` is not a commit");
+    assert_eq!(
+        RuleId::UnreviewedShip.verdict(&session),
+        None,
+        "a session that shipped nothing is not eligible",
+    );
+}
+
+/// **Eligibility, per harness.** Copilot types its skills but records slash commands as unmarked
+/// prose, so it is *partially* observable — and partial is not enough to assert that no review
+/// ran. Its sessions leave the rate entirely rather than scoring a failure nothing observed.
+///
+/// The borrowed fixture is exactly that shape: `/chronicle improve` sits in a `user.message` as
+/// prose with no marker, beside a real `skill.invoked`.
+#[test]
+fn copilot_is_couldnt_look_because_its_slash_surface_is_untyped() {
+    let session = fold("munshi/copilot-1.0.76-invocation.jsonl", "copilot-cli");
+    let reviews = &session.reviews;
+    assert!(
+        !reviews.observable,
+        "copilot's slash surface is prose, so `copilot ran no review` is unsayable",
+    );
+    assert!(
+        reviews.skill_invocations > 0,
+        "its skill surface *is* typed — this is partial observability, not none",
+    );
+    assert_eq!(
+        RuleId::UnreviewedShip.verdict(&session),
+        None,
+        "couldn't-look, whatever it shipped",
+    );
+
+    // And the claim holds even when such a session ships: eligibility is the harness first.
+    let mut shipped = session;
+    shipped.reviews.commits = 4;
+    assert!(shipped.reviews.shipped());
+    assert!(!shipped.reviews.shipped_observably());
+    assert_eq!(RuleId::UnreviewedShip.verdict(&shipped), None);
+}
+
+/// The three verdicts, on three fixtures: **fired**, **did not fire**, **could not look**.
+#[test]
+fn the_rule_answers_three_ways() {
+    let unreviewed = claude("rules/unreviewed-ship.jsonl");
+    assert_eq!(RuleId::UnreviewedShip.verdict(&unreviewed), Some(true));
+
+    let reviewed = claude("rules/reviewed-ship.jsonl");
+    assert_eq!(
+        RuleId::UnreviewedShip.verdict(&reviewed),
+        Some(false),
+        "it shipped and a review pass ran",
+    );
+    assert_eq!(reviewed.reviews.commits, 1);
+    assert_eq!(reviewed.reviews.review_passes, 1);
+
+    let copilot = fold("munshi/copilot-1.0.76-invocation.jsonl", "copilot-cli");
+    assert_eq!(RuleId::UnreviewedShip.verdict(&copilot), None);
+}
+
+/// The finding itself: it fires, it is the only rule this fixture trips, and its detail line says
+/// what shipped and what ran instead of a review.
+#[test]
+fn unreviewed_ship_fires_and_says_what_it_ran_instead() {
+    let session = claude("rules/unreviewed-ship.jsonl");
+    let findings = fires_only(&session, RuleId::UnreviewedShip);
+    let finding = finding(&findings, RuleId::UnreviewedShip);
+    assert_eq!(finding.evidence.len(), 1);
+    assert_eq!(finding.evidence[0].source_hash, session.source_hash);
+    assert_eq!(
+        finding.evidence[0].detail,
+        "committed 3 times; no review pass among 1 skill invocation",
+    );
+
+    // The reviewed twin trips nothing at all.
+    let reviewed = claude("rules/reviewed-ship.jsonl");
+    assert!(
+        rules::evaluate(std::slice::from_ref(&reviewed)).is_empty(),
+        "a session that reviewed before shipping is clean",
+    );
+}
+
+/// **The evidence decision, end to end.** The rule is `Mixed`: its ship half anchors the commits
+/// it counted, and its review half — an absence — anchors nothing because there is nothing to
+/// anchor.
+///
+/// Every anchor resolves through the ordinary excerpt route, and the planted credential in the
+/// first commit message is scrubbed on the way out. That is the reason anchoring a commit is
+/// defensible at all: a commit message is operator-written text, and the route that serves it
+/// already owes it the redaction layer.
+#[test]
+fn the_unreviewed_ship_rule_anchors_the_commits_and_redacts_their_messages() {
+    let session = claude("rules/unreviewed-ship.jsonl");
+    let findings = rules::evaluate(std::slice::from_ref(&session));
+    let finding = finding(&findings, RuleId::UnreviewedShip);
+    assert_eq!(finding.rule.evidence_kind(), EvidenceKind::Mixed);
+
+    let anchors = &finding.evidence[0].anchors;
+    assert_eq!(anchors.len(), 3, "one anchor per counted ship");
+    let locators: Vec<u64> = anchors.iter().map(|anchor| anchor.locator).collect();
+    let mut ascending = locators.clone();
+    ascending.sort_unstable();
+    assert_eq!(locators, ascending, "file order");
+    for anchor in anchors {
+        assert_eq!(anchor.tool.as_deref(), Some("Bash"));
+        assert!(anchor.at.is_some());
+    }
+
+    let bytes = std::fs::read(fixture("rules/unreviewed-ship.jsonl")).unwrap();
+    let redactor = Redactor::new();
+    let mut saw_subject = false;
+    for anchor in anchors {
+        let excerpt = extract(&bytes, Source::ClaudeCode, anchor.locator)
+            .expect("the anchor resolves")
+            .redacted(&redactor);
+        assert_eq!(excerpt.locator, anchor.locator);
+        assert_eq!(excerpt.record, anchor.record);
+        assert_eq!(excerpt.tool.as_deref(), Some("Bash"));
+        let rendered = format!("{excerpt:?}");
+        assert!(
+            !rendered.contains("ghp_CANARYCANARYCANARYCANARYCANARYCANARY"),
+            "the planted credential survived the scrub: {rendered}",
+        );
+        if rendered.contains("CANARY_COMMIT_SUBJECT") {
+            saw_subject = true;
+        }
+    }
+    assert!(
+        saw_subject,
+        "the commit message is served — that is what makes the anchor worth having",
+    );
 }
