@@ -56,9 +56,10 @@ every run.
 
 **Scores and trends** ([#4](https://github.com/surdy/qanungo/issues/4)) sit on top of it: the five
 practice lanes, scored 0–100 **per harness** from the window's own readings, with window-over-window
-arrows against the equal-length window immediately before it. Three lanes are fed by signals the
-fold types today (Prompt Quality, Session Hygiene, Tool Mastery); Code Review and Context Management
-render as *not scored* rather than taking a default — no signal, no claim. Every run recomputes all
+arrows against the equal-length window immediately before it. Four lanes are fed by signals the fold
+types today (Prompt Quality, Session Hygiene, Tool Mastery, and — since munshi#77 typed the
+compaction markers — Context Management, off a session compacting its window over and over); Code
+Review renders as *not scored* rather than taking a default — no signal, no claim. Every run recomputes all
 of it with the current rule pack
 ([ADR 0001](docs/adr/0001-recompute-all-history-with-the-current-rule-pack.md)) and stamps the pack's
 digest into the footer, so two reports compare only when that stamp matches. Every timestamp is UTC:

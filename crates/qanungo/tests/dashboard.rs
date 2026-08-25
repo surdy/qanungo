@@ -1249,3 +1249,66 @@ fn the_structural_grammar_admits_timestamps_and_durations_and_nothing_else() {
         );
     }
 }
+
+/// The Context Management lane, end to end over the served surface (qanungo #4, munshi#77 pull A).
+///
+/// Every session in this archive compacted past the threshold, so the lane renders a *score* rather
+/// than the "not scored" sentence it carried for its whole life before this — and the churn finding
+/// beside it is structural, with no anchor and no excerpt to ask for. Five copies of each fixture
+/// because a fire rate under `MIN_SCORED_SESSIONS` is not a reading, which is the same discipline
+/// every other lane holds.
+#[test]
+fn the_context_management_lane_scores_and_its_finding_offers_no_excerpt() {
+    let claude = transcript("munshi/claude-code-2.1.235-compaction.jsonl");
+    let copilot = transcript("munshi/copilot-1.0.76-compaction.jsonl");
+    let archive: Vec<ArchivedSession> = (0..5)
+        .flat_map(|index| {
+            [
+                ArchivedSession::new(index, "claude-code", &claude, 2),
+                ArchivedSession::new(index + 100, "copilot-cli", &copilot, 3),
+            ]
+        })
+        .collect();
+    let (address, _directory) = spawn_dashboard(archive);
+    let payload = payload_of(address);
+
+    let lane = payload["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == "context-management")
+        .expect("the lane is on the page");
+    assert_eq!(lane["reason"], serde_json::Value::Null, "no longer unfed");
+    assert_eq!(lane["fleet"]["state"], "scored");
+    // Every eligible session thrashed, which is four times the fire-rate floor and clamps to the
+    // component's whole share — and the lane has exactly one component to spend.
+    assert_eq!(lane["fleet"]["score"], 0);
+    for harness in lane["harnesses"].as_array().unwrap() {
+        assert_eq!(harness["score"], 0, "{}", harness["source_agent"]);
+        assert_eq!(harness["components"].as_array().unwrap().len(), 1);
+        assert_eq!(harness["components"][0]["label"], "Compaction churn");
+    }
+
+    let finding = payload["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["rule"] == "compaction-churn")
+        .expect("the churn rule fires on this window");
+    assert_eq!(finding["evidence_kind"], "structural");
+    let evidence = &finding["evidence"][0];
+    assert!(
+        evidence["anchors"].as_array().unwrap().is_empty(),
+        "a compaction marker carries no verbatim and has no tool-event ordinal to anchor",
+    );
+    // It renders the same structural block every session-shaped finding does, and that block is
+    // still numbers and timestamps only.
+    let mut leaves = 0;
+    assert_structural_leaves(&evidence["structural"], "structural", &mut leaves);
+    assert!(leaves > 0, "the finding shows the session's shape instead");
+
+    // And an excerpt is refused, exactly as it is for a duration.
+    let source_hash = evidence["source_hash"].as_str().unwrap();
+    let (head, _body) = request(address, &format!("/api/evidence/{source_hash}/1"));
+    assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
+}

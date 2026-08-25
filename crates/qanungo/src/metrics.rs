@@ -1,4 +1,4 @@
-//! The fold: exactly four metrics over `munshi-transcript`'s typed events.
+//! The fold: exactly five metrics over `munshi-transcript`'s typed events.
 //!
 //! Everything here is derivable from what the interpreter types *today* — no new transcript
 //! parsing, no schema changes upstream:
@@ -15,6 +15,8 @@
 //! 4. **Repeated-command churn** — how much of a session's command-bearing tool activity was the
 //!    same command run again, from the `command` field a [`ToolEvent`] may carry. See
 //!    [`CommandChurn`].
+//! 5. **Context compaction** — how many times a session compacted its own context window, from
+//!    the [`Compaction`] markers a [`Record`] may carry. See [`Compactions`].
 //!
 //! # What counts as a tool outcome
 //!
@@ -50,6 +52,18 @@
 //! would be this crate re-parsing transcript payloads, which is precisely what read-time
 //! interpretation through the shared crate exists to prevent.
 //!
+//! # What counts as a compaction
+//!
+//! One [`CompactionPhase::Complete`] marker that is **not known to have failed**, and nothing
+//! else. Both halves of that sentence are the interpreter's warnings taken literally, and both
+//! would be silently wrong the obvious way round — see [`Compactions`].
+//!
+//! Unlike every other metric here, a session with no marker in it is a *reading of none* rather
+//! than no reading, for the two harnesses that write markers: Claude Code and Copilot both type
+//! one, so a transcript of theirs with none in it did not compact. Codex is the opposite case and
+//! gets the usual treatment — the interpreter reads no Codex compaction at all, so a Codex
+//! transcript says nothing either way and claims nothing.
+//!
 //! A session that never records the field still has **no churn reading**, not a zero one,
 //! exactly as a harness that cannot express tool failure gets no error rate rather than a
 //! flattering zero. Post-promotion that is the honest minority: on the 2026-08-18 mirror,
@@ -74,7 +88,8 @@ use std::io::BufRead;
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use munshi_transcript::{
-    Classification, Event, SessionSummary, Source, ToolEvent, TranscriptStream, UnsupportedVersion,
+    Classification, Compaction, CompactionPhase, Event, Record, SessionSummary, Source, ToolEvent,
+    TranscriptStream, UnsupportedVersion,
 };
 
 use crate::evidence::{
@@ -302,6 +317,123 @@ impl CommandRuns {
     }
 }
 
+/// Context compactions for one session: how many times the window was compacted, and how large it
+/// had grown when that happened.
+///
+/// # Counting is `Complete`, not markers
+///
+/// Copilot writes a `session.compaction_start` **and** a `session.compaction_complete` for every
+/// compaction; Claude Code writes one `compact_boundary` afterwards, which the interpreter reads as
+/// [`CompactionPhase::Complete`] for exactly this reason. A fold over markers would therefore count
+/// every Copilot compaction twice and every Claude Code one once — a number that means two
+/// different things in the same column. Counting `Complete` is what makes the two comparable, and
+/// [`Compactions::started`] is kept only as context.
+///
+/// # Failure is `!= Some(false)`, never `== Some(true)`
+///
+/// Copilot states `success` on a completion; Claude Code's boundary states no outcome at all, so
+/// `succeeded` is `None` on every one of them. `== Some(true)` would therefore score the whole
+/// Claude Code harness at zero compactions — the rule that reads the same in both harnesses is
+/// *not known to have failed*, which is what `None` means. The three completions the archive holds
+/// that did fail are counted in [`Compactions::failed`] and kept out of the total, because a
+/// compaction that failed did not manage the window.
+///
+/// # No denominator exists, so utilization is not a metric here
+///
+/// [`Compaction::token_limit`] is absent on every Claude Code boundary and on all but five Copilot
+/// pairs, so there is no window size to divide a pre-compaction total by. The totals below are
+/// therefore **context in a finding and never a scored component**: a coaching report that turned
+/// "compacted at 403k tokens" into points would be scoring a number against a denominator it
+/// invented. What the pack does score is the *repetition*, which needs no denominator at all.
+///
+/// # Absent markers, for a harness that writes them, is a real zero
+///
+/// [`Compactions::observable`] carries that distinction. It is decided by the interpreter that read
+/// the transcript, not by whether markers turned up: Claude Code and Copilot both type markers, so
+/// none found means none happened, while `munshi-transcript` reads no Codex compaction whatsoever
+/// (the archive holds zero Codex sessions, so its shape was never certified) and a Codex transcript
+/// is a session nothing looked at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compactions {
+    /// Whether the harness that wrote this transcript types compaction markers at all. `false` is
+    /// *nobody looked*; `true` with a zero count is *nothing happened*.
+    pub observable: bool,
+    /// [`CompactionPhase::Complete`] markers not known to have failed — the session's compactions,
+    /// on the one counting rule that means the same thing in both harnesses.
+    pub completed: u64,
+    /// `Complete` markers whose source stated the compaction failed. Kept out of `completed` and
+    /// reported beside it: a failed compaction is a context wall hit, not a window managed.
+    pub failed: u64,
+    /// [`CompactionPhase::Start`] markers. Context only, and never a compaction: counting these
+    /// alongside completions is the double-count the phase filter exists to prevent. A `Start`
+    /// with no completion after it is a session captured mid-compaction, which the archive has
+    /// never held.
+    pub started: u64,
+    /// Counted completions that stated how large the context was beforehand. Below `completed`
+    /// wherever the source said nothing.
+    pub pre_tokens_stated: u64,
+    /// The largest pre-compaction context any counted completion stated.
+    pub pre_tokens_max: Option<u64>,
+    /// Those pre-compaction totals, summed — over the counted completions only, on the same phase
+    /// filter as the count itself, since both halves of a Copilot compaction can state one.
+    pub pre_tokens_total: u64,
+}
+
+impl Compactions {
+    /// The session's compaction count, or `None` when nothing could look for one.
+    ///
+    /// `Some(0)` is a real answer and the common one: a session that never filled its window.
+    pub const fn count(&self) -> Option<u64> {
+        if self.observable {
+            Some(self.completed)
+        } else {
+            None
+        }
+    }
+
+    /// The mean pre-compaction context across the completions that stated one, or `None` when none
+    /// did. Averaged over the completions that *spoke*, never over all of them — a completion that
+    /// stated no figure is missing, not zero.
+    ///
+    /// Whole tokens, because a token is a whole thing and the figure is rendered at three
+    /// significant digits anyway.
+    pub const fn mean_pre_tokens(&self) -> Option<u64> {
+        self.pre_tokens_total.checked_div(self.pre_tokens_stated)
+    }
+
+    /// Folds one record's compaction marker, if it has one.
+    fn observe(&mut self, compaction: &Compaction) {
+        match compaction.phase {
+            CompactionPhase::Start => self.started += 1,
+            CompactionPhase::Complete if compaction.succeeded == Some(false) => self.failed += 1,
+            CompactionPhase::Complete => {
+                self.completed += 1;
+                if let Some(pre) = compaction.pre_tokens {
+                    self.pre_tokens_stated += 1;
+                    self.pre_tokens_total = self.pre_tokens_total.saturating_add(pre);
+                    self.pre_tokens_max = Some(self.pre_tokens_max.unwrap_or(0).max(pre));
+                }
+            }
+        }
+    }
+}
+
+/// Whether this interpreter reads compaction markers for a harness at all — the eligibility
+/// question, asked of the reader rather than of the transcript.
+///
+/// Claude Code (`system`/`compact_boundary`) and Copilot (`session.compaction_start` /
+/// `_complete`) both have a certified marker shape, so their transcripts answer the question either
+/// way. `munshi-transcript` deliberately reads **no** Codex compaction: the rollout schema names a
+/// `compacted` record, but the archive holds zero Codex sessions and the crate has never seen one
+/// payload of it, so guessing at the shape would be inventing an interpretation. A Codex session is
+/// therefore one nothing looked at, and it belongs in no fire rate's denominator.
+const fn compaction_observable(source: Source) -> bool {
+    match source {
+        Source::ClaudeCode | Source::Copilot => true,
+        Source::Codex => false,
+    }
+}
+
 /// Gap-aware activity for one session: how much of its span was actually worked, and in how many
 /// separate sittings.
 ///
@@ -498,6 +630,8 @@ pub struct SessionMetrics {
     pub activity: Activity,
     /// Repeated-command churn, undefined for a harness that records no command field.
     pub commands: CommandChurn,
+    /// Context compactions, undefined for a harness this interpreter reads no marker for.
+    pub compactions: Compactions,
     /// Where the events a rule will count were. Strictly additive — see [`crate::evidence`].
     pub anchors: SessionAnchors,
     /// Transcript bytes read, for the fold-cost footer.
@@ -565,6 +699,7 @@ pub struct Fold {
     pub tools: ToolOutcomes,
     pub activity: Activity,
     pub commands: CommandChurn,
+    pub compactions: Compactions,
     pub anchors: SessionAnchors,
 }
 
@@ -583,6 +718,9 @@ pub fn fold_transcript(
 ) -> Result<Fold, UnsupportedVersion> {
     let stream = TranscriptStream::new(source, artifact_set_version, reader)?;
     let mut fold = Fold::default();
+    // Decided by the interpreter this fold is reading with, before a single record is seen: what a
+    // *missing* marker means is a property of the harness, not of the transcript.
+    fold.compactions.observable = compaction_observable(source);
     let mut names: HashMap<String, String> = HashMap::new();
     let mut commands = CommandRuns::default();
     // The locator every anchor is keyed by: the tool event's ordinal in file order. It is counted
@@ -597,6 +735,11 @@ pub fn fold_transcript(
         // or something was still at the keyboard, so the gap fold sees all of them.
         if let Some(at) = record.timestamp {
             fold.activity.observe(at);
+        }
+        // A third independent read-pass, exactly as the interpreter promotes it: every marker record
+        // is `Ignored` bookkeeping, so this is deliberately not inside the `Content` arm below.
+        if let Some(compaction) = compaction_of(record) {
+            fold.compactions.observe(compaction);
         }
         if let Classification::Content { events } = &record.classification {
             for event in events {
@@ -630,6 +773,12 @@ pub fn fold_transcript(
     fold.commands = churn;
     fold.anchors.command_runs = busiest_runs;
     Ok(fold)
+}
+
+/// The compaction a record marks, if it marks one. A named function rather than a `Box` deref at
+/// the call site, so the one place this crate reads the promoted field is greppable.
+fn compaction_of(record: &Record) -> Option<&Compaction> {
+    record.compaction.as_deref()
 }
 
 /// Folds one tool event: remember what it names, then count what it reports — and, when what it
@@ -908,6 +1057,7 @@ mod tests {
             tools: fold.tools,
             activity: fold.activity,
             commands: fold.commands,
+            compactions: fold.compactions,
             anchors: fold.anchors,
             bytes_folded: 0,
         }
@@ -1219,6 +1369,107 @@ mod tests {
         );
     }
 
+    /// A Copilot session whose compactions are written as `start`/`complete` pairs — the shape the
+    /// phase filter exists for. Six markers, three compactions.
+    #[test]
+    fn copilot_compaction_pairs_are_counted_once_each() {
+        let transcript = concat!(
+            r#"{"type":"session.compaction_start","timestamp":"2026-08-01T10:00:00.000Z","data":{"currentTokens":100000,"tokenLimit":200000}}"#,
+            "\n",
+            r#"{"type":"session.compaction_complete","timestamp":"2026-08-01T10:01:00.000Z","data":{"success":true,"preCompactionTokens":100000,"postCompactionTokens":9000}}"#,
+            "\n",
+            r#"{"type":"session.compaction_start","timestamp":"2026-08-01T11:00:00.000Z","data":{"currentTokens":180000}}"#,
+            "\n",
+            r#"{"type":"session.compaction_complete","timestamp":"2026-08-01T11:01:00.000Z","data":{"success":true,"preCompactionTokens":180000}}"#,
+            "\n",
+            r#"{"type":"session.compaction_start","timestamp":"2026-08-01T12:00:00.000Z","data":{"currentTokens":150000}}"#,
+            "\n",
+            r#"{"type":"session.compaction_complete","timestamp":"2026-08-01T12:01:00.000Z","data":{"success":true}}"#,
+        );
+        let fold = fold_transcript(Source::Copilot, 2, transcript.as_bytes()).unwrap();
+        let compactions = fold.compactions;
+        assert!(compactions.observable);
+        assert_eq!(compactions.started, 3, "the announcements are context");
+        assert_eq!(
+            compactions.completed, 3,
+            "three compactions, not six markers"
+        );
+        assert_eq!(compactions.failed, 0);
+        // Summed over the counted phase only: the starts state `currentTokens` for the same
+        // quantity, and adding both halves would double every Copilot figure.
+        assert_eq!(compactions.pre_tokens_stated, 2);
+        assert_eq!(compactions.pre_tokens_total, 280_000);
+        assert_eq!(compactions.pre_tokens_max, Some(180_000));
+        assert_eq!(compactions.mean_pre_tokens(), Some(140_000));
+    }
+
+    /// `succeeded != Some(false)`, held from both sides. A Copilot completion that failed is
+    /// excluded; a Claude Code boundary, which states no outcome at all, is not.
+    #[test]
+    fn a_failed_completion_is_excluded_and_a_silent_one_is_not() {
+        let copilot = concat!(
+            r#"{"type":"session.compaction_complete","timestamp":"2026-08-01T10:01:00.000Z","data":{"success":true,"preCompactionTokens":100000}}"#,
+            "\n",
+            r#"{"type":"session.compaction_complete","timestamp":"2026-08-01T11:01:00.000Z","data":{"success":false,"error":"summarizer timed out"}}"#,
+        );
+        let fold = fold_transcript(Source::Copilot, 2, copilot.as_bytes()).unwrap();
+        assert_eq!(fold.compactions.completed, 1);
+        assert_eq!(fold.compactions.failed, 1);
+
+        // The same filter over an envelope that never states an outcome. Reading this as
+        // `== Some(true)` would score the whole harness at zero compactions.
+        let claude = concat!(
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-08-01T10:00:00.000Z","compactMetadata":{"trigger":"manual","preTokens":214864,"postTokens":8156}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-08-01T11:00:00.000Z","compactMetadata":{"trigger":"auto","preTokens":339462,"postTokens":10705}}"#,
+        );
+        let fold = fold_claude(claude);
+        assert_eq!(fold.compactions.completed, 2);
+        assert_eq!(fold.compactions.failed, 0);
+        assert_eq!(fold.compactions.started, 0);
+        assert_eq!(fold.compactions.pre_tokens_max, Some(339_462));
+    }
+
+    /// Observability is decided by the interpreter before a record is read, so a harness that
+    /// types markers reports a real zero and one that does not reports nothing at all. Both
+    /// transcripts below are the same healthy session with no compaction in it.
+    #[test]
+    fn a_harness_that_types_markers_reports_zero_and_one_that_does_not_reports_nothing() {
+        let quiet = claude_tool_transcript("Bash", 2, 0);
+        assert_eq!(fold_claude(&quiet).compactions.count(), Some(0));
+        assert_eq!(
+            fold_transcript(Source::Copilot, 2, quiet.as_bytes())
+                .unwrap()
+                .compactions
+                .count(),
+            Some(0),
+        );
+        assert_eq!(
+            fold_codex(&codex_shell_transcript(&["ls"]))
+                .compactions
+                .count(),
+            None,
+            "munshi-transcript certifies no codex compaction shape, so nothing looked",
+        );
+    }
+
+    /// A marker record is `Ignored` bookkeeping and stays that way: reading the compaction off it
+    /// must add no event, no tool activity, and no user request to the counting fold beside it.
+    #[test]
+    fn a_compaction_marker_stays_bookkeeping_in_every_other_metric() {
+        let transcript = concat!(
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"user","content":"go"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-08-01T10:05:00.000Z","compactMetadata":{"preTokens":100000}}"#,
+        );
+        let fold = fold_claude(transcript);
+        assert_eq!(fold.compactions.completed, 1);
+        assert_eq!(fold.summary.user_requests, 1);
+        assert_eq!(fold.summary.tool_activities, 0);
+        // It is still a dated record, so the gap fold sees it — somebody was at the keyboard.
+        assert_eq!(fold.activity.active_time(), Some(TimeDelta::minutes(5)));
+    }
+
     #[test]
     fn tools_per_request_is_undefined_without_a_user_request() {
         let one_request = metrics(fold_claude(&claude_tool_transcript("Bash", 3, 0)));
@@ -1260,6 +1511,7 @@ mod tests {
             tools: ToolOutcomes::default(),
             activity: activity(gaps),
             commands: CommandChurn::default(),
+            compactions: Compactions::default(),
             anchors: SessionAnchors::default(),
             bytes_folded: 0,
         };
@@ -1354,6 +1606,7 @@ mod tests {
             tools: ToolOutcomes::default(),
             activity: Activity::over([start, start + TimeDelta::milliseconds(900)]),
             commands: CommandChurn::default(),
+            compactions: Compactions::default(),
             anchors: SessionAnchors::default(),
             bytes_folded: 0,
         };

@@ -1,4 +1,4 @@
-//! The six hardcoded coaching rules.
+//! The seven hardcoded coaching rules.
 //!
 //! P0 deliberately skips the rule DSL (qanungo #3): a handful of rules in Rust are enough to find
 //! out whether folded metrics say anything worth acting on, and a DSL built before that answer is
@@ -35,6 +35,8 @@
 //! [`thresholds::RETRY_LOOP_REPEATS`] was briefly a third case — set against a proxy while the
 //! archive held none of the signal it reads — until munshi#77 typed the `command` field and the
 //! live fold confirmed the proxy's numbers. Both rounds are written down beside it.
+
+use std::fmt::Write as _;
 
 use crate::evidence::{EventAnchor, EvidenceKind};
 use crate::format;
@@ -118,6 +120,32 @@ pub mod thresholds {
     /// A fire-and-forget session is one the operator never came back to: exactly this many user
     /// requests.
     pub const FIRE_AND_FORGET_USER_REQUESTS: usize = 1;
+
+    /// Completed compactions inside one session past which the window is being thrashed rather
+    /// than managed.
+    ///
+    /// **Measured against the archive** (2026-08-24 mirror, 734 transcripts, the first fold of
+    /// munshi#77's compaction promotion), and the shape of that distribution is what picked the
+    /// number. 91 sessions compacted at all (12.4%); among those, 43 compacted **once** and 15
+    /// **twice** — 64% of the whole compacting population is one or two — and then the mass thins
+    /// to a shelf of 6/5/6/3 at three through six and a long thin tail out to 45.
+    ///
+    /// Four is the p75 of that compacting distribution and twice its median, the same "well past
+    /// the ordinary case" framing [`RESUMED_SPAN_TO_ACTIVE`] uses. It selects 27 of 734 eligible
+    /// sessions (3.7%), which is the order the duration and churn rules already fire at — marathon
+    /// 4.4%, retry loop 4.9% — and a third of the rate at which sessions compact at all. Two would
+    /// have been the median itself and would have fired on 5.7%: over half of everyone who ever
+    /// compacted, which is reporting the weather rather than naming a habit.
+    ///
+    /// Compacting **once** is deliberately not a finding at any threshold. A session that fills its
+    /// window and compacts has managed the window; what this rule is looking for is the session
+    /// that does it again, and again, because the work outgrew the transcript rather than the
+    /// context outgrew a step. That decision is upstream of the constant and does not move with it.
+    ///
+    /// Still arbitrary in the doctrinal sense this module opens with — nothing says the p75 is
+    /// where coaching should start — but arbitrary at a *measured* point, with the measurement
+    /// written down beside it.
+    pub const COMPACTION_CHURN_COMPLETIONS: u64 = 4;
 }
 
 /// Which rule produced a finding.
@@ -129,18 +157,20 @@ pub enum RuleId {
     ResumedSession,
     Babysitting,
     FireAndForget,
+    CompactionChurn,
 }
 
 impl RuleId {
     /// Every rule, in the order [`evaluate`] runs them — which is also report order, and the
     /// order the rule-pack stamp hashes them in.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::HighToolErrorRate,
         Self::RetryLoop,
         Self::MarathonSession,
         Self::ResumedSession,
         Self::Babysitting,
         Self::FireAndForget,
+        Self::CompactionChurn,
     ];
 
     /// The finding's heading in the report.
@@ -152,6 +182,7 @@ impl RuleId {
             Self::ResumedSession => "Heavily resumed session",
             Self::Babysitting => "Babysitting pattern",
             Self::FireAndForget => "Fire-and-forget extreme",
+            Self::CompactionChurn => "Compaction churn",
         }
     }
 
@@ -165,6 +196,7 @@ impl RuleId {
             Self::ResumedSession => "resumed-session",
             Self::Babysitting => "babysitting",
             Self::FireAndForget => "fire-and-forget",
+            Self::CompactionChurn => "compaction-churn",
         }
     }
 
@@ -178,13 +210,25 @@ impl RuleId {
     /// Fire-and-forget is honestly `Mixed`: its ratio component is a shape, and its error component
     /// counts concrete failing events, so it offers both.
     ///
+    /// **Compaction churn is `Structural` even though it counts records**, and the two reasons are
+    /// worth stating because it is the one rule where the honest answer is not the obvious one.
+    /// First, a compaction marker carries no verbatim: an excerpt minted for one would be a token
+    /// count and possibly the word `manual`, which is what the finding's own detail line already
+    /// says, so the excerpt would show a reader nothing the count did not. Second, an
+    /// [`EventAnchor`]'s locator is defined as the event's ordinal **among the transcript's tool
+    /// events** — a marker record is not a tool event and has no ordinal in that space, so an
+    /// anchor minted for one would either carry a number that means a different event or need a
+    /// second locator space nothing else uses. The rule counted records rather than utterances, and
+    /// what it shows is the count.
+    ///
     /// This decides nothing about firing. It is a statement about what a fired rule may *show*.
     pub const fn evidence_kind(self) -> EvidenceKind {
         match self {
             Self::HighToolErrorRate | Self::RetryLoop => EvidenceKind::Event,
-            Self::MarathonSession | Self::ResumedSession | Self::Babysitting => {
-                EvidenceKind::Structural
-            }
+            Self::MarathonSession
+            | Self::ResumedSession
+            | Self::Babysitting
+            | Self::CompactionChurn => EvidenceKind::Structural,
             Self::FireAndForget => EvidenceKind::Mixed,
         }
     }
@@ -240,6 +284,20 @@ impl RuleId {
                             && session.tools.total.errors > 0,
                     )
             }
+            // Eligible whenever the *harness* types a compaction marker, which is the one place in
+            // this pack where an absent signal is still a reading. Elsewhere — a command field, a
+            // tool outcome — absence is ambiguous between "did not happen" and "cannot be
+            // expressed", so the rule declines to look. Here it is not: Claude Code and Copilot both
+            // write markers, so a transcript of theirs with none in it is a session that did not
+            // compact, and counting it as a clean denominator is a fact rather than a flattering
+            // guess. Codex is the genuine could-not-look case and the reason this is a question at
+            // all — `munshi-transcript` reads no Codex compaction, so a Codex session says nothing
+            // either way and stays out of the rate entirely. See
+            // [`Compactions`](crate::metrics::Compactions).
+            Self::CompactionChurn => session
+                .compactions
+                .count()
+                .map(|completed| completed >= thresholds::COMPACTION_CHURN_COMPLETIONS),
         }
     }
 
@@ -304,6 +362,7 @@ pub fn evaluate(sessions: &[SessionMetrics]) -> Vec<Finding> {
         resumed_session(sessions),
         babysitting(sessions),
         fire_and_forget(sessions),
+        compaction_churn(sessions),
     ]
     .into_iter()
     .flatten()
@@ -658,6 +717,92 @@ fn fire_and_forget(sessions: &[SessionMetrics]) -> Option<Finding> {
     })
 }
 
+/// **Compaction churn.** One session that compacted its context window
+/// [`thresholds::COMPACTION_CHURN_COMPLETIONS`] times or more: the window is being thrashed rather
+/// than managed.
+///
+/// Compacting **once** is not this finding and never will be. A session that fills its window and
+/// compacts has done the right thing with it; what is worth naming is the session that does it over
+/// and over, because each round throws away context the next round then has to rediscover. That is
+/// the same coaching point the marathon rule makes about one unbroken sitting, arrived at from the
+/// window rather than from the clock — and the two are separate rules for the same reason marathon
+/// and heavily-resumed are: a long session need not compact, and a compacting session need not be
+/// long.
+///
+/// **The pre-compaction totals are context, never a trigger.** How large the window had grown is in
+/// the evidence line because "compacted five times, the largest at 403k tokens" is the sentence that
+/// makes the finding legible — but no threshold reads it. The interpreter's `token_limit` is absent
+/// across almost the whole archive, so there is no window size to divide by, and a rule that
+/// compared a raw token count against a constant would be inventing the denominator it lacks. The
+/// repetition needs none.
+fn compaction_churn(sessions: &[SessionMetrics]) -> Option<Finding> {
+    let evidence: Vec<_> = sessions
+        .iter()
+        .filter(fired(RuleId::CompactionChurn))
+        .map(|session| Evidence {
+            source_hash: session.source_hash.clone(),
+            // Structural, per [`RuleId::evidence_kind`]: a compaction marker carries no verbatim to
+            // excerpt, and its record has no ordinal in the tool-event space anchors are keyed by.
+            anchors: Vec::new(),
+            detail: compaction_detail(session),
+        })
+        .collect();
+    (!evidence.is_empty()).then(|| Finding {
+        rule: RuleId::CompactionChurn,
+        problem: format!(
+            "{} of {} folded sessions compacted their context window {}+ times.",
+            evidence.len(),
+            sessions.len(),
+            thresholds::COMPACTION_CHURN_COMPLETIONS,
+        ),
+        action: "Repeated compaction is the window telling you the transcript has outgrown the \
+                 work. Each round discards context the next round has to rediscover, and what \
+                 survives is a summary of a summary. Land the current piece, write the handoff \
+                 down — what is done, what is next, which files matter — and start the follow-on \
+                 in a fresh session, so the new context begins from that handoff rather than from \
+                 whatever the last compaction happened to keep."
+            .to_owned(),
+        evidence,
+    })
+}
+
+/// One compacting session's evidence line: how often, and how large the window had grown.
+///
+/// The pre-compaction figures are stated as *what the source said* rather than as a property of the
+/// session, because the sources say very different amounts of it — Copilot states a total on almost
+/// every completion, Claude Code on every boundary, and neither states the limit it was compacting
+/// against. A line that printed a mean over completions that stated nothing would be averaging in
+/// zeroes nobody recorded.
+fn compaction_detail(session: &SessionMetrics) -> String {
+    let compactions = &session.compactions;
+    let mut detail = format!("compacted {} times", compactions.completed);
+    if compactions.failed > 0 {
+        let _ = write!(detail, ", {} further attempts failed", compactions.failed);
+    }
+    match compactions.pre_tokens_max {
+        Some(largest) if compactions.pre_tokens_stated == compactions.completed => {
+            let _ = write!(
+                detail,
+                "; largest window compacted {} tokens, mean {}",
+                format::tokens(largest),
+                compactions
+                    .mean_pre_tokens()
+                    .map_or_else(|| "—".to_owned(), format::tokens),
+            );
+        }
+        Some(largest) => {
+            let _ = write!(
+                detail,
+                "; largest window compacted {} tokens, stated on {} of them",
+                format::tokens(largest),
+                compactions.pre_tokens_stated,
+            );
+        }
+        None => detail.push_str("; no compaction stated the size of the window it compacted"),
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -667,7 +812,7 @@ mod tests {
 
     use super::*;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -722,6 +867,12 @@ mod tests {
             },
             activity,
             commands: CommandChurn::default(),
+            // Claude Code types a compaction marker, so every fixture here is a session the rule
+            // *can* look at — and one that compacted nothing.
+            compactions: Compactions {
+                observable: true,
+                ..Compactions::default()
+            },
             bytes_folded: 0,
         }
     }
@@ -1072,6 +1223,113 @@ mod tests {
         assert_eq!(finding.evidence[0].source_hash, "07".repeat(32));
     }
 
+    /// The same quiet session, given a compaction reading.
+    fn with_compactions(hash: u8, compactions: Compactions) -> SessionMetrics {
+        let mut session = quiet_session();
+        session.source_hash = format!("{hash:02x}").repeat(32);
+        session.compactions = compactions;
+        session
+    }
+
+    /// A session that compacted **once** is not a finding, and neither is one that compacted one
+    /// time short of the threshold. Compacting is management; compacting over and over is not, and
+    /// the rule's whole job is to keep those apart.
+    #[test]
+    fn a_single_compaction_is_never_a_finding() {
+        for completed in 0..thresholds::COMPACTION_CHURN_COMPLETIONS {
+            let managed = with_compactions(
+                50,
+                Compactions {
+                    observable: true,
+                    completed,
+                    ..Compactions::default()
+                },
+            );
+            assert_eq!(
+                RuleId::CompactionChurn.verdict(&managed),
+                Some(false),
+                "{completed} compactions must read as looked-at and clean",
+            );
+            assert!(evaluate(&[managed]).is_empty(), "{completed}");
+        }
+
+        // And exactly at the threshold it fires: the boundary is a `>=`.
+        let thrashing = with_compactions(
+            51,
+            Compactions {
+                observable: true,
+                completed: thresholds::COMPACTION_CHURN_COMPLETIONS,
+                ..Compactions::default()
+            },
+        );
+        let findings = evaluate(&[thrashing]);
+        assert_eq!(
+            findings.iter().map(|f| f.rule).collect::<Vec<_>>(),
+            vec![RuleId::CompactionChurn],
+        );
+    }
+
+    /// A completion the source said failed is a context wall hit, not a window managed: it is
+    /// reported beside the count and never inside it. Four real compactions plus two failed
+    /// attempts fire; three plus three do not.
+    #[test]
+    fn a_failed_compaction_is_reported_but_never_counted() {
+        let enough = with_compactions(
+            52,
+            Compactions {
+                observable: true,
+                completed: thresholds::COMPACTION_CHURN_COMPLETIONS,
+                failed: 2,
+                ..Compactions::default()
+            },
+        );
+        let short = with_compactions(
+            53,
+            Compactions {
+                observable: true,
+                completed: thresholds::COMPACTION_CHURN_COMPLETIONS - 1,
+                failed: 3,
+                ..Compactions::default()
+            },
+        );
+        assert_eq!(RuleId::CompactionChurn.verdict(&short), Some(false));
+
+        let findings = evaluate(&[enough, short]);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule == RuleId::CompactionChurn)
+            .expect("the churn rule fires on the first");
+        assert_eq!(finding.evidence.len(), 1);
+        assert_eq!(finding.evidence[0].source_hash, "34".repeat(32));
+        assert_eq!(
+            finding.evidence[0].detail,
+            "compacted 4 times, 2 further attempts failed; no compaction stated the size of the \
+             window it compacted",
+        );
+    }
+
+    /// Every counted compaction stating a size is the one shape that gets a mean, because averaging
+    /// over completions that stated nothing would be averaging in zeroes nobody recorded.
+    #[test]
+    fn the_evidence_line_states_a_mean_only_when_every_compaction_spoke() {
+        let complete = with_compactions(
+            54,
+            Compactions {
+                observable: true,
+                completed: 4,
+                pre_tokens_stated: 4,
+                pre_tokens_max: Some(400_000),
+                pre_tokens_total: 1_000_000,
+                ..Compactions::default()
+            },
+        );
+        let findings = evaluate(&[complete]);
+        assert_eq!(
+            findings[0].evidence[0].detail,
+            "compacted 4 times; largest window compacted 400.0k tokens, mean 250.0k",
+        );
+    }
+
     /// The distinction every fire rate divides by: a rule that looked and found nothing is not a
     /// rule that could not look. A quiet session answers `Some(false)` to the rules whose signal
     /// it carries and `None` to the ones it does not.
@@ -1104,6 +1362,28 @@ mod tests {
         );
         assert_eq!(RuleId::RetryLoop.verdict(&measured), Some(false));
         assert_eq!(RuleId::RetryLoop.eligible(&[quiet, measured]), 1);
+    }
+
+    /// Compaction is the one rule in the pack where an *absent* signal is still a reading, so its
+    /// eligibility is worth pinning apart from every other rule's: a harness that types markers
+    /// counts as a clean denominator, and one that does not is left out entirely.
+    #[test]
+    fn compaction_eligibility_follows_the_harness_and_not_the_transcript() {
+        let readable = with_compactions(
+            60,
+            Compactions {
+                observable: true,
+                ..Compactions::default()
+            },
+        );
+        let unreadable = with_compactions(61, Compactions::default());
+        assert_eq!(RuleId::CompactionChurn.verdict(&readable), Some(false));
+        assert_eq!(RuleId::CompactionChurn.verdict(&unreadable), None);
+        assert_eq!(
+            RuleId::CompactionChurn.eligible(&[readable, unreadable]),
+            1,
+            "only the harness that could have recorded a compaction is in the denominator",
+        );
     }
 
     /// A session with too few outcome-bearing calls for either error-rate trigger to fire is one

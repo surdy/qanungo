@@ -770,7 +770,7 @@ mod tests {
 
     use super::*;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, ToolOutcomes, ToolTally};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes, ToolTally};
     use crate::rules;
 
     fn instrumentation() -> Instrumentation {
@@ -845,6 +845,10 @@ mod tests {
                 unattributed: 0,
             },
             commands: CommandChurn::default(),
+            compactions: Compactions {
+                observable: true,
+                ..Compactions::default()
+            },
             bytes_folded: 4096,
         }
     }
@@ -909,6 +913,10 @@ mod tests {
                     tools: ToolOutcomes::default(),
                     activity: Activity::over(timestamps),
                     commands: CommandChurn::default(),
+                    compactions: Compactions {
+                        observable: true,
+                        ..Compactions::default()
+                    },
                     bytes_folded: 1024,
                 }
             })
@@ -1036,8 +1044,10 @@ mod tests {
         assert!(markdown.contains("| Bash | 20 | 9 | 45% |"));
     }
 
-    /// A lane no signal feeds says so, in every column, and never carries a number. The two rows
-    /// below are the whole no-signal-no-claim discipline as a reader sees it.
+    /// A lane no signal feeds says so, in every column, and never carries a number. The one row
+    /// below is the whole no-signal-no-claim discipline as a reader sees it — Context Management
+    /// was the other until munshi#77 typed compaction, and the pair of assertions here is what
+    /// keeps the difference between a dark lane and a lit one visible in the rendered document.
     #[test]
     fn an_unfed_lane_renders_as_not_scored_in_every_column() {
         let markdown = render(&hygiene_window(20, 5), &[]);
@@ -1046,11 +1056,23 @@ mod tests {
             "{markdown}"
         );
         assert!(
-            markdown.contains("| Context Management | not scored | not scored |"),
+            markdown.contains("**Code Review — not scored.** no signal typed for this lane yet"),
+            "{markdown}"
+        );
+        // The woken lane renders like any other scored one, and never as "not scored" again.
+        assert!(
+            markdown.contains("| Context Management | 100 | 100 |"),
             "{markdown}"
         );
         assert!(
-            markdown.contains("**Code Review — not scored.** no signal typed for this lane yet"),
+            !markdown.contains("**Context Management — not scored.**"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "- Compaction churn: fired on 0 of 20 sessions whose harness records \
+                 compactions (0%) — 0.0 points off"
+            ),
             "{markdown}"
         );
         // And a fed one does carry a number, with the readings that produced it beside it.

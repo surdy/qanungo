@@ -1,4 +1,4 @@
-//! Fixture-backed proof that each of the six rules fires — and that a report built from a
+//! Fixture-backed proof that each of the seven rules fires — and that a report built from a
 //! transcript stuffed with canary strings contains none of them.
 
 use std::fs::File;
@@ -42,6 +42,7 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
         tools: folded.tools,
         activity: folded.activity,
         commands: folded.commands,
+        compactions: folded.compactions,
         anchors: folded.anchors,
         bytes_folded: bytes.len() as u64,
     }
@@ -235,6 +236,100 @@ fn churn_reads_exactly_the_sessions_that_record_a_command_field() {
     );
     assert_eq!(session.commands.repeat_share(), None);
     assert_eq!(session.commands.busiest_runs(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Compaction churn (qanungo #4, munshi#77 pull A)
+// ---------------------------------------------------------------------------
+
+/// The dedup discipline the interpreter warns about, against a real Copilot transcript: the
+/// fixture writes **five** `session.compaction_start` records and **five**
+/// `session.compaction_complete` records — ten markers for five compactions — and the fold counts
+/// four. One completion states `success:false` and is excluded; the starts are context and are
+/// counted as compactions by nothing.
+///
+/// A fold over markers would have said ten, which is the number the whole phase filter exists to
+/// prevent.
+#[test]
+fn copilot_start_and_complete_pairs_count_as_one_compaction_each() {
+    let session = fold("munshi/copilot-1.0.76-compaction.jsonl", "copilot-cli");
+    let compactions = &session.compactions;
+    assert!(compactions.observable, "copilot types compaction markers");
+    assert_eq!(compactions.started, 5, "five announcements");
+    assert_eq!(compactions.failed, 1, "one completion said it failed");
+    assert_eq!(
+        compactions.completed, 4,
+        "four compactions, not ten markers and not five completions",
+    );
+    assert_eq!(compactions.count(), Some(4));
+
+    // The pre-compaction totals ride along as context, over the counted completions only — three
+    // of the four stated one, and the failed attempt states nothing at all.
+    assert_eq!(compactions.pre_tokens_stated, 3);
+    assert_eq!(compactions.pre_tokens_max, Some(403_971));
+    assert_eq!(compactions.pre_tokens_total, 160_939 + 218_150 + 403_971);
+
+    let findings = fires_only(&session, RuleId::CompactionChurn);
+    let finding = finding(&findings, RuleId::CompactionChurn);
+    assert_eq!(finding.rule.evidence_kind(), EvidenceKind::Structural);
+    assert!(finding.evidence[0].anchors.is_empty(), "no event to anchor");
+    assert_eq!(
+        finding.evidence[0].detail,
+        "compacted 4 times, 1 further attempts failed; largest window compacted 404.0k tokens, \
+         stated on 3 of them",
+    );
+}
+
+/// Claude Code writes one record per compaction and states no outcome on it, so the failure filter
+/// has to be `succeeded != Some(false)`: the `== Some(true)` spelling would score this whole
+/// harness at zero compactions. The fixture's five boundaries are five compactions.
+#[test]
+fn claude_boundaries_count_once_each_and_are_never_read_as_failures() {
+    let session = claude("munshi/claude-code-2.1.235-compaction.jsonl");
+    let compactions = &session.compactions;
+    assert_eq!(compactions.started, 0, "claude writes no start marker");
+    assert_eq!(compactions.failed, 0, "and states no outcome to fail");
+    assert_eq!(compactions.completed, 5);
+
+    // Two of the five state a readable pre-compaction figure; the rest carry a string, a
+    // non-object, or no metadata at all, and the fold reports what was stated rather than zero.
+    assert_eq!(compactions.pre_tokens_stated, 2);
+    assert_eq!(compactions.pre_tokens_max, Some(339_462));
+    assert_eq!(compactions.mean_pre_tokens(), Some((214_864 + 339_462) / 2));
+
+    let findings = fires_only(&session, RuleId::CompactionChurn);
+    assert_eq!(
+        finding(&findings, RuleId::CompactionChurn).evidence[0].detail,
+        "compacted 5 times; largest window compacted 339.5k tokens, stated on 2 of them",
+    );
+}
+
+/// The three-valued verdict, on three real transcripts: a session that compacted too little, one
+/// that compacted enough, and one whose harness this interpreter reads no compaction for at all.
+///
+/// The middle case is the discipline's whole point — a Claude Code transcript with no marker in it
+/// is a session that *did not compact*, which is a reading of none rather than no reading, because
+/// the harness would have written one. A Codex transcript is the opposite and stays out of the rate.
+#[test]
+fn the_churn_verdict_separates_not_compacting_from_not_being_readable() {
+    let quiet = claude("munshi/claude-code-2.1.44-normal.jsonl");
+    assert_eq!(quiet.compactions.count(), Some(0));
+    assert_eq!(
+        RuleId::CompactionChurn.verdict(&quiet),
+        Some(false),
+        "the rule looked at a session that never compacted",
+    );
+
+    let thrashing = claude("munshi/claude-code-2.1.235-compaction.jsonl");
+    assert_eq!(RuleId::CompactionChurn.verdict(&thrashing), Some(true));
+
+    let codex = fold("rules/retry-loop.jsonl", "codex-cli");
+    assert_eq!(codex.compactions.count(), None);
+    assert_eq!(
+        RuleId::CompactionChurn.verdict(&codex),
+        None,
+        "munshi-transcript reads no codex compaction, so nothing looked",
+    );
 }
 
 #[test]
@@ -547,6 +642,13 @@ fn session_shaped_rules_anchor_nothing() {
         ("rules/marathon-session.jsonl", RuleId::MarathonSession),
         ("rules/resumed-session.jsonl", RuleId::ResumedSession),
         ("rules/babysitting.jsonl", RuleId::Babysitting),
+        // Compaction churn counts records rather than measuring a shape, and is still structural:
+        // a marker carries no verbatim to excerpt, and its record has no ordinal in the tool-event
+        // space a locator is keyed by. What it shows a reader is the count and the session's shape.
+        (
+            "munshi/claude-code-2.1.235-compaction.jsonl",
+            RuleId::CompactionChurn,
+        ),
     ] {
         let session = claude(relative);
         let findings = rules::evaluate(std::slice::from_ref(&session));

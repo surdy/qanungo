@@ -1,8 +1,8 @@
 //! Practice-lane scores, and the rule-pack stamp that says when two of them may be compared.
 //!
 //! The five lanes are the ones qanungo #4 names — Prompt Quality, Session Hygiene, Code Review,
-//! Tool Mastery, Context Management — and only three of them are fed by anything the fold types
-//! today. **A lane with no feeding signal is not scored.** It renders as unscored, with the
+//! Tool Mastery, Context Management — and four of them are fed by something the fold types today.
+//! **A lane with no feeding signal is not scored.** It renders as unscored, with the
 //! signal it is waiting for named. It never gets a default, a proxy, or a zero: the same
 //! no-signal-no-claim discipline [`CommandChurn`](crate::metrics::CommandChurn) applies to one
 //! session's churn, applied to a whole lane.
@@ -15,14 +15,26 @@
 //! | Session Hygiene | marathon fire rate; heavily-resumed fire rate | both are readings of *how the work is packaged into sessions* — one unbroken push, and one transcript standing in for many work items |
 //! | Prompt Quality | babysitting fire rate; fire-and-forget fire rate | both are readings of *how the ask was shaped* — a hundred small steering turns, or one enormous unattended run with no checkpoint in it |
 //! | Code Review | nothing | no typed signal reports review activity at all |
-//! | Context Management | nothing | no typed signal reports compaction or context utilization at all |
+//! | Context Management | compaction-churn fire rate | a session that compacted its window over and over is *managing context badly*, read off the window itself rather than off anything standing in for it |
 //!
-//! The two empty rows are the interesting ones. Marathon *sounds* like context management — a
-//! context window accumulating without a break — and heavily-resumed *sounds* like it too. Both
-//! are declined here on purpose: what the fold measures is sitting length and calendar dilution,
-//! not context. Scoring Context Management off them would be scoring an implication, and one
-//! signal counted into two lanes is one behaviour reported as two findings. The lane stays
-//! unscored until munshi#77 types compaction events and per-request token usage.
+//! Code Review's empty row is the interesting one now. Marathon *sounds* like it belongs to
+//! Context Management — a context window accumulating without a break — and heavily-resumed
+//! *sounds* like it too. Both were declined here on purpose while the lane was dark, and both stay
+//! declined now that it is lit: what those two measure is sitting length and calendar dilution, not
+//! context. Scoring Context Management off them would be scoring an implication, and one signal
+//! counted into two lanes is one behaviour reported as two findings. The lane waited for munshi#77
+//! to type the compaction markers themselves, and that is what it is scored from.
+//!
+//! # A lane with one component
+//!
+//! Context Management is fed by a single reading today, and the formula below needs no special case
+//! for that — the mean over the components that read is over a set of one, so the component spends
+//! the whole lane. It is a real limitation rather than a design: what a session's *utilization* was
+//! before it compacted is the lane's obvious second component, and it is not here because no
+//! denominator exists to divide a pre-compaction total by (the interpreter's `token_limit` is
+//! absent on every Claude Code boundary and all but five Copilot pairs). The totals ride along in
+//! the finding as context and are scored by nothing. The second component lands when a window size
+//! does — the compaction/token wishlist row on qanungo #4 is where it waits.
 //!
 //! Cadence is fed into no lane either, for a different reason: sessions per active day has no
 //! defensible *direction*. Four sessions a day is not better or worse than one. It stays in the
@@ -54,7 +66,7 @@
 //! # What a score does and does not mean
 //!
 //! **100 means nothing this pack penalizes was observed** — not that the practice is perfect. The
-//! pack sees what the fold types, and that is four metrics.
+//! pack sees what the fold types, and that is five metrics.
 //!
 //! **Scores are comparable across windows under the same rule-pack stamp, and never across
 //! lanes.** Each lane's constants are anchored on its own rules' thresholds; there is no shared
@@ -206,7 +218,8 @@ impl Lane {
                 Signal::PooledToolErrorRate,
                 Signal::FireRate(RuleId::RetryLoop),
             ],
-            Self::CodeReview | Self::ContextManagement => &[],
+            Self::ContextManagement => &[Signal::FireRate(RuleId::CompactionChurn)],
+            Self::CodeReview => &[],
         }
     }
 
@@ -220,13 +233,6 @@ impl Lane {
                 "no signal typed for this lane yet — nothing in the event stream reports review \
                  activity (files edited versus read, diffs reviewed, revert-and-retry cycles), so \
                  the lane has no reading and takes no default",
-            ),
-            Self::ContextManagement => Some(
-                "no signal typed for this lane yet — nothing in the event stream reports \
-                 compaction events, pre-compaction utilization, or per-request token usage, so \
-                 the lane has no reading and takes no default. Sitting length and calendar \
-                 dilution are deliberately *not* borrowed for it: they are Session Hygiene's \
-                 readings, and one signal counted into two lanes is one behaviour reported twice",
             ),
             _ => None,
         }
@@ -283,6 +289,13 @@ impl Signal {
                 thresholds::BABYSITTING_MIN_USER_REQUESTS
             ),
             Self::FireRate(RuleId::FireAndForget) => "single-request sessions".to_owned(),
+            // Not "sessions that compacted": the denominator is every session whose harness would
+            // have *recorded* a compaction, so a session that never filled its window counts as a
+            // clean one rather than being left out of the rate. See
+            // [`RuleId::verdict`](crate::rules::RuleId::verdict).
+            Self::FireRate(RuleId::CompactionChurn) => {
+                "sessions whose harness records compactions".to_owned()
+            }
         }
     }
 
@@ -761,6 +774,10 @@ fn pack_entries() -> Vec<(String, String)> {
         "threshold.fire-and-forget-user-requests",
         thresholds::FIRE_AND_FORGET_USER_REQUESTS.to_string(),
     );
+    push(
+        "threshold.compaction-churn-completions",
+        thresholds::COMPACTION_CHURN_COMPLETIONS.to_string(),
+    );
     push("scoring.clean-score", float(constants::CLEAN_SCORE));
     push("scoring.fire-rate-floor", float(constants::FIRE_RATE_FLOOR));
     push(
@@ -821,7 +838,7 @@ mod tests {
 
     use super::*;
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
 
     fn at(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -854,6 +871,12 @@ mod tests {
             tools: ToolOutcomes::default(),
             activity: Activity::over(timestamps),
             commands: CommandChurn::default(),
+            // Both fixture harnesses type compaction markers, so these are sessions the churn rule
+            // can look at, and each one compacted nothing.
+            compactions: Compactions {
+                observable: true,
+                ..Compactions::default()
+            },
             bytes_folded: 0,
         }
     }
@@ -954,17 +977,81 @@ mod tests {
 
     /// A lane nothing types a signal for refuses to score, and says which pull would light it up.
     /// It is never a zero and never a default.
+    ///
+    /// Code Review is the last one: Context Management left this list when munshi#77 typed the
+    /// compaction markers, which is the loop this discipline exists to make visible.
     #[test]
     fn an_unfed_lane_refuses_to_score() {
         let sessions = hygiene_window(20, 0);
-        for lane in [Lane::CodeReview, Lane::ContextManagement] {
-            let score = lane_of(&sessions, lane);
-            assert_eq!(score.score(), None, "{lane:?} must not carry a score");
-            let LaneScore::Untyped(reason) = score else {
-                panic!("{lane:?} has no typed signal");
-            };
-            assert!(reason.contains("no signal typed for this lane yet"));
+        let score = lane_of(&sessions, Lane::CodeReview);
+        assert_eq!(score.score(), None, "Code Review must not carry a score");
+        let LaneScore::Untyped(reason) = score else {
+            panic!("Code Review has no typed signal");
+        };
+        assert!(reason.contains("no signal typed for this lane yet"));
+
+        // And the lane that woke up is no longer in that state at all.
+        assert_eq!(Lane::ContextManagement.untyped(), None);
+        assert!(matches!(
+            lane_of(&sessions, Lane::ContextManagement),
+            LaneScore::Scored { .. }
+        ));
+    }
+
+    /// The lane munshi#77 woke: a window of sessions that never compacted scores a clean hundred,
+    /// off the one component the lane has.
+    #[test]
+    fn context_management_scores_from_the_compaction_churn_rate() {
+        let clean = hygiene_window(20, 0);
+        let LaneScore::Scored { score, components } = lane_of(&clean, Lane::ContextManagement)
+        else {
+            panic!("every fixture session is one the rule can look at");
+        };
+        assert_eq!(score, 100);
+        assert_eq!(components.len(), 1, "a single-component lane");
+        assert_eq!(components[0].label, "Compaction churn");
+        assert_eq!(
+            components[0].detail,
+            "fired on 0 of 20 sessions whose harness records compactions (0%)",
+        );
+
+        // Five of the twenty thrashing is a 25% fire rate — exactly the floor — and with one
+        // component that spends the whole lane rather than half of it.
+        let mut thrashing = clean;
+        for session in thrashing.iter_mut().take(5) {
+            session.compactions.completed = thresholds::COMPACTION_CHURN_COMPLETIONS;
         }
+        let LaneScore::Scored { score, components } = lane_of(&thrashing, Lane::ContextManagement)
+        else {
+            panic!("the component reads");
+        };
+        assert_eq!(components[0].cost, Some(100.0));
+        assert_eq!(score, 0);
+    }
+
+    /// A harness this interpreter reads no compaction for is a harness that cannot be scored on
+    /// this lane — not one that scores a hundred. Codex sessions leave the denominator entirely.
+    #[test]
+    fn a_harness_with_no_compaction_marker_gets_no_context_management_reading() {
+        let mut sessions = hygiene_window(20, 0);
+        for session in &mut sessions {
+            session.source_agent = "codex-cli".to_owned();
+            session.compactions.observable = false;
+        }
+        let lane = Scorecard::fold(&sessions)
+            .harness("codex-cli")
+            .expect("codex contributed sessions")
+            .lane(Lane::ContextManagement)
+            .clone();
+        assert_eq!(lane.score(), None, "{lane:?}");
+        let LaneScore::NoReading { components } = lane else {
+            panic!("the lane is fed, but nothing in this window could look");
+        };
+        assert!(
+            components[0]
+                .detail
+                .contains("only 0 sessions whose harness")
+        );
     }
 
     /// A fed lane whose signals are all silent is also not a score. The window below has five

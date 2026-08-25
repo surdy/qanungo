@@ -485,7 +485,7 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
     use crate::evidence::SessionAnchors;
-    use crate::metrics::{Activity, CommandChurn, ToolOutcomes};
+    use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
     use crate::report::Instrumentation;
     use crate::rules;
     use crate::scoring::RulePack;
@@ -543,6 +543,10 @@ mod tests {
                     tools: ToolOutcomes::default(),
                     activity: Activity::over(timestamps),
                     commands: CommandChurn::default(),
+                    compactions: Compactions {
+                        observable: true,
+                        ..Compactions::default()
+                    },
                     anchors: SessionAnchors::default(),
                     bytes_folded: 1024,
                 }
@@ -657,20 +661,35 @@ mod tests {
     #[test]
     fn an_unfed_lane_is_not_scored_everywhere_and_says_what_it_waits_for() {
         let payload = built(hygiene_window("claude-code", 20, 5), Vec::new());
-        for key in ["code-review", "context-management"] {
-            let lane = lane(&payload, key);
-            assert_eq!(lane["fleet"]["state"], "not-scored", "{key}");
-            assert_eq!(lane["fleet"]["score"], Value::Null, "{key}");
-            assert_eq!(lane["harnesses"][0]["state"], "not-scored", "{key}");
-            assert_eq!(lane["harnesses"][0]["score"], Value::Null, "{key}");
-            assert!(
-                lane["reason"]
-                    .as_str()
-                    .expect("an unfed lane says why")
-                    .contains("no signal typed for this lane yet"),
-                "{key}",
-            );
-        }
+        let review = lane(&payload, "code-review");
+        assert_eq!(review["fleet"]["state"], "not-scored");
+        assert_eq!(review["fleet"]["score"], Value::Null);
+        assert_eq!(review["harnesses"][0]["state"], "not-scored");
+        assert_eq!(review["harnesses"][0]["score"], Value::Null);
+        assert!(
+            review["reason"]
+                .as_str()
+                .expect("an unfed lane says why")
+                .contains("no signal typed for this lane yet"),
+        );
+
+        // Context Management was the other one until munshi#77 typed compaction. It now carries a
+        // score and no reason at all, in the same payload the report's table is serialized from.
+        let context = lane(&payload, "context-management");
+        assert_eq!(context["fleet"]["state"], "scored");
+        assert_eq!(context["fleet"]["score"], 100);
+        assert_eq!(context["reason"], Value::Null);
+        assert_eq!(
+            context["harnesses"][0]["components"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            context["harnesses"][0]["components"][0]["label"],
+            "Compaction churn",
+        );
     }
 
     /// A fed lane whose signals were all silent is a third state, and must not read as either of

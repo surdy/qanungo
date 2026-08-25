@@ -4,7 +4,7 @@
 
 Copied verbatim from the Munshi suite's own fixtures (`munshi/fixtures/…`), which are the
 pinned-envelope examples `munshi-transcript` itself is validated against. They exercise the fold
-against transcripts nobody wrote for qanungo — they are ordinary short sessions, so they
+against transcripts nobody wrote for qanungo — the first three are ordinary short sessions, so they
 deliberately fire **no** rule.
 
 | File | Origin |
@@ -12,6 +12,25 @@ deliberately fire **no** rule.
 | `claude-code-2.1.44-normal.jsonl` | `fixtures/claude-code-2.1.44/normal/0c1a0de0-…-000000000001.jsonl` |
 | `copilot-1.0.70-envelope.jsonl` | `fixtures/copilot-1.0.70/transcript/synthetic-envelope.jsonl` |
 | `copilot-1.0.76-tool-activity.jsonl` | `fixtures/copilot-tool-activity/aaaaaaaa-…/events.jsonl` |
+| `claude-code-2.1.235-compaction.jsonl` | `fixtures/claude-code-compaction/transcript/0c1a0de0-…-000000077003.jsonl` |
+| `copilot-1.0.76-compaction.jsonl` | `fixtures/copilot-compaction/dddddddd-…/events.jsonl` |
+
+The last two are the exception to that note, and they are borrowed rather than synthesized on
+purpose: they are the fixtures munshi cut for issue #77's compaction promotion, so the marker shapes
+in them are the ones the interpreter was actually certified against, traps included. Each fires
+**Compaction churn** and nothing else.
+
+They pin the two counting rules a consumer cannot get right by guessing. The Copilot file writes
+five `session.compaction_start` records and five `session.compaction_complete` records — ten markers
+for what the fold must report as **four** compactions, because one completion states `success:false`
+and a start is not a compaction. The Claude Code file writes five `compact_boundary` records and
+states no outcome on any of them, which is why the failure filter is spelled
+`succeeded != Some(false)`: `== Some(true)` would read this whole harness as having compacted
+nothing. Both carry the malformed metadata munshi's own survey found — a `preTokens` that is a
+string, a `compactMetadata` that is a number, a marker with no metadata at all, a
+`compaction_complete` whose `data` is unreadable — so the pre-compaction totals the finding carries
+as context are stated on fewer compactions than there are, which is the shape a rendering path has
+to handle rather than assume away.
 
 ## `rules/`
 
