@@ -138,6 +138,28 @@
 //! cannot check, and the whole argument for scopes is that a reader can ask a narrower question and
 //! still see what answered it.
 //!
+//! ## What the timeline slice added, measured
+//!
+//! Against production on 2026-08-25, same window and same run pair: **1,123,533 B (1097.2 KiB)**
+//! with the timeline against **1,108,020 B (1082.1 KiB)** without — **+15,513 B, +15.1 KiB,
+//! +1.4%**. The `timeline` sections together are 15,061 B (14.7 KiB, **1.3% of the body**): 1,898 B
+//! at the top level and 13,163 B across the 28 repository scopes. That is 179 day rows at **84 B a
+//! row**, and a row is a date and two integer arrays.
+//!
+//! An order of magnitude cheaper than the scopes it rides beside, and it is worth saying why,
+//! because the obvious implementation is not. The section is **sparse over the calendar**: only days
+//! a session actually landed on are served, so a scope's rows are bounded by that scope's session
+//! count and the whole section by the window's. A dense day × harness grid per scope would instead
+//! cost the window's *length* × the roster × the repository count — on this window, 30 days × 2
+//! harnesses × 28 scopes of mostly zeroes, several times the size for strictly less information.
+//! Keeping the harness axis positional rather than repeating a label per day per scope is the other
+//! half: the labels alone would have been most of the section.
+//!
+//! The window measured 707 sessions over **26 UTC days**, and no comparison window at all — the
+//! archive holds nothing in `[60d, 30d)`, so `comparison_days` was empty and the boundary rule was
+//! exercised at `--last 15d` instead (531 + 176 = 707 across 16 + 10 days, each half reconciling
+//! with its own count).
+//!
 //! # Scopes, and the rule they do not bend
 //!
 //! [`Payload::scopes_section`] adds every repository scope to the same document: one pre-folded

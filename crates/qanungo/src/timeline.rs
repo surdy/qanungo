@@ -70,6 +70,15 @@
 //! a bar height cannot be computed from `"2h 10m"`. What the page does with it is arithmetic on a
 //! quantity — seconds into hours for an axis tick — and not a second implementation of
 //! [`crate::format::span`], which stays the one renderer of how a duration reads in prose.
+//!
+//! # What it costs, measured
+//!
+//! Against production on 2026-08-25 — 707 sessions over **26 UTC days** in 28 repositories — the
+//! whole served calendar, top level plus every scope, is **15,061 B (14.7 KiB, 1.3% of the
+//! payload)**: 179 day rows at 84 bytes each. It is an order of magnitude cheaper than the scopes it
+//! rides beside because of the two decisions above — sparse over the calendar, positional over the
+//! harness axis. See [`crate::dashboard`] for the full measurement and for what the dense
+//! alternative would have cost.
 
 use std::collections::BTreeMap;
 

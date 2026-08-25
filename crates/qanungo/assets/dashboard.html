@@ -1494,11 +1494,18 @@ const TIMELINE = {
   padTop: 14,
   padBottom: 34,
   plotHeight: 150,
-  /* The slot a day gets, and the bar inside it. The leftover is air: a bar that
-     filled its slot would touch its neighbours, and the gap is what separates
-     touching marks here — never a stroke, which would add ink that is not data. */
+  /* The narrowest slot a day gets, the widest, and the air left around the bar
+     inside it. A bar that filled its slot would touch its neighbours, and the gap
+     is what separates touching marks here — never a stroke, which would add ink
+     that is not data. The bar is capped as well as floored: past 24px a column
+     stops reading as a mark and starts reading as a block. */
   slot: 18,
-  bar: 14,
+  widestSlot: 48,
+  slotAir: 4,
+  widestBar: 24,
+  /* A chart of three days should not be three bars huddled at the left of an empty
+     box, so the slot grows until the plot is at least this wide. */
+  leastPlot: 320,
   /* The surface gap between stacked segments, and the rounded data-end on the top of
      a column. The baseline end stays square. */
   gap: 2,
@@ -1595,7 +1602,38 @@ function timelineTicks(max) {
 }
 
 function tickLabel(value) {
-  return measure === "sessions" ? String(value) : value.toFixed(1) + "h";
+  if (measure === "sessions") return String(value);
+  /* A whole number of hours reads as one: "500h", not "500.0h". The decimal is
+     there for an axis whose top is under ten, where it is the only thing telling
+     two ticks apart. */
+  return (Number.isInteger(value) ? String(value) : value.toFixed(1)) + "h";
+}
+
+/* How wide a day's slot is, and the bar inside it.
+ *
+ * Fixed at the floor for a long window, widened for a short one so a scope worked on
+ * three days is a chart rather than three bars in the corner of an empty box. The bar
+ * is capped at the mark spec's ceiling however wide the slot gets. */
+function slotWidth(count) {
+  if (!count) return TIMELINE.slot;
+  const room = Math.floor(TIMELINE.leastPlot / count);
+  return Math.max(TIMELINE.slot, Math.min(TIMELINE.widestSlot, room));
+}
+
+function barWidth(slot) {
+  return Math.min(TIMELINE.widestBar, slot - TIMELINE.slotAir);
+}
+
+/* How many slots apart date labels may stand.
+ *
+ * Measured against the slot rather than fixed, because the point is that two labels
+ * must not overlap: `Aug 12` is about 40px, so a chart of 18px slots labels every
+ * third day and one of 48px slots labels every other. Labelling every column was the
+ * obvious first answer and it is wrong — at any real slot width the dates run
+ * together into a smear, which is worse than an unlabelled bar the tooltip and the
+ * table both name. */
+function labelStride(slot) {
+  return Math.max(1, Math.ceil(46 / slot));
 }
 
 /* A column with a square baseline and a rounded data-end. The radius is clamped
@@ -1648,7 +1686,9 @@ function drawTimeline(columns, series) {
     return node;
   };
 
-  const width = Math.max(320, TIMELINE.padLeft + columns.length * TIMELINE.slot + TIMELINE.padRight);
+  const slot = slotWidth(columns.length);
+  const bar = barWidth(slot);
+  const width = TIMELINE.padLeft + columns.length * slot + TIMELINE.padRight;
   const height = TIMELINE.padTop + TIMELINE.plotHeight + TIMELINE.padBottom;
   const base = TIMELINE.padTop + TIMELINE.plotHeight;
   set(chart, { width, height, viewBox: "0 0 " + width + " " + height });
@@ -1691,7 +1731,7 @@ function drawTimeline(columns, series) {
   }
 
   columns.forEach((column, index) => {
-    const slotX = TIMELINE.padLeft + index * TIMELINE.slot;
+    const slotX = TIMELINE.padLeft + index * slot;
     const group = shape("g");
     const label = shape("title");
     label.textContent = columnTitle(column);
@@ -1702,7 +1742,7 @@ function drawTimeline(columns, series) {
       set(shape("rect", "hit"), {
         x: slotX,
         y: TIMELINE.padTop,
-        width: TIMELINE.slot,
+        width: slot,
         height: TIMELINE.plotHeight,
       })
     );
@@ -1715,18 +1755,19 @@ function drawTimeline(columns, series) {
          is where the rounded data-end goes instead. */
       const top = at === drawn.length - 1;
       const trim = top ? 0 : TIMELINE.gap;
-      const y = cursor - span + trim;
+      /* Anchored at the bottom of its band and never below it: a segment thinner
+         than the gap keeps one drawn pixel rather than being trimmed past the
+         baseline into a rectangle with a negative height. */
       const tall = Math.max(span - trim, 1);
-      const x = slotX + (TIMELINE.slot - TIMELINE.bar) / 2;
+      const y = cursor - tall;
+      const x = slotX + (slot - bar) / 2;
       if (top) {
         group.appendChild(
-          set(shape("path", part.series.klass), {
-            d: barPath(x, y, TIMELINE.bar, tall, TIMELINE.radius),
-          })
+          set(shape("path", part.series.klass), { d: barPath(x, y, bar, tall, TIMELINE.radius) })
         );
       } else {
         group.appendChild(
-          set(shape("rect", part.series.klass), { x, y, width: TIMELINE.bar, height: tall })
+          set(shape("rect", part.series.klass), { x, y, width: bar, height: tall })
         );
       }
       cursor -= span;
@@ -1739,7 +1780,7 @@ function drawTimeline(columns, series) {
      instant, which is why a day can appear on both sides of this line. */
   const opens = columns.findIndex((column) => column.reported);
   if (opens > 0) {
-    const x = TIMELINE.padLeft + opens * TIMELINE.slot - TIMELINE.gap / 2;
+    const x = TIMELINE.padLeft + opens * slot - TIMELINE.gap / 2;
     nodes.push(set(shape("line", "boundary"), { x1: x, y1: TIMELINE.padTop, x2: x, y2: base }));
     const marker = shape("text", "axis-text");
     set(marker, { x: x + 4, y: TIMELINE.padTop + 8 });
@@ -1756,19 +1797,32 @@ function drawTimeline(columns, series) {
     })
   );
 
-  /* Date labels are selective: every column labelled is a wall of text at sixty days,
-     and the axis is not where the numbers are. First, the boundary, and last — plus
-     every column when there are few enough that they fit. */
-  const labelled = new Set([0, columns.length - 1]);
-  if (opens > 0) labelled.add(opens);
-  if (columns.length <= 8) columns.forEach((_, index) => labelled.add(index));
-  for (const index of labelled) {
+  /* Date labels are selective, and spaced by how wide a label is rather than by a
+     count: the first day, the last, the boundary between the two windows, and then
+     every `stride`th in between, dropping any that would land on top of the last.
+     The axis is not where the numbers are — the tooltip and the table both carry
+     every value — so a legible handful of dates beats a smear of all of them. */
+  const stride = labelStride(slot);
+  const last = columns.length - 1;
+  /* The two ends are placed first and always; then the boundary, then the strided
+     candidates in order, each taken only if it clears every label already placed.
+     A candidate that would land beside the boundary is the case that made this a
+     greedy walk rather than a set — a forced label and a strided one an index apart
+     print on top of each other, and the result is unreadable in exactly the place a
+     reader most wants a date. */
+  const placed = [0, last];
+  const wanted = opens > 0 ? [opens] : [];
+  for (let index = stride; index < last; index += stride) wanted.push(index);
+  for (const index of wanted) {
+    if (placed.every((at) => Math.abs(at - index) >= stride)) placed.push(index);
+  }
+  for (const index of placed.sort((left, right) => left - right)) {
     const text = shape("text", "axis-text");
-    const anchor = index === 0 ? "start" : index === columns.length - 1 ? "end" : "middle";
+    const anchor = index === 0 ? "start" : index === last ? "end" : "middle";
     const at =
       TIMELINE.padLeft +
-      index * TIMELINE.slot +
-      (anchor === "start" ? 0 : anchor === "end" ? TIMELINE.slot : TIMELINE.slot / 2);
+      index * slot +
+      (anchor === "start" ? 0 : anchor === "end" ? slot : slot / 2);
     set(text, { x: at, y: base + 16, "text-anchor": anchor });
     text.textContent = dayLabel(columns[index].date);
     nodes.push(text);
@@ -1811,7 +1865,8 @@ function timelineTable(columns, series) {
     ...series.map((entry) => ({ label: entry.label, figure: true })),
     { label: "Total", figure: true },
   ];
-  const cell = (value) => (measure === "sessions" ? String(value) : activeHours(value * 3600) + "h");
+  /* The measure has already been applied — a count, or hours. This only writes it. */
+  const cell = (value) => (measure === "sessions" ? String(value) : value.toFixed(1) + "h");
   const rows = columns.map((column) => [
     column.date,
     column.reported ? "reported" : "comparison",
@@ -1825,16 +1880,21 @@ function timelineTable(columns, series) {
 }
 
 function timelineNote(data, timeline, columns) {
+  /* "16 days of the last 15d" is a sentence that reads like a mistake and is not one:
+     a window is a rolling span of hours counted back from the refresh, so it straddles
+     one more calendar day than it is long whenever it does not start at midnight. The
+     span is named separately from the count, and the reason is stated, rather than
+     leaving a reader to decide the page cannot add up. */
   const covered =
+    "Sessions landed on " +
     timeline.days_covered +
-    (timeline.days_covered === 1 ? " day" : " days") +
-    " of the last " +
-    data.window.last +
-    " had a session archived on them" +
+    (timeline.days_covered === 1 ? " UTC day" : " UTC days") +
     (timeline.comparison_days_covered
-      ? ", and " + timeline.comparison_days_covered + " in the window before it"
+      ? ", and on " + timeline.comparison_days_covered + " in the window before it"
       : "") +
-    ". ";
+    ". The window is the last " +
+    data.window.last +
+    " counted back from the refresh, so it can straddle one more calendar day than it is long. ";
   const basis =
     "A day is the UTC calendar day the archive finished the session's snapshot — archive time, not" +
     " the transcript's own clock and not the reader's local one. It is the clock the window itself" +
