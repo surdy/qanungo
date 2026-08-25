@@ -132,7 +132,9 @@ pub mod thresholds {
     ///
     /// Four is the p75 of that compacting distribution and twice its median, the same "well past
     /// the ordinary case" framing [`RESUMED_SPAN_TO_ACTIVE`] uses. It selects 27 of 734 eligible
-    /// sessions (3.7%), which is the order the duration and churn rules already fire at — marathon
+    /// sessions (3.7%; every session in the mirror is eligible today only because the archive
+    /// holds zero codex transcripts — codex sessions would leave the denominator entirely),
+    /// which is the order the duration and churn rules already fire at — marathon
     /// 4.4%, retry loop 4.9% — and a third of the rate at which sessions compact at all. Two would
     /// have been the median itself and would have fired on 5.7%: over half of everyone who ever
     /// compacted, which is reporting the weather rather than naming a habit.
@@ -777,7 +779,12 @@ fn compaction_detail(session: &SessionMetrics) -> String {
     let compactions = &session.compactions;
     let mut detail = format!("compacted {} times", compactions.completed);
     if compactions.failed > 0 {
-        let _ = write!(detail, ", {} further attempts failed", compactions.failed);
+        let plural = if compactions.failed == 1 { "" } else { "s" };
+        let _ = write!(
+            detail,
+            ", {} further attempt{plural} failed",
+            compactions.failed
+        );
     }
     match compactions.pre_tokens_max {
         Some(largest) if compactions.pre_tokens_stated == compactions.completed => {

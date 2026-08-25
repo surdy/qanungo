@@ -275,7 +275,7 @@ fn copilot_start_and_complete_pairs_count_as_one_compaction_each() {
     assert!(finding.evidence[0].anchors.is_empty(), "no event to anchor");
     assert_eq!(
         finding.evidence[0].detail,
-        "compacted 4 times, 1 further attempts failed; largest window compacted 404.0k tokens, \
+        "compacted 4 times, 1 further attempt failed; largest window compacted 404.0k tokens, \
          stated on 3 of them",
     );
 }
