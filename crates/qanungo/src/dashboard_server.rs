@@ -73,9 +73,9 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::cache::{self, BlobCache};
-use crate::cli::{ArchiveArgs, DashboardArgs, Refresh, Window};
+use crate::cli::{ArchiveArgs, DashboardArgs, Refresh};
 use crate::command::{self, CommandError, Folded};
-use crate::dashboard::{self, Refreshed};
+use crate::dashboard::{self, Payload, Refreshed, Windows};
 use crate::evidence::{self, EvidenceIndex};
 use crate::format;
 use crate::metrics;
@@ -154,7 +154,7 @@ pub struct Dashboard {
     listener: TcpListener,
     service: Arc<Service>,
     archive: ArchiveArgs,
-    window: Window,
+    windows: Windows,
     refresh: Refresh,
 }
 
@@ -190,10 +190,15 @@ impl Dashboard {
         }
         .map_err(DashboardError::Cache)?;
 
+        let windows = Windows {
+            coaching: args.last.clone(),
+            cost: args.cost_last.clone(),
+            standup: args.standup_last.clone(),
+        };
         let service = Arc::new(Service::new(
             fold_and_publish(
                 &args.archive,
-                &args.last,
+                &windows,
                 &args.refresh,
                 Refreshed {
                     generation: 1,
@@ -209,7 +214,7 @@ impl Dashboard {
             listener,
             service,
             archive: args.archive.clone(),
-            window: args.last.clone(),
+            windows,
             refresh: args.refresh.clone(),
         })
     }
@@ -231,12 +236,12 @@ impl Dashboard {
     pub fn run(self) {
         let refreshing = Arc::clone(&self.service);
         let archive = self.archive.clone();
-        let window = self.window.clone();
+        let windows = self.windows.clone();
         let refresh = self.refresh.clone();
         let redactor = self.service.redactor;
         if let Err(error) = thread::Builder::new()
             .name("dashboard-refresh".to_owned())
-            .spawn(move || refresh_loop(&refreshing, &archive, &window, &refresh, &redactor))
+            .spawn(move || refresh_loop(&refreshing, &archive, &windows, &refresh, &redactor))
         {
             // Serving the one payload already folded is strictly better than refusing to serve at
             // all, so this is reported and survived rather than propagated.
@@ -384,34 +389,103 @@ impl Service {
     }
 }
 
-/// Folds the window pair once and serializes the payload, narrating both to stderr.
+/// Folds all three lanes once and serializes the payload, narrating each to stderr.
+///
+/// **One call, one generation, one document.** The three folds happen back to back and the payload
+/// is built from all three at once, so the atomic swap below carries a whole page rather than a
+/// section of one: a reader can never see a bill from this refresh beside a standup from the last.
+/// A torn view across lanes is not made unlikely here, it is made unrepresentable — there is no
+/// intermediate state in which a [`Served`] holds two lanes.
+///
+/// # What three lanes actually cost, measured
+///
+/// Against the production archive on 2026-08-25, warm cache: **45.4 s** for the whole refresh —
+/// coaching sync 16.10 s + fold 6.32 s, cost sync 15.95 s + fold 4.62 s, standup sync 2.37 s + fold
+/// 20 ms. The second refresh in the same process took 45.3 s, so there is no warm-up left to find.
+///
+/// The blob cache spares the **transfers** and not the requests, and that is the number worth
+/// stating plainly rather than hoping for. Every one of the three mirrors reported `0 B
+/// transferred` — the cost lane's 705 sessions were all cache hits over a window twice the
+/// coaching lane's — and its sync still cost 15.95 s, because [`crate::sync`] asks the archive for
+/// one snapshot document per listed session whether or not the artifact behind it is already on
+/// disk. So the refresh is very nearly the *sum* of the three lanes' own runs, and an earlier draft
+/// of this comment claiming otherwise was wrong.
+///
+/// What that buys is still worth having. On a cold cache the sharing is real: the standup lane
+/// alone measured 4.94 s cold against 2.37 s warm, and the transcript lanes' cold cost is the
+/// archive's 3.1 GiB, paid once between the two of them instead of twice. And 45 s inside a
+/// five-minute interval is 15% of the process's life spent talking to Patwari, against the 6% the
+/// coaching lane alone spent — comfortably inside what [`crate::cli::MIN_DASHBOARD_REFRESH`] was
+/// set to protect, and the reason that floor is a floor rather than a default.
 ///
 /// Every line goes to stderr, including the access log below: this lane writes no document to
 /// stdout, and keeping the whole narration on one stream means `qanungo dashboard >/dev/null`
 /// cannot silently swallow the posture statement.
 fn fold_and_publish(
     archive: &ArchiveArgs,
-    window: &Window,
+    windows: &Windows,
     refresh: &Refresh,
     refreshed: Refreshed,
     redactor: &Redactor,
 ) -> Result<Served, CommandError> {
     eprintln!(
-        "qanungo dashboard: folding the last {window} and the window before it from {} — a warm \
-         run takes about 25 s, a cold one about a minute",
-        archive.patwari_url,
+        "qanungo dashboard: folding three lanes from {} — coaching {} (and the window before it), \
+         cost {} (and the window before it), standup {}",
+        archive.patwari_url, windows.coaching, windows.cost, windows.standup,
     );
     let started = Instant::now();
-    let folded = command::fold_coaching(archive, window)?;
-    let evidence = dashboard::evidence_index(&folded);
-    let body = serde_json::to_vec(&dashboard::payload(
-        window, refresh, &folded, refreshed, redactor,
-    ))
+    let coaching = command::fold_coaching(archive, &windows.coaching)?;
+    eprintln!(
+        "qanungo dashboard: coaching — {}",
+        instrumentation_line(&coaching)
+    );
+    let cost = command::fold_cost(archive, &windows.cost)?;
+    eprintln!(
+        "qanungo dashboard: cost — sync {} · fold {} · {} sessions (+{} comparison) · {} records \
+         · price table {}",
+        format::elapsed(cost.instrumentation.sync.elapsed),
+        format::elapsed(cost.instrumentation.fold_elapsed),
+        cost.instrumentation.sessions_folded,
+        cost.instrumentation.comparison_sessions_folded,
+        cost.instrumentation.records_read,
+        crate::pricing::PRICE_TABLE_REVISION,
+    );
+    // The redactor is handed to the fold rather than applied afterwards: `Standup::fold` scrubs on
+    // the way into its own types, so what comes back has no unscrubbed string in it for the payload
+    // to reach. See `crate::command::FoldedStandup`.
+    let standup = command::fold_standup(archive, &windows.standup, *redactor)?;
+    eprintln!(
+        "qanungo dashboard: standup — sync {} · fold {} · {} sessions across {} repositories · {} \
+         read · redaction fired {}",
+        format::elapsed(standup.instrumentation.sync.elapsed),
+        format::elapsed(standup.instrumentation.fold_elapsed),
+        standup.standup.sessions,
+        standup.standup.repositories_narrated(),
+        format::bytes(standup.standup.bytes_read),
+        standup.standup.redaction.total(),
+    );
+    let folds_elapsed = started.elapsed();
+
+    let evidence = dashboard::evidence_index(&coaching);
+    let body = serde_json::to_vec(
+        &Payload {
+            windows,
+            refresh,
+            coaching: &coaching,
+            cost: &cost,
+            standup: &standup,
+            folds_elapsed,
+            refreshed,
+            redactor,
+        }
+        .build(),
+    )
     .unwrap_or_else(|_| b"{}".to_vec());
     eprintln!(
-        "qanungo dashboard: refresh {} — {} · payload {} · {} anchors over {} sessions · {}",
+        "qanungo dashboard: refresh {} — three lanes in {} · payload {} · {} anchors over {} \
+         sessions · serialized at {}",
         refreshed.generation,
-        instrumentation_line(&folded),
+        format::elapsed(folds_elapsed),
         format::bytes(body.len() as u64),
         evidence.anchors(),
         evidence.sessions(),
@@ -456,7 +530,7 @@ fn instrumentation_line(folded: &Folded) -> String {
 fn refresh_loop(
     service: &Service,
     archive: &ArchiveArgs,
-    window: &Window,
+    windows: &Windows,
     refresh: &Refresh,
     redactor: &Redactor,
 ) {
@@ -468,7 +542,7 @@ fn refresh_loop(
         let at = Utc::now();
         match fold_and_publish(
             archive,
-            window,
+            windows,
             refresh,
             Refreshed {
                 generation,
@@ -1294,6 +1368,16 @@ mod tests {
         assert!(
             PAGE.contains("/api/events"),
             "the page subscribes to refreshes"
+        );
+        // The three sections the payload feeds, each fed from its own key rather than from a
+        // second fetch: one document, one generation, and no route added to serve a section.
+        for section in ["data.cost", "data.standup", "data.lanes", "data.findings"] {
+            assert!(PAGE.contains(section), "the page renders {section}");
+        }
+        assert_eq!(
+            PAGE.matches("fetch(").count(),
+            2,
+            "the payload and one excerpt at a time, and nothing else",
         );
         assert!(
             !PAGE.contains("href"),

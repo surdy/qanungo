@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="no-referrer">
-<title>qanungo — practice scores</title>
+<title>qanungo — practice, cost, standup</title>
 <style>
 /*
  * One file, no assets, no fonts, no network but this server's own two routes.
@@ -251,6 +251,74 @@ summary {
 .sitting-track { flex: 1 1 6rem; min-width: 4rem; height: 0.55rem; background: var(--rule); border-radius: 3px; }
 .sitting-bar { height: 100%; background: var(--ink-2); border-radius: 3px; min-width: 2px; }
 
+/* The cost section. A headline, then tables — which are the honest shape for a
+   priced breakdown and the one the CLI already uses, so a reader comparing the two
+   is comparing rows to rows. Each table scrolls inside its own box rather than
+   letting the page scroll sideways on a phone. */
+.headline {
+  font-size: clamp(1.6rem, 2.4vw, 2.4rem);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  margin: 0 0 0.2rem;
+}
+.headline-sub { color: var(--ink-2); margin: 0 0 0.75rem; }
+.note { color: var(--ink-2); font-size: 0.85rem; max-width: 78ch; margin: 0 0 0.75rem; }
+.scroller { overflow-x: auto; margin: 0.75rem 0; }
+table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+caption {
+  caption-side: top;
+  text-align: left;
+  font-weight: 650;
+  padding-bottom: 0.35rem;
+}
+th, td {
+  padding: 0.35rem 0.7rem 0.35rem 0;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  white-space: nowrap;
+}
+th { color: var(--ink-muted); font-weight: 600; font-size: 0.78rem; }
+td.figure, th.figure { text-align: right; font-variant-numeric: tabular-nums; }
+td.name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem; }
+.flags { margin: 0.5rem 0 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--ink-2); }
+.flags li { margin-bottom: 0.3rem; max-width: 78ch; }
+
+/* The standup section: the archive's own prose, scrubbed. Sessions read like a
+   document rather than a dashboard, because that is what they are. */
+.repo { margin-bottom: 1.75rem; }
+.repo h3 {
+  font-size: 0.95rem;
+  font-weight: 650;
+  margin: 0 0 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.session-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: clamp(0.8rem, 1.1vw, 1.2rem);
+  margin-bottom: 0.6rem;
+}
+.session-card h4 { font-size: 1rem; font-weight: 650; margin: 0 0 0.2rem; max-width: 78ch; }
+.session-meta {
+  font-size: 0.75rem;
+  color: var(--ink-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+  margin-bottom: 0.5rem;
+}
+.session-goal { color: var(--ink-2); max-width: 78ch; margin: 0 0 0.4rem; }
+.work { margin: 0; padding-left: 1.1rem; font-size: 0.9rem; color: var(--ink-2); }
+.work li { margin-bottom: 0.2rem; max-width: 78ch; }
+.rollup { margin: 0.4rem 0 0; padding-left: 1.1rem; }
+.rollup li { margin-bottom: 0.35rem; max-width: 78ch; }
+.rollup .where {
+  color: var(--ink-muted);
+  font-size: 0.78rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 footer {
   margin-top: 3rem;
   padding-top: 1rem;
@@ -276,6 +344,16 @@ footer .archive { overflow-wrap: anywhere; }
   <section aria-labelledby="findings-heading">
     <h2 id="findings-heading">Findings</h2>
     <div id="findings"></div>
+  </section>
+
+  <section aria-labelledby="cost-heading">
+    <h2 id="cost-heading">Cost</h2>
+    <div id="cost"></div>
+  </section>
+
+  <section aria-labelledby="standup-heading">
+    <h2 id="standup-heading">Standup</h2>
+    <div id="standup"></div>
   </section>
 
   <footer id="provenance"></footer>
@@ -582,20 +660,459 @@ function findingCard(finding, folded) {
   return card;
 }
 
+/* A table, built element by element and filled with textContent. `columns` names each
+   heading and whether it is a figure; `rows` is an array of cell values already
+   rendered server-side, because how a dollar or a token count reads is format.rs's
+   job and a second implementation of it here would drift from the CLI. */
+function table(caption, columns, rows) {
+  const scroller = el("div", "scroller");
+  const node = el("table");
+  if (caption) node.appendChild(el("caption", null, caption));
+  const head = el("tr");
+  for (const column of columns) {
+    head.appendChild(el("th", column.figure ? "figure" : null, column.label));
+  }
+  const thead = el("thead");
+  thead.appendChild(head);
+  node.appendChild(thead);
+  const body = el("tbody");
+  for (const row of rows) {
+    const tr = el("tr");
+    row.forEach((value, index) => {
+      const column = columns[index];
+      const className = column.figure ? "figure" : column.name ? "name" : null;
+      tr.appendChild(el("td", className, value));
+    });
+    body.appendChild(tr);
+  }
+  node.appendChild(body);
+  scroller.appendChild(node);
+  return scroller;
+}
+
+/* The cost delta, in the three states the payload can be in. ▲ is more money, which
+   is a direction and not a verdict — the sentence says so, exactly as the report does. */
+function costComparison(comparison, window) {
+  if (comparison.state === "no-window") {
+    return el("p", "note", "No comparison: " + window + " is too long to place an equal-length window before it.");
+  }
+  if (comparison.state === "nothing-priced") {
+    return el(
+      "p",
+      "note",
+      "No comparison: the archive holds no priced session in the equal-length window before this one, which opened " +
+        comparison.opens_at +
+        " (UTC)."
+    );
+  }
+  const node = el("p", "delta " + comparison.direction);
+  node.textContent =
+    comparison.glyph +
+    " " +
+    comparison.delta_rendered +
+    " against the equal-length window before it — " +
+    comparison.was_rendered +
+    " across " +
+    comparison.was_sessions +
+    " sessions, from " +
+    comparison.opens_at +
+    " (UTC). ▲ is more money, not a worse window.";
+  return node;
+}
+
+function costSection(cost) {
+  const nodes = [];
+  const priced = cost.priced;
+
+  if (priced.priced_anything) {
+    nodes.push(el("p", "headline", priced.dollars_rendered));
+    nodes.push(
+      el(
+        "p",
+        "headline-sub",
+        "across " +
+          priced.sessions +
+          " claude-code sessions and " +
+          priced.messages +
+          " billed messages, archived in the last " +
+          cost.window.last +
+          " since " +
+          cost.window.opens_at +
+          " (UTC)."
+      )
+    );
+    nodes.push(
+      el(
+        "p",
+        "note",
+        "Anthropic API list prices, at the rates in force when each session was archived (price " +
+          "table " +
+          cost.price_table_revision +
+          "). The archive knows which model answered and how many tokens it read and wrote; it " +
+          "does not know the account's billing plan, so this is what the usage would list at and " +
+          "not necessarily what was charged for it."
+      )
+    );
+    nodes.push(costComparison(cost.comparison, cost.window.last));
+  } else {
+    nodes.push(
+      el(
+        "p",
+        "empty",
+        "No claude-code session in the last " +
+          cost.window.last +
+          " carried usage this build could price. What the archive did record is below."
+      )
+    );
+  }
+
+  if (cost.by_model.length) {
+    nodes.push(
+      table(
+        null,
+        [
+          { label: "Model", name: true },
+          { label: "Messages", figure: true },
+          { label: "Input", figure: true },
+          { label: "Output", figure: true },
+          { label: "Cache write 5m", figure: true },
+          { label: "Cache write 1h", figure: true },
+          { label: "Cache read", figure: true },
+          { label: "Cost", figure: true },
+        ],
+        cost.by_model.map((row) => [
+          row.model,
+          row.messages,
+          row.tokens.input.rendered,
+          row.tokens.output.rendered,
+          row.tokens.cache_write_5m.rendered,
+          row.tokens.cache_write_1h.rendered,
+          row.tokens.cache_read.rendered,
+          row.dollars_rendered,
+        ])
+      )
+    );
+  }
+
+  if (cost.caching) {
+    let sentence =
+      cost.caching.read.rendered +
+      " tokens were served from the prompt cache for " +
+      cost.caching.read_dollars_rendered +
+      ". Sending them as fresh input would have cost " +
+      cost.caching.at_input_rate_rendered +
+      ", so caching saved " +
+      cost.caching.saving_rendered +
+      ".";
+    if (cost.caching.write_5m || cost.caching.write_1h) {
+      sentence +=
+        " The writes that filled it are already inside the total above, so this is the read side" +
+        " alone and is not net of them.";
+    }
+    nodes.push(el("p", "note", sentence));
+  }
+
+  if (cost.by_repository.length) {
+    nodes.push(
+      table(
+        "By repository",
+        [
+          { label: "Repository", name: true },
+          { label: "Messages", figure: true },
+          { label: "Tokens", figure: true },
+          { label: "Cost", figure: true },
+        ],
+        cost.by_repository.map((row) => [
+          row.repository === null ? "(no repository)" : row.repository,
+          row.messages,
+          row.tokens.total.rendered,
+          row.dollars_rendered,
+        ])
+      )
+    );
+  }
+
+  /* Copilot. The payload hands this page token volumes and no money at all — there is
+     no dollar figure here to render, and none is invented. The label says so rather
+     than leaving a reader to wonder why one column is missing. */
+  if (cost.copilot.rows.length) {
+    nodes.push(
+      el(
+        "p",
+        "note",
+        "Copilot records output tokens only — one figure per assistant message, with no " +
+          "per-message input, cache, or tier — and a transcript does not say whether the account " +
+          "was on premium requests or on usage-based credits. These rows are token volumes: no " +
+          "dollars, no credit estimate, no premium-request count, and they are not in the total " +
+          "above."
+      )
+    );
+    nodes.push(
+      table(
+        "Token volumes (copilot) — no dollars",
+        [
+          { label: "Model", name: true },
+          { label: "Messages", figure: true },
+          { label: "Output tokens", figure: true },
+        ],
+        cost.copilot.rows.map((row) => [
+          row.model === null ? "(no model recorded)" : row.model,
+          row.messages,
+          row.output_rendered,
+        ])
+      )
+    );
+  }
+
+  for (const entry of cost.sessions.no_signal) {
+    nodes.push(
+      el(
+        "p",
+        "note",
+        entry.sessions +
+          " " +
+          entry.source_agent +
+          " sessions recorded no per-message usage at all, so nothing about their cost can be read" +
+          " at any price."
+      )
+    );
+  }
+
+  const flagged = cost.flagged;
+  if (flagged.any) {
+    nodes.push(el("p", "note", "Unpriced and flagged — tokens the archive recorded that this build did not turn into dollars. None of it is estimated, interpolated, or rounded into the total above."));
+    const list = el("ul", "flags");
+    if (flagged.synthetic) {
+      list.appendChild(
+        el(
+          "li",
+          null,
+          "Unbilled (synthetic) — " +
+            flagged.synthetic.messages +
+            " messages, " +
+            flagged.synthetic.tokens.total.rendered +
+            " tokens. Claude Code's placeholder for messages it generated locally; no vendor" +
+            " billed them."
+        )
+      );
+    }
+    for (const unpriced of flagged.unpriced) {
+      list.appendChild(
+        el(
+          "li",
+          null,
+          "Unpriced — " +
+            unpriced.messages +
+            " messages, " +
+            unpriced.tokens.total.rendered +
+            " tokens: " +
+            unpriced.detail +
+            "."
+        )
+      );
+    }
+    if (flagged.untiered_cache_writes) {
+      list.appendChild(
+        el(
+          "li",
+          null,
+          "Cache writes with no tier — " +
+            flagged.untiered_cache_writes.rendered +
+            " tokens across " +
+            flagged.untiered_cache_writes.messages +
+            " messages stated only as a total. The two tiers bill at different multiples of" +
+            " input, so such a write has no rate and is left out rather than charged at an" +
+            " assumed one."
+        )
+      );
+    }
+    if (flagged.undeduplicatable) {
+      list.appendChild(
+        el(
+          "li",
+          null,
+          "Undeduplicatable usage — " +
+            flagged.undeduplicatable.records +
+            " records carrying " +
+            flagged.undeduplicatable.rendered +
+            " tokens were summed per record, so this share of the total may be counted more than" +
+            " once. Over-counting rather than dropping real spend, and named either way."
+        )
+      );
+    }
+    nodes.push(list);
+  }
+
+  if (cost.duplicate_records) {
+    nodes.push(
+      el(
+        "p",
+        "note",
+        "Deduplication dropped " +
+          cost.duplicate_records +
+          " further records that repeated a message already counted: one API message reaches a" +
+          " transcript as several records repeating its usage verbatim, so summing records would" +
+          " have inflated every figure above."
+      )
+    );
+  }
+  for (const gap of cost.gaps) {
+    nodes.push(el("p", "note", "Gap — " + gap.count + " — " + gap.reason));
+  }
+  return nodes;
+}
+
+/* The standup. Every string here came out of the fold already scrubbed, and the
+   redaction markers are rendered exactly as they arrived: a reader has to be able to
+   see that the scrub fired, so a marker is shown rather than tidied away. */
+function standupSession(session) {
+  const card = el("div", "session-card");
+  card.appendChild(el("h4", null, session.title));
+  const meta = [
+    "archived " + (session.archived_at || "at an unreadable time") + " (UTC)",
+    session.branch ? "branch " + session.branch : null,
+    "sha256:" + session.source_hash,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  card.appendChild(el("div", "session-meta", meta));
+  card.appendChild(el("p", "session-goal", session.goal));
+  const work = el("ul", "work");
+  if (session.work_completed.length) {
+    for (const item of session.work_completed) work.appendChild(el("li", null, item));
+  } else {
+    work.appendChild(el("li", null, "(this session's summary lists no completed work)"));
+  }
+  card.appendChild(work);
+  return card;
+}
+
+function rollup(heading, lines, note) {
+  const nodes = [el("p", "headline-sub", heading)];
+  if (!lines.length) {
+    nodes.push(el("p", "empty", "No session in this window recorded any under this heading."));
+    return nodes;
+  }
+  const list = el("ul", "rollup");
+  for (const line of lines) {
+    const item = el("li", null, line.text + " ");
+    item.appendChild(el("span", "where", line.repository));
+    list.appendChild(item);
+  }
+  nodes.push(list);
+  nodes.push(el("p", "note", note));
+  return nodes;
+}
+
+function standupSection(standup) {
+  const nodes = [];
+  if (standup.sessions === 0) {
+    nodes.push(
+      el(
+        "p",
+        "empty",
+        "No archived session in the last " +
+          standup.window.last +
+          " carried a summary to narrate. Anything the archive did hold is below."
+      )
+    );
+  } else {
+    nodes.push(
+      el(
+        "p",
+        "headline-sub",
+        standup.sessions +
+          " sessions across " +
+          standup.repositories_narrated +
+          (standup.repositories_narrated === 1 ? " repository" : " repositories") +
+          ", archived since " +
+          standup.window.opens_at +
+          " (UTC) — narrated from the summaries munshi wrote when it captured them. No model" +
+          " reconstructed any of this."
+      )
+    );
+    for (const group of standup.repositories) {
+      const repo = el("div", "repo");
+      repo.appendChild(el("h3", null, group.repository));
+      for (const session of group.sessions) repo.appendChild(standupSession(session));
+      nodes.push(repo);
+    }
+  }
+
+  nodes.push(
+    ...rollup(
+      "Decisions",
+      standup.decisions,
+      "These are the decisions the sessions themselves recorded, in reading order, with exact" +
+        " repeats within a repository dropped."
+    )
+  );
+  nodes.push(
+    ...rollup(
+      "Open items",
+      standup.open_items,
+      "These are the open items the sessions themselves recorded — what was still owed when each" +
+        " capture ended, not a live task list."
+    )
+  );
+
+  if (standup.gaps.length) {
+    nodes.push(el("p", "headline-sub", "Gaps"));
+    const list = el("ul", "flags");
+    for (const gap of standup.gaps) {
+      list.appendChild(el("li", null, gap.count + " — " + gap.reason));
+    }
+    nodes.push(list);
+  }
+  return nodes;
+}
+
+/* What the scrub did to the prose above, in the document that carries it. A reader
+   looking at an unmarked standup needs to know whether that means "nothing matched"
+   or "the scrub was off", and those are very different sentences. */
+function standupScrubNote(standup, redaction) {
+  if (!redaction.secrets) {
+    return (
+      "The prose above is SERVED RAW: this dashboard was started with --no-redact, so nothing in" +
+      " it was scrubbed for secrets."
+    );
+  }
+  const fired = standup.redaction.total
+    ? standup.redaction.total +
+      " replacements were made (" +
+      standup.redaction.fired.map((entry) => entry.pattern + " ×" + entry.count).join(", ") +
+      ")"
+    : "Nothing matched";
+  return (
+    "Every line of prose above came out of the archive and was scrubbed for secrets before it was" +
+    " rendered, against pattern set " +
+    redaction.pattern_revision +
+    ". " +
+    fired +
+    ". What a pattern matched is never recorded, printed, or counted per value — only that it" +
+    " fired."
+  );
+}
+
 function render(data) {
   const provenance = data.provenance;
   const harnesses = Object.entries(data.sessions.by_harness)
     .map(([name, count]) => name + " (" + count + ")")
     .join(", ");
   document.getElementById("subtitle").textContent =
-    data.sessions.folded +
-    " sessions archived in the last " +
+    "Scored over the last " +
     data.window.last +
-    ", since " +
+    " — " +
+    data.sessions.folded +
+    " sessions since " +
     data.window.opens_at +
     " (UTC)" +
     (harnesses ? " — " + harnesses : "") +
-    ".";
+    ". Cost covers the last " +
+    data.cost.window.last +
+    " and the standup the last " +
+    data.standup.window.last +
+    "; each section says which.";
 
   if (provenance.stale_since) {
     banner(
@@ -627,6 +1144,14 @@ function render(data) {
     );
   }
 
+  document.getElementById("cost").replaceChildren(...costSection(data.cost));
+  document
+    .getElementById("standup")
+    .replaceChildren(
+      ...standupSection(data.standup),
+      el("p", "note", standupScrubNote(data.standup, provenance.redaction))
+    );
+
   const footer = document.getElementById("provenance");
   const gaps = provenance.gaps
     .map((gap) => gap.count + " — " + gap.reason)
@@ -637,14 +1162,15 @@ function render(data) {
       "not that the practice is perfect. Scores move across windows; they do not compare across " +
       "lanes. Fleet is the unweighted mean of the per-harness scores, and carries an arrow only " +
       "when the same harnesses scored the lane in both windows.",
-    "This page renders aggregates, rule ids, counts and transcript content hashes, and will " +
-      "expand a finding into the individual events that rule counted — one event each, " +
+    "The scores and the cost above are aggregates, rule ids, counts and transcript content " +
+      "hashes; a finding will expand into the individual events that rule counted, one event " +
+      "each. The standup is the archive's own prose, " +
       (provenance.redaction.secrets
         ? "scrubbed for secrets by pattern set " + provenance.redaction.pattern_revision
         : "SERVED RAW: this dashboard was started with --no-redact") +
       ". Nothing else from a transcript is served, and there is no link into the archive. To " +
       "read a whole session, take its hash to your own shell.",
-    "Window " +
+    "Coaching " +
       provenance.window +
       " · " +
       provenance.sessions_folded +
@@ -665,14 +1191,40 @@ function render(data) {
       " misses (" +
       provenance.bytes_transferred +
       " transferred)",
+    "Cost " +
+      provenance.lanes.cost.window +
+      " · " +
+      provenance.lanes.cost.sessions_folded +
+      " sessions (+" +
+      provenance.lanes.cost.comparison_sessions_folded +
+      " comparison) · " +
+      provenance.lanes.cost.records_read +
+      " records · sync " +
+      provenance.lanes.cost.sync +
+      " · fold " +
+      provenance.lanes.cost.fold,
+    "Standup " +
+      provenance.lanes.standup.window +
+      " · " +
+      provenance.lanes.standup.sessions_folded +
+      " sessions · " +
+      provenance.lanes.standup.bytes_folded +
+      " read · sync " +
+      provenance.lanes.standup.sync +
+      " · fold " +
+      provenance.lanes.standup.fold,
     "Rule pack " +
       provenance.rule_pack +
+      " · price table " +
+      provenance.price_table_revision +
       " · redaction patterns " +
       provenance.redaction_pattern_revision +
       " · refresh " +
       provenance.generation +
       " at " +
       provenance.refreshed_at +
+      " in " +
+      provenance.refresh_elapsed +
       ", every " +
       provenance.refresh_interval,
   ];

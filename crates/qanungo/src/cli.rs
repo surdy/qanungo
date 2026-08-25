@@ -48,6 +48,19 @@ pub const DEFAULT_PATWARI_URL: &str = "https://patwari.clusterfault.com";
 /// and `--last 30d` still says exactly what the issue asked for.
 pub const DEFAULT_STANDUP_WINDOW: &str = "7d";
 
+/// How far back the cost lane prices when nobody says otherwise.
+///
+/// A quarter, spelled in the units the window grammar actually has. qanungo #12 asks for "3m" and
+/// the grammar deliberately has no month unit — `m` reads as either minutes or months, and a
+/// coaching window that could be misread by a factor of forty thousand is worse than one that has
+/// to be spelled in weeks.
+///
+/// Named rather than repeated because two commands now default to it: `qanungo cost --last` and the
+/// dashboard's `--cost-last`, which is the *same* window under a different presentation. Two
+/// literals that happened to agree would be one edit away from a page pricing a different quarter
+/// from the terminal beside it.
+pub const DEFAULT_COST_WINDOW: &str = "12w";
+
 /// Where `qanungo dashboard` listens when nobody says otherwise.
 ///
 /// **Loopback**, because a surface with no authentication has to be opt-in to being reachable at
@@ -63,18 +76,31 @@ pub const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8878";
 ///
 /// **A tunable, not a decision.** A coaching window of thirty days does not change meaningfully
 /// inside five minutes — a session has to be finished, archived, and listed before it can move a
-/// number — so this is chosen to keep the archive quiet rather than to keep the page fresh. The
-/// measured warm re-sync against the production archive is 16.8 s, so five minutes spends about
-/// 6% of the dashboard's life talking to Patwari.
+/// number — so this is chosen to keep the archive quiet rather than to keep the page fresh.
+///
+/// A refresh now folds three lanes rather than one, and the measurement moved with it: **45.4 s**
+/// warm against the production archive on 2026-08-25 — coaching 22.4 s, cost 20.6 s, standup 2.4 s
+/// — against the 23 s the coaching lane cost alone. Five minutes therefore spends about 15% of the
+/// dashboard's life talking to Patwari rather than 6%. Still a quiet client, and still well clear
+/// of the floor below.
 pub const DEFAULT_DASHBOARD_REFRESH: &str = "5m";
 
 /// Floor under `--refresh`, refused rather than clamped.
 ///
-/// A warm re-sync measured 16.8 s against the production archive, and Patwari serves about eight
-/// concurrent requests. A refresh interval near the sync's own duration is not a fresher
-/// dashboard, it is a permanent polling load on a LAN archive that has other readers — so the
-/// floor sits at roughly three times the measured sync, and somebody who typed `--refresh 5s` is
-/// told what this client will not do rather than quietly given something else.
+/// A warm three-lane refresh measured 45.4 s against the production archive, and Patwari serves
+/// about eight concurrent requests. A refresh interval near the refresh's own duration is not a
+/// fresher dashboard, it is a permanent polling load on a LAN archive that has other readers — so
+/// somebody who typed `--refresh 5s` is told what this client will not do rather than quietly given
+/// something else.
+///
+/// The floor stayed at a minute when the slice tripled what a refresh costs, and that is worth
+/// saying out loud rather than leaving as an oversight: a minute is now only a third above the
+/// measured refresh instead of three times it, so `--refresh 60s` today means a dashboard that is
+/// talking to the archive about three quarters of the time. It is left where it is because the
+/// floor's job is to refuse the *absurd* ask — a five-second poll — and not to second-guess an
+/// operator who has decided their own archive can wear a tight loop. Raising it would be this
+/// client deciding that for them; the honest place for the discouragement is the measured number in
+/// [`DEFAULT_DASHBOARD_REFRESH`] above, which is what anybody choosing an interval should read.
 pub const MIN_DASHBOARD_REFRESH: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
@@ -168,10 +194,8 @@ pub struct ReportArgs {
 #[derive(Debug, Args)]
 pub struct CostArgs {
     /// How far back to price, as `<count><unit>` with unit `h`, `d`, or `w`. The default is a
-    /// quarter, spelled `12w`: qanungo #12 asks for "3m", and the window grammar deliberately has
-    /// no month unit — `m` reads as either minutes or months, and a coaching window that could be
-    /// misread by a factor of forty thousand is worse than one that has to be spelled in weeks.
-    #[arg(long = "last", default_value = "12w", value_parser = parse_window)]
+    /// quarter, spelled `12w` — see [`DEFAULT_COST_WINDOW`].
+    #[arg(long = "last", default_value = DEFAULT_COST_WINDOW, value_parser = parse_window)]
     pub last: Window,
 
     #[command(flatten)]
@@ -209,12 +233,35 @@ pub struct StandupArgs {
 /// given process gets the same scrub, the served payload states which one
 /// ([`crate::dashboard`]), and startup says so out loud — loudly indeed when `--no-redact` meets a
 /// routable address (see [`crate::dashboard_server::posture_line`]).
+///
+/// # Three windows, one page
+///
+/// The standup-and-cost slice adds two more windows, because the three lanes are not asking the
+/// same question and a single `--last` would force two of them to answer the wrong one. A coaching
+/// score wants a month; a bill wants a quarter; a standup wants a week a person can read to the end
+/// of. So each section keeps its own lane's default — `--last 30d`, `--cost-last 12w`,
+/// `--standup-last 7d` — and all three parse through the same window grammar, so a spelling means
+/// same span wherever it is typed.
+///
+/// They are three flags rather than a per-section override of one: an operator who narrows the
+/// coaching window has said nothing about what the bill should cover, and silently moving the other
+/// two would be the page inventing an intent.
 #[derive(Debug, Args)]
 pub struct DashboardArgs {
     /// How far back to score, as `<count><unit>` with unit `h`, `d`, or `w`. The comparison window
     /// the trend arrows are drawn against is the equal-length one before it, as in `report`.
     #[arg(long = "last", default_value = "30d", value_parser = parse_window)]
     pub last: Window,
+
+    /// How far back the cost section prices, as `<count><unit>` with unit `h`, `d`, or `w`.
+    /// Defaults to `qanungo cost`'s own quarter so the page and the CLI answer the same question.
+    #[arg(long = "cost-last", default_value = DEFAULT_COST_WINDOW, value_parser = parse_window)]
+    pub cost_last: Window,
+
+    /// How far back the standup section narrates, as `<count><unit>` with unit `h`, `d`, or `w`.
+    /// Defaults to `qanungo standup`'s own week, for the same reason.
+    #[arg(long = "standup-last", default_value = DEFAULT_STANDUP_WINDOW, value_parser = parse_window)]
+    pub standup_last: Window,
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
@@ -278,8 +325,9 @@ fn parse_refresh(value: &str) -> Result<Refresh, String> {
     let interval = Duration::from_secs(seconds);
     if interval < MIN_DASHBOARD_REFRESH {
         return Err(format!(
-            "must be at least {}s — a warm re-sync of the archive takes about 17 s, and refreshing \
-             near that interval is a polling load on a LAN server rather than a fresher dashboard",
+            "must be at least {}s — a warm three-lane refresh takes about 45 s against the archive, \
+             and refreshing near that interval is a polling load on a LAN server rather than a \
+             fresher dashboard",
             MIN_DASHBOARD_REFRESH.as_secs(),
         ));
     }
@@ -560,6 +608,91 @@ mod tests {
         assert!(args.bind.ip().is_loopback());
         assert_eq!(args.refresh.to_string(), DEFAULT_DASHBOARD_REFRESH);
         assert_eq!(args.refresh.interval(), Duration::from_secs(300));
+    }
+
+    /// The dashboard folds three lanes over three windows, and each one defaults to the window its
+    /// own command defaults to — so a page nobody configured shows the same three answers the three
+    /// CLI runs with no flags would print.
+    #[test]
+    fn the_dashboards_three_windows_default_to_their_own_lanes_defaults() {
+        let Command::Dashboard(dashboard) = Cli::parse_from(["qanungo", "dashboard"]).command
+        else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        let (Command::Report(report), Command::Cost(cost), Command::Standup(standup)) = (
+            Cli::parse_from(["qanungo", "report"]).command,
+            Cli::parse_from(["qanungo", "cost"]).command,
+            Cli::parse_from(["qanungo", "standup"]).command,
+        ) else {
+            panic!("each lane parses as itself");
+        };
+        assert_eq!(dashboard.last, report.last, "30d, as `report` scores");
+        assert_eq!(dashboard.cost_last, cost.last, "12w, as `cost` prices");
+        assert_eq!(
+            dashboard.standup_last, standup.last,
+            "7d, as `standup` narrates",
+        );
+        assert_eq!(dashboard.cost_last.delta(), TimeDelta::weeks(12));
+        assert_eq!(dashboard.standup_last.delta(), TimeDelta::days(7));
+    }
+
+    /// The two new flags share `--last`'s grammar exactly: the same units accepted, the same units
+    /// refused, and the same refusal of a window that covers nothing. A second grammar would be a
+    /// second definition of what `12w` means on one command line.
+    #[test]
+    fn the_extra_window_flags_share_the_window_grammar() {
+        let windows = |flags: &[&str]| {
+            let Command::Dashboard(args) = Cli::parse_from(
+                ["qanungo", "dashboard"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+            .command
+            else {
+                panic!("`dashboard` parses as the dashboard command");
+            };
+            (args.last, args.cost_last, args.standup_last)
+        };
+
+        // Each flag moves its own window and neither of the others.
+        let (last, cost, standup) = windows(&["--cost-last", "4w"]);
+        assert_eq!(cost.delta(), TimeDelta::weeks(4));
+        assert_eq!(last.to_string(), "30d");
+        assert_eq!(standup.to_string(), DEFAULT_STANDUP_WINDOW);
+
+        let (last, cost, standup) = windows(&["--standup-last", "48h"]);
+        assert_eq!(standup.delta(), TimeDelta::hours(48));
+        assert_eq!(last.to_string(), "30d");
+        assert_eq!(cost.to_string(), DEFAULT_COST_WINDOW);
+
+        // All three at once, each keeping the spelling it was typed in so provenance can echo it.
+        let (last, cost, standup) =
+            windows(&["--last", "14d", "--cost-last", "2w", "--standup-last", "3d"]);
+        assert_eq!(last.to_string(), "14d");
+        assert_eq!(cost.to_string(), "2w");
+        assert_eq!(standup.to_string(), "3d");
+
+        for flag in ["--cost-last", "--standup-last"] {
+            for bad in ["", "d", "30", "30m", "0d", "-1d", "30days", "5s"] {
+                assert!(
+                    Cli::try_parse_from(["qanungo", "dashboard", flag, bad]).is_err(),
+                    "{flag} {bad:?} must not parse",
+                );
+            }
+            for good in ["12h", "30d", "12w"] {
+                assert!(
+                    Cli::try_parse_from(["qanungo", "dashboard", flag, good]).is_ok(),
+                    "{flag} {good} is a window",
+                );
+            }
+        }
+
+        // And they belong to the dashboard alone: the single-lane commands each have one window.
+        for command in ["report", "cost", "standup"] {
+            assert!(Cli::try_parse_from(["qanungo", command, "--cost-last", "4w"]).is_err());
+            assert!(Cli::try_parse_from(["qanungo", command, "--standup-last", "3d"]).is_err());
+        }
     }
 
     /// A routable bind parses — that is the tailnet case, and refusing it here would be refusing

@@ -1,16 +1,48 @@
-//! The dashboard's payload: the coaching lane's own numbers, as JSON.
+//! The dashboard's payload: three lanes' own numbers, as JSON.
 //!
 //! # The redaction line (hard), restated for a served surface
 //!
-//! This payload carries **lane scores, rule ids, counts, rendered aggregates, archive-stated
-//! identifiers, tool names, evidence anchors, and `sha256` content hashes — nothing else**. No
-//! transcript text, no summary prose, no command strings, no error text, no file paths, not
-//! truncated and not in evidence.
+//! The line this module holds is **not one sentence any more**, because the page is no longer one
+//! lane. It is three, and saying so is the honest version:
 //!
-//! It is the same line [`crate::report`] holds and it is held the same way: by *construction*.
-//! Every field below is read off a [`Folded`](crate::command::Folded), whose types have already
-//! reduced a transcript to counts, timestamps, locators, and a digest — the fold drops content
-//! before this module can see it, so there is no string here to filter.
+//! - The **coaching** section carries lane scores, rule ids, counts, rendered aggregates,
+//!   archive-stated identifiers, tool names, evidence anchors, and `sha256` content hashes.
+//! - The **cost** section carries token counts, message counts, dollars, and the model, modifier,
+//!   and repository identifiers the archive itself recorded, clamped.
+//! - Neither of those two carries a byte of transcript text. Both hold that by *construction*, the
+//!   way [`crate::report`] and [`crate::cost_report`] do: every field is read off a fold whose
+//!   types have already reduced a transcript to counts, timestamps, locators, and digests, so
+//!   there is no string in either to filter.
+//! - The **standup** section carries prose somebody typed into a terminal — and carries it
+//!   *scrubbed*, which is a different claim from carrying none. See below.
+//!
+//! ## The standup section, and why it is not an exception
+//!
+//! [`crate::standup`] scrubs on the way *into* its own types, so a
+//! [`crate::command::FoldedStandup`] holds no pre-scrub string at all — the parsed
+//! archive record is a local of [`fold_standup`](crate::command::fold_standup) and is dropped
+//! before it returns. This module therefore has nothing unscrubbed in scope to serialize by
+//! mistake, exactly as [`crate::standup_report`] has nothing unscrubbed to render by mistake. The
+//! two surfaces are the same guarantee reached the same way, and the redaction markers travel with
+//! the text so a reader can see the scrub fired.
+//!
+//! What this module must *not* do is re-scrub. A second redactor call here would be a second place
+//! the posture could drift from the one the process was launched with, and a section whose text had
+//! been through two passes would report counts that matched neither.
+//!
+//! A fixture archive stuffed with canary strings — including planted credentials in a `summary.md`
+//! — is serialized through this module in `tests/dashboard.rs`, so a field that started carrying
+//! unscrubbed text fails a test rather than reaching a browser.
+//!
+//! ## The copilot rule, carried onto the wire
+//!
+//! [`crate::cost`]'s honesty rule is that Copilot records output tokens and nothing else, and its
+//! billing regime is not recoverable from a transcript — so it gets volumes and **no dollars, no
+//! credit estimate, no premium-request count**. That rule is a property of the *payload* here and
+//! not of the page: the copilot rows carry no money-shaped field at all, and there is no blended
+//! total anywhere that would hide the split behind one number. A page cannot render a dollar figure
+//! it was never handed, which is a stronger guarantee than a page that was handed one and chose
+//! well. `tests/dashboard.rs` pins it over the wire.
 //!
 //! An **anchor is not content**: a locator, a record number, a line number, a timestamp, and a tool
 //! name — schema metadata, and the one verbatim string decision 9 blessed for an aggregate surface.
@@ -22,10 +54,6 @@
 //! payload still carries none, but the surface it belongs to does, and a page that claimed
 //! otherwise would be inviting a reader to trust a control it had stopped exercising.
 //!
-//! A fixture archive stuffed with canary strings is serialized through this module in
-//! `tests/dashboard.rs`, so a field that started carrying transcript text fails a test rather than
-//! reaching a browser.
-//!
 //! **No raw Patwari links, anywhere.** Patwari serves unredacted blobs and never redacts, so a
 //! deep link from this page to an artifact would hand any tailnet device the whole transcript —
 //! the correction the 2026-08-24 grilling made to qanungo #5. The archive's base URL appears once,
@@ -36,33 +64,76 @@
 //! # It computes nothing
 //!
 //! Every number here was computed by [`fold_coaching`](crate::command::fold_coaching),
-//! [`rules::evaluate`](crate::rules::evaluate), and [`Scorecard::fold`] — the same three calls
-//! `qanungo report` makes, on the same window pair. This module chooses a shape and a key name; it
-//! does not choose a value. The arrow rules in particular are not re-derived: a per-harness trend
-//! is [`Trend::between`] and a fleet trend is [`Blend::comparable`](crate::scoring::Blend::comparable),
-//! the same two functions the Markdown table draws its `▲` from.
+//! [`fold_cost`](crate::command::fold_cost), and [`fold_standup`](crate::command::fold_standup) —
+//! the same three calls `qanungo report`, `qanungo cost`, and `qanungo standup` make, on the same
+//! windows. This module chooses a shape and a key name; it does not choose a value.
+//!
+//! Not one arithmetic here is this module's own. The arrow rules are [`Trend::between`] and
+//! [`Blend::comparable`](crate::scoring::Blend::comparable), the same two functions the Markdown
+//! table draws its `▲` from. The cost delta is the same subtraction [`crate::cost_report`] renders,
+//! drawn under the same two refusals — no comparison window at all, and a comparison window that
+//! priced nothing are different facts and both are stated. What caching saved is
+//! [`PricedTokens::cache_saving`]. The row orderings are the CLI's orderings, most expensive first,
+//! because the reason to read a cost table is to find where the money went and that reason does not
+//! change with the medium. Every rendered figure comes out of [`crate::format`] beside its raw
+//! value, so a second implementation of "how a dollar reads" cannot drift into the JavaScript.
+//!
+//! # Three lanes, three windows, one generation
+//!
+//! The sections do not share a window and must not be made to: a coaching score wants a month, a
+//! bill wants a quarter, a standup wants a week. [`Windows`] carries all three, each labelled in
+//! its own section and again in provenance, so no reader has to guess which span a number is a
+//! statement about.
+//!
+//! They do share a **generation**. One refresh folds all three and publishes one document, so a
+//! reader can never see a cost section from one fold beside a standup section from another — a
+//! torn view across lanes is impossible by construction rather than unlikely by timing. That is the
+//! whole reason this is one payload built in one call: see [`crate::dashboard_server`].
+//!
+//! # One route, measured
+//!
+//! `/api/data` stays the single payload. Against production on 2026-08-25 it is **744 KiB**:
+//! standup 529 KiB (71%), findings-with-anchors 195 KiB (26%), cost 15 KiB (2%), everything else
+//! under 6 KiB. That is 4.6x the V1 payload, and the standup section is essentially all of the
+//! growth — 100 sessions of prose, which is the same 353 KiB `qanungo standup --last 7d` prints.
+//!
+//! Splitting the standup onto its own route was the obvious alternative and is not worth what it
+//! costs. The saving is one 744 KiB fetch per refresh interval becoming one 215 KiB fetch plus a
+//! second one when a reader scrolls — about 2.5 kbit/s of sustained tailnet traffic either way, on
+//! a page that renders every section on load anyway. The price is a second route, a second set of
+//! atomicity tests, and — the real objection — a page that can hold two sections fetched at
+//! different generations, which is the exact failure this slice is arranged against. Keeping the
+//! generation honest across two routes is possible (both would read one [`Refreshed`] snapshot) but
+//! it is a guarantee held by care where it is currently held by there being nothing to get wrong.
+//!
+//! The number to watch is the standup window: `--standup-last 30d` would put this near 2 MiB. If it
+//! goes there, the answer is still not a split — it is that a served narrative of 400 sessions is
+//! not a thing anybody reads, and the section should bound what it renders and say that it did.
 //!
 //! # What this slice leaves out
 //!
-//! The standup and cost views over folds that already ship, scope selection by repository and
-//! harness, the timeline, and the 7×24 heatmap — the last blocked on munshi#77's local-offset pull,
-//! because UTC misplaces every late-night claim the view exists to make. Each is a later slice over
-//! this same payload, not a change to it.
+//! Scope selection by repository and harness, the timeline, and the 7×24 heatmap — the last blocked
+//! on munshi#77's local-offset pull, because UTC misplaces every late-night claim the view exists to
+//! make. Each is a later slice over this same payload, not a change to it.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::cli::{Refresh, Window};
-use crate::command::Folded;
+use crate::command::{Folded, FoldedCost, FoldedStandup};
+use crate::cost::{CopilotTokens, CostTotals, Flagged, PricedTokens, TokenTally};
 use crate::evidence::{self, EventAnchor, EvidenceIndex};
 use crate::format;
 use crate::metrics::{SessionMetrics, Totals};
-use crate::redaction::{PATTERN_REVISION, Redactor};
-use crate::report::{self, stamp};
+use crate::pricing::PRICE_TABLE_REVISION;
+use crate::redaction::{PATTERN_REVISION, RedactionReport, Redactor};
+use crate::report::{self, SkippedNote, stamp};
 use crate::rules::Finding;
 use crate::scoring::{Lane, LaneScore, Scorecard, Trend};
+use crate::standup::{RolledUp, StandupSession};
 
 /// What the refresh loop knows and the fold does not: which run this is, when it landed, and
 /// whether the last attempt to take a new one failed.
@@ -117,58 +188,477 @@ pub fn evidence_index(folded: &Folded) -> EvidenceIndex {
     index
 }
 
-/// Builds the served JSON document.
+/// The three windows one refresh folds.
 ///
-/// One call per refresh, never per request: the body is serialized once and handed to every reader
-/// as bytes, so a hundred open tabs cost one fold and one serialization between them.
-///
-/// The `redactor` does two things. It is **stated** in the provenance block, because a page that
-/// offers to expand evidence has to say which scrub stands behind the expansion — an answer fixed at
-/// launch and identical for every reader. And it scrubs the one archive-written string this document
-/// carries onto its evidence controls, the tool name on an anchor ([`anchor_value`]). Everything
-/// else here was already counts, timestamps, and digests before this module could see it.
-pub fn payload(
-    window: &Window,
-    refresh: &Refresh,
-    folded: &Folded,
-    refreshed: Refreshed,
-    redactor: &Redactor,
-) -> Value {
-    // The same two questions the report asks in the same order: is there a comparison window at
-    // all, and if so what did it score? A window too long to place an equal-length one before it
-    // has no `before`, and therefore no arrow anywhere on the page.
-    let comparison_opens_at = folded
-        .compared
-        .then(|| window.comparison_opens_at(folded.generated_at))
-        .flatten();
-    let now = Scorecard::fold(&folded.sessions);
-    let before = comparison_opens_at.map(|_| Scorecard::fold(&folded.previous));
-    let columns = report::harness_columns(&now, before.as_ref());
-    let by_hash: BTreeMap<&str, &SessionMetrics> = folded
-        .sessions
-        .iter()
-        .map(|session| (session.source_hash.as_str(), session))
-        .collect();
+/// A type rather than three arguments because they travel together everywhere — the refresh loop
+/// holds them, the payload labels each section with one, and provenance echoes all three — and
+/// three bare [`Window`]s in a row is exactly the signature where two of them get swapped and every
+/// test still passes.
+#[derive(Debug, Clone)]
+pub struct Windows {
+    /// What the lane scores and the findings are taken over. `--last`, default `30d`.
+    pub coaching: Window,
+    /// What the bill covers. `--cost-last`, default `12w`.
+    pub cost: Window,
+    /// What the narrative covers. `--standup-last`, default `7d`.
+    pub standup: Window,
+}
 
+/// Everything one served document is built from: three folds, the windows they were taken over,
+/// and the three facts only a long-lived process has.
+///
+/// A struct with a [`Payload::build`] rather than a function of eight arguments, on the same
+/// reasoning [`crate::report::Report`] and [`crate::cost_report::CostReport`] are structs with a
+/// `render` — and for one reason more, which is that every field here is somebody else's output.
+/// Naming them at the call site is what keeps the cost fold from being handed to the standup
+/// section by a caller counting positions.
+pub struct Payload<'a> {
+    pub windows: &'a Windows,
+    pub refresh: &'a Refresh,
+    pub coaching: &'a Folded,
+    pub cost: &'a FoldedCost,
+    pub standup: &'a FoldedStandup,
+    /// Wall-time of the three folds together — the number that answers "what does a refresh of this
+    /// page actually cost".
+    ///
+    /// Measured rather than added, even though against production it lands within a tenth of a
+    /// second of the sum of the three lanes' own syncs and folds (45.4 s warm, 2026-08-25). It is
+    /// measured because *whether* it equals that sum is a fact about the mirror that can change: the
+    /// blob cache already spares the transfers, and a cursor protocol or a listing cache would start
+    /// sparing the per-session requests that currently dominate. A footer that added the parts would
+    /// keep reporting the old answer straight through the change worth noticing.
+    pub folds_elapsed: Duration,
+    pub refreshed: Refreshed,
+    pub redactor: &'a Redactor,
+}
+
+impl Payload<'_> {
+    /// Builds the served JSON document.
+    ///
+    /// One call per refresh, never per request: the body is serialized once and handed to every
+    /// reader as bytes, so a hundred open tabs cost one fold and one serialization between them.
+    ///
+    /// The `redactor` does two things here, and neither of them is scrubbing the standup section —
+    /// which arrives already scrubbed, by the fold, with the counts that say so. It is **stated** in
+    /// the provenance block, because a page that renders verbatim has to say which scrub stands
+    /// behind it, and that answer is fixed at launch and identical for every reader. And it scrubs
+    /// the one archive-written string the coaching section puts onto its evidence controls, the tool
+    /// name on an anchor (see `anchor_value` below).
+    /// The coaching section keeps the **top level** it had when it was the whole payload —
+    /// `window`, `sessions`, `lanes`, `findings` — rather than being moved under a `coaching` key
+    /// beside its two new siblings. Symmetry is not worth the cost here: nesting it would break
+    /// every reader of the V1 payload to buy a shape nobody reads twice, and the duplication that
+    /// would keep both working is a second copy of the largest section in the document.
+    pub fn build(&self) -> Value {
+        let mut document = self.coaching_section();
+        let fields = document
+            .as_object_mut()
+            .expect("the coaching section is an object");
+        fields.insert("cost".to_owned(), self.cost_section());
+        fields.insert("standup".to_owned(), self.standup_section());
+        fields.insert("provenance".to_owned(), self.provenance());
+        document
+    }
+
+    /// The coaching lane: the window pair, the five lanes, and the findings under them.
+    fn coaching_section(&self) -> Value {
+        let window = &self.windows.coaching;
+        let folded = self.coaching;
+        // The same two questions the report asks in the same order: is there a comparison window at
+        // all, and if so what did it score? A window too long to place an equal-length one before it
+        // has no `before`, and therefore no arrow anywhere on the page.
+        let comparison_opens_at = folded
+            .compared
+            .then(|| window.comparison_opens_at(folded.generated_at))
+            .flatten();
+        let now = Scorecard::fold(&folded.sessions);
+        let before = comparison_opens_at.map(|_| Scorecard::fold(&folded.previous));
+        let columns = report::harness_columns(&now, before.as_ref());
+        let by_hash: BTreeMap<&str, &SessionMetrics> = folded
+            .sessions
+            .iter()
+            .map(|session| (session.source_hash.as_str(), session))
+            .collect();
+
+        json!({
+            "window": {
+                "last": window.to_string(),
+                "opens_at": stamp(window.opens_at(folded.generated_at)),
+                "comparison_opens_at": comparison_opens_at.map(stamp),
+                "generated_at": stamp(folded.generated_at),
+                "compared": folded.compared,
+            },
+            "sessions": sessions_value(folded),
+            "lanes": Lane::ALL
+                .iter()
+                .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns))
+                .collect::<Vec<_>>(),
+            "findings": folded
+                .findings
+                .iter()
+                .map(|finding| finding_value(finding, &by_hash, self.redactor))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The cost lane, over its own window: what was spent, on what, where, and what the fold
+    /// refused to turn into money.
+    fn cost_section(&self) -> Value {
+        let window = &self.windows.cost;
+        let folded = self.cost;
+        let totals = &folded.totals;
+        json!({
+            "window": {
+                "last": window.to_string(),
+                "opens_at": stamp(window.opens_at(folded.generated_at)),
+                "comparison_opens_at": folded
+                    .previous
+                    .as_ref()
+                    .and_then(|_| window.comparison_opens_at(folded.generated_at))
+                    .map(stamp),
+                "generated_at": stamp(folded.generated_at),
+            },
+            "sessions": {
+                "priced": totals.priceable_sessions,
+                "token_only": totals.token_only_sessions,
+                "no_signal": totals
+                    .no_signal_sessions
+                    .iter()
+                    .map(|(agent, count)| json!({
+                        "source_agent": format::identifier(agent),
+                        "sessions": count,
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+            "priced": priced_total_value(totals),
+            "by_model": by_model_value(totals),
+            "by_repository": by_repository_value(totals),
+            "caching": caching_value(&totals.priced),
+            "comparison": self.cost_comparison(),
+            "copilot": copilot_value(totals),
+            "flagged": flagged_value(&totals.flagged),
+            "records_read": totals.records_read,
+            "duplicate_records": totals.duplicate_records,
+            "price_table_revision": PRICE_TABLE_REVISION,
+            "gaps": gaps_value(&folded.skipped),
+        })
+    }
+
+    /// The window-over-window move on the bill, under the CLI's own two refusals.
+    ///
+    /// Three states, because collapsing any two of them would be a page reporting the archive's
+    /// shape as spending: no comparison window was asked for at all; one was, and priced nothing;
+    /// or both windows priced something and there is a real delta to draw. `▲` is more money, which
+    /// is a direction and not a verdict — the page says so beside it.
+    fn cost_comparison(&self) -> Value {
+        let folded = self.cost;
+        let (Some(previous), Some(opens_at)) = (
+            folded.previous.as_ref(),
+            self.windows.cost.comparison_opens_at(folded.generated_at),
+        ) else {
+            return json!({ "state": "no-window" });
+        };
+        if !previous.priced_anything() {
+            return json!({
+                "state": "nothing-priced",
+                "opens_at": stamp(opens_at),
+            });
+        }
+        let now = folded.totals.priced.dollars;
+        let was = previous.priced.dollars;
+        json!({
+            "state": "compared",
+            "opens_at": stamp(opens_at),
+            "was": was,
+            "was_rendered": format::dollars(was),
+            "was_sessions": previous.priceable_sessions,
+            "delta": now - was,
+            "delta_rendered": format::dollars((now - was).abs()),
+            // The glyph the coaching lane's arrows use, chosen the same way, so one page does not
+            // spell "more" two ways. Equality is exact on purpose: two windows that priced the same
+            // float to the cent still moved by nothing.
+            "direction": if now > was {
+                "up"
+            } else if now < was {
+                "down"
+            } else {
+                "flat"
+            },
+            "glyph": if now > was {
+                "▲"
+            } else if now < was {
+                "▼"
+            } else {
+                "="
+            },
+        })
+    }
+
+    /// The standup lane, over its own window: the archive's own words, as the fold scrubbed them.
+    fn standup_section(&self) -> Value {
+        let window = &self.windows.standup;
+        let folded = self.standup;
+        let standup = &folded.standup;
+        json!({
+            "window": {
+                "last": window.to_string(),
+                "opens_at": stamp(window.opens_at(folded.generated_at)),
+                "generated_at": stamp(folded.generated_at),
+            },
+            "sessions": standup.sessions,
+            "repositories_narrated": standup.repositories_narrated(),
+            "repositories": standup
+                .repositories
+                .iter()
+                .map(|group| json!({
+                    "repository": group.repository,
+                    "sessions": group
+                        .sessions
+                        .iter()
+                        .map(standup_session_value)
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+            "decisions": rolled_up_value(&standup.decisions),
+            "open_items": rolled_up_value(&standup.open_items),
+            "gaps": gaps_value(&standup.gaps),
+            "redaction": redaction_value(&standup.redaction),
+        })
+    }
+}
+
+/// The window's bill: the headline, and the sample behind it.
+///
+/// Dollars arrive raw *and* rendered, as every figure in this payload does — [`crate::format`] owns
+/// how money reads (to the cent, grouped, and `<$0.01` rather than `$0.00` for real spend below
+/// one), and a second implementation of that in JavaScript would drift from the cost report this
+/// section claims to be a view of.
+fn priced_total_value(totals: &CostTotals) -> Value {
     json!({
-        "window": {
-            "last": window.to_string(),
-            "opens_at": stamp(window.opens_at(folded.generated_at)),
-            "comparison_opens_at": comparison_opens_at.map(stamp),
-            "generated_at": stamp(folded.generated_at),
-            "compared": folded.compared,
-        },
-        "sessions": sessions_value(folded),
-        "lanes": Lane::ALL
-            .iter()
-            .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns))
+        "priced_anything": totals.priced_anything(),
+        "dollars": totals.priced.dollars,
+        "dollars_rendered": format::dollars(totals.priced.dollars),
+        "sessions": totals.priceable_sessions,
+        "messages": totals.priced.tokens.messages,
+        "fast_messages": totals.priced.fast_messages,
+        "tokens": tally_value(&totals.priced.tokens),
+    })
+}
+
+/// One token tally, every category the fold counts, raw beside rendered.
+///
+/// `thinking` is carried and is deliberately *not* a category: it is a share of `output` and is
+/// already inside it, so a reader adding the columns must not find it there twice. The key is named
+/// `thinking_of_output` to say so on the wire rather than in a comment nobody serves.
+fn tally_value(tally: &TokenTally) -> Value {
+    let rendered = |count: u64| json!({ "tokens": count, "rendered": format::tokens(count) });
+    json!({
+        "total": rendered(tally.total()),
+        "input": rendered(tally.input),
+        "output": rendered(tally.output),
+        "cache_write_5m": rendered(tally.cache_write_5m),
+        "cache_write_1h": rendered(tally.cache_write_1h),
+        "cache_write_untiered": rendered(tally.cache_write_untiered),
+        "cache_read": rendered(tally.cache_read),
+        "thinking_of_output": rendered(tally.thinking),
+    })
+}
+
+/// Where the money went by model, most expensive first — the CLI's own ordering, because the reason
+/// to read this table is the same reason in both media.
+///
+/// Model ids are the archive's strings and go through [`format::identifier`] exactly as they do on
+/// the way into the Markdown table, for the reason that clamp exists: a manifest states whatever it
+/// likes, and a served page is a rendering surface a peer does not get to choose characters on.
+fn by_model_value(totals: &CostTotals) -> Value {
+    let mut rows: Vec<_> = totals.by_model.iter().collect();
+    rows.sort_by(|(left_model, left), (right_model, right)| {
+        right
+            .dollars
+            .total_cmp(&left.dollars)
+            .then_with(|| left_model.cmp(right_model))
+    });
+    rows.into_iter()
+        .map(|(model, priced)| {
+            let mut row = priced_row_value(priced);
+            row["model"] = json!(format::identifier(model));
+            row
+        })
+        .collect()
+}
+
+/// The same money, cut by the repository the archive recorded. A session captured outside a
+/// checkout has no repository and is its own row: `repository` is `null` there rather than being
+/// folded into somebody else's, exactly as the report gives it its own `(no repository)` line.
+fn by_repository_value(totals: &CostTotals) -> Value {
+    let mut rows: Vec<_> = totals.by_repository.iter().collect();
+    rows.sort_by(|(left_name, left), (right_name, right)| {
+        right
+            .dollars
+            .total_cmp(&left.dollars)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    rows.into_iter()
+        .map(|(repository, priced)| {
+            let mut row = priced_row_value(priced);
+            row["repository"] = json!(repository.as_deref().map(format::identifier));
+            row
+        })
+        .collect()
+}
+
+/// The columns every priced row carries, whatever it is a row of.
+fn priced_row_value(priced: &PricedTokens) -> Value {
+    json!({
+        "messages": priced.tokens.messages,
+        "fast_messages": priced.fast_messages,
+        "dollars": priced.dollars,
+        "dollars_rendered": format::dollars(priced.dollars),
+        "tokens": tally_value(&priced.tokens),
+    })
+}
+
+/// What the prompt cache actually saved: the difference between reading tokens back and sending
+/// them again.
+///
+/// `null` when nothing was read from the cache — an absent saving is a different statement from a
+/// saving of zero, and a page showing `$0.00 saved` over a window with no cache reads would be
+/// answering a question nobody asked.
+fn caching_value(priced: &PricedTokens) -> Value {
+    if priced.tokens.cache_read == 0 {
+        return Value::Null;
+    }
+    json!({
+        "read": json!({
+            "tokens": priced.tokens.cache_read,
+            "rendered": format::tokens(priced.tokens.cache_read),
+        }),
+        "read_dollars": priced.cache_read_dollars,
+        "read_dollars_rendered": format::dollars(priced.cache_read_dollars),
+        "at_input_rate": priced.cache_read_at_input_rate,
+        "at_input_rate_rendered": format::dollars(priced.cache_read_at_input_rate),
+        "saving": priced.cache_saving(),
+        "saving_rendered": format::dollars(priced.cache_saving()),
+        // The writes that filled it are already inside the total, so the saving above is the read
+        // side alone and is not net of them. Carried so the page can say so rather than imply it.
+        "write_5m": priced.tokens.cache_write_5m,
+        "write_1h": priced.tokens.cache_write_1h,
+    })
+}
+
+/// Copilot's rows: token volumes, and **nothing money-shaped**.
+///
+/// There is no `dollars` key here, no estimate, no credit equivalent, and no place a page could
+/// find one — which is the whole of [`crate::cost::BillingSignal`]'s honesty rule, held on the wire
+/// rather than in a renderer. Copilot records one `outputTokens` figure per assistant message and a
+/// transcript does not say which of its two billing regimes the account was on, so `basis` says
+/// `tokens-only` and the page labels the table with it.
+fn copilot_value(totals: &CostTotals) -> Value {
+    let mut rows: Vec<(&Option<String>, &CopilotTokens)> = totals.copilot.iter().collect();
+    rows.sort_by(|(left_model, left), (right_model, right)| {
+        right
+            .output
+            .cmp(&left.output)
+            .then_with(|| left_model.cmp(right_model))
+    });
+    json!({
+        "basis": "tokens-only",
+        "rows": rows
+            .into_iter()
+            .map(|(model, volumes)| json!({
+                "model": model.as_deref().map(format::identifier),
+                "messages": volumes.messages,
+                "output": volumes.output,
+                "output_rendered": format::tokens(volumes.output),
+            }))
             .collect::<Vec<_>>(),
-        "findings": folded
-            .findings
+    })
+}
+
+/// Everything the fold counted and refused to turn into money, with the reason and the size — and
+/// each reason kept apart from the others, because a section that merged them could not say whether
+/// a gap was a placeholder, a missing price row, or a bug.
+fn flagged_value(flagged: &Flagged) -> Value {
+    json!({
+        "any": flagged.any(),
+        "synthetic": (flagged.synthetic.messages > 0).then(|| json!({
+            "messages": flagged.synthetic.messages,
+            "tokens": tally_value(&flagged.synthetic),
+        })),
+        "unpriced": flagged
+            .unpriced
             .iter()
-            .map(|finding| finding_value(finding, &by_hash, redactor))
+            .map(|(reason, tally)| json!({
+                // Already clamped: `Unpriced::detail` takes the clamp rather than applying one
+                // afterwards, so there is no version of this string with the archive's raw value in
+                // it for this module to forget to clean up.
+                "detail": reason.detail(format::identifier),
+                "messages": tally.messages,
+                "tokens": tally_value(tally),
+            }))
             .collect::<Vec<_>>(),
-        "provenance": provenance_value(window, refresh, folded, refreshed, redactor),
+        "untiered_cache_writes": (flagged.untiered_cache_writes > 0).then(|| json!({
+            "tokens": flagged.untiered_cache_writes,
+            "rendered": format::tokens(flagged.untiered_cache_writes),
+            "messages": flagged.untiered_cache_write_messages,
+        })),
+        "undeduplicatable": flagged.undeduplicatable.any().then(|| json!({
+            "records": flagged.undeduplicatable.records(),
+            "without_a_message_id": flagged.undeduplicatable.without_a_message_id,
+            "past_the_id_cap": flagged.undeduplicatable.past_the_id_cap,
+            "tokens": flagged.undeduplicatable.tokens,
+            "rendered": format::tokens(flagged.undeduplicatable.tokens),
+        })),
+    })
+}
+
+/// One session as the standup fold left it: **already scrubbed, and not scrubbed again here**.
+///
+/// Every string below came out of [`crate::standup::Standup::fold`], which ran the redactor into
+/// [`StandupSession`]. A second pass here would be a second posture to keep in step with the first
+/// and would double-count what fired; what this module owes instead is to serialize exactly what the
+/// fold produced, markers and all, so what a reader sees on the page is what the CLI would print.
+fn standup_session_value(session: &StandupSession) -> Value {
+    json!({
+        "source_hash": session.source_hash,
+        "archived_at": session.archived_at.map(stamp),
+        "branch": session.branch,
+        "title": session.title,
+        "goal": session.goal,
+        "work_completed": session.work_completed,
+        "decisions": session.decisions,
+        "open_items": session.open_items,
+    })
+}
+
+/// A rolled-up list across the whole window, each line attributed to the repository it came out of.
+fn rolled_up_value(lines: &[RolledUp]) -> Value {
+    lines
+        .iter()
+        .map(|line| json!({ "repository": line.repository, "text": line.text }))
+        .collect()
+}
+
+/// Sessions that contributed nothing, grouped by reason. The same shape all three lanes' gaps take,
+/// because they are the same [`SkippedNote`].
+fn gaps_value(notes: &[SkippedNote]) -> Value {
+    notes
+        .iter()
+        .map(|note| json!({ "count": note.count, "reason": note.reason }))
+        .collect()
+}
+
+/// What a scrub fired, as counts against pattern ids and nothing else.
+///
+/// The type has nothing else to render: a [`RedactionReport`] cannot carry what it matched, which is
+/// qanungo #8's counts-only invariant held by construction rather than by this function's restraint.
+fn redaction_value(report: &RedactionReport) -> Value {
+    json!({
+        "total": report.total(),
+        "fired": report
+            .fired()
+            .map(|(pattern, count)| json!({ "pattern": pattern.as_str(), "count": count }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -413,64 +903,132 @@ fn structural_value(session: &SessionMetrics) -> Value {
     })
 }
 
-/// What the numbers cost and what they may be compared against.
+/// What one lane's fold cost, in the footer's own quantities and the footer's own renderings.
 ///
-/// The instrumentation footer of every CLI run, plus the three facts only a long-lived process has:
-/// which refresh this is, when it landed, and whether the last attempt failed. Durations and byte
-/// counts arrive **pre-rendered** by [`crate::format`] alongside their raw values — the renderings
-/// are that module's job, and a second implementation of them in JavaScript would drift from the
-/// footer this block is supposed to mirror.
-fn provenance_value(
+/// Three lanes now, so the shape is a function rather than three copies of the same six keys —
+/// which also means a lane cannot come to report its sync in seconds while another reports it in
+/// milliseconds. Durations and byte counts arrive **pre-rendered** by [`crate::format`] alongside
+/// their raw values, because those renderings are that module's job and a second implementation of
+/// them in JavaScript would drift from the CLI footers this block mirrors.
+fn lane_cost_value(
     window: &Window,
-    refresh: &Refresh,
-    folded: &Folded,
-    refreshed: Refreshed,
-    redactor: &Redactor,
+    sync: &crate::sync::SyncStats,
+    fold_elapsed: Duration,
+    sessions_folded: usize,
+    bytes: u64,
 ) -> Value {
-    let instrumentation = &folded.instrumentation;
     json!({
         "window": window.to_string(),
-        "sessions_listed": instrumentation.sync.sessions_listed,
-        "sessions_folded": instrumentation.sessions_folded,
-        "comparison_sessions_folded": instrumentation.comparison_sessions_folded,
-        "fold": format::elapsed(instrumentation.fold_elapsed),
-        "fold_millis": u64::try_from(instrumentation.fold_elapsed.as_millis()).unwrap_or(u64::MAX),
-        "sync": format::elapsed(instrumentation.sync.elapsed),
-        "sync_millis": u64::try_from(instrumentation.sync.elapsed.as_millis()).unwrap_or(u64::MAX),
-        "bytes_folded": format::bytes(instrumentation.bytes_folded),
-        "bytes_transferred": format::bytes(instrumentation.sync.bytes_transferred),
-        "cache_hits": instrumentation.sync.cache_hits,
-        "cache_misses": instrumentation.sync.cache_misses,
-        "rule_pack": instrumentation.rule_pack.stamp(),
-        "rule_pack_digest": instrumentation.rule_pack.digest(),
-        "redaction_pattern_revision": PATTERN_REVISION,
-        // Text, never a link. See the module docs: Patwari serves unredacted blobs, so a browser
-        // deep-link into it is a transcript disclosure wearing a convenience.
-        "patwari_url": instrumentation.patwari_url,
-        "cache_root": instrumentation.cache_root.display().to_string(),
-        "refresh_interval": refresh.to_string(),
-        "refreshed_at": stamp(refreshed.at),
-        "generation": refreshed.generation,
-        "stale_since": refreshed.stale_since.map(stamp),
-        "gaps": folded
-            .skipped
-            .iter()
-            .map(|note| json!({ "count": note.count, "reason": note.reason }))
-            .collect::<Vec<_>>(),
-        // A machine-checkable statement of this *surface's* contract, not of this document's. The
-        // payload still carries no transcript text; the page it feeds can expand an anchor into a
-        // redacted excerpt, and that is verbatim rendering however narrow the span. It says so, and
-        // the block below says what stands behind it — which is the whole of qanungo #8's standing
-        // rule for a new rendering surface.
-        "renders_verbatim": true,
-        "redaction": {
-            // Launch-time, identical for every reader, and never a query string: a redaction
-            // control a browser could flip is a redaction bypass with a nicer name.
-            "secrets": redactor.redacts_secrets(),
-            "profanity": redactor.filters_profanity(),
-            "pattern_revision": PATTERN_REVISION,
-        },
+        "sessions_listed": sync.sessions_listed,
+        "sessions_folded": sessions_folded,
+        "fold": format::elapsed(fold_elapsed),
+        "fold_millis": u64::try_from(fold_elapsed.as_millis()).unwrap_or(u64::MAX),
+        "sync": format::elapsed(sync.elapsed),
+        "sync_millis": u64::try_from(sync.elapsed.as_millis()).unwrap_or(u64::MAX),
+        "bytes_folded": format::bytes(bytes),
+        "bytes_transferred": format::bytes(sync.bytes_transferred),
+        "cache_hits": sync.cache_hits,
+        "cache_misses": sync.cache_misses,
     })
+}
+
+impl Payload<'_> {
+    /// What the numbers cost and what they may be compared against.
+    ///
+    /// The instrumentation footer of every CLI run — now three of them, one per lane — plus the
+    /// three facts only a long-lived process has: which refresh this is, when it landed, and
+    /// whether the last attempt failed.
+    ///
+    /// The coaching lane's quantities stay at the top level of this block rather than moving under
+    /// `lanes.coaching`, for the same reason its section did: a footer a reader already knows how to
+    /// read should not be relocated to buy symmetry. The other two arrive beside it under
+    /// [`lane_cost_value`], and every one of the three names the window it was taken over, because
+    /// three folds over three spans in one document is exactly where an unlabelled number becomes a
+    /// wrong one.
+    fn provenance(&self) -> Value {
+        let instrumentation = &self.coaching.instrumentation;
+        let cost = &self.cost.instrumentation;
+        let standup = &self.standup.instrumentation;
+        // The cost lane's own two extras, added to the shared shape rather than given a second
+        // near-identical literal: it folds a window *pair*, and it counts records where the others
+        // count bytes.
+        let mut cost_lane = lane_cost_value(
+            &self.windows.cost,
+            &cost.sync,
+            cost.fold_elapsed,
+            cost.sessions_folded,
+            cost.bytes_folded,
+        );
+        cost_lane["comparison_sessions_folded"] = json!(cost.comparison_sessions_folded);
+        cost_lane["records_read"] = json!(cost.records_read);
+        json!({
+            "window": self.windows.coaching.to_string(),
+            "sessions_listed": instrumentation.sync.sessions_listed,
+            "sessions_folded": instrumentation.sessions_folded,
+            "comparison_sessions_folded": instrumentation.comparison_sessions_folded,
+            "fold": format::elapsed(instrumentation.fold_elapsed),
+            "fold_millis": u64::try_from(instrumentation.fold_elapsed.as_millis())
+                .unwrap_or(u64::MAX),
+            "sync": format::elapsed(instrumentation.sync.elapsed),
+            "sync_millis": u64::try_from(instrumentation.sync.elapsed.as_millis())
+                .unwrap_or(u64::MAX),
+            "bytes_folded": format::bytes(instrumentation.bytes_folded),
+            "bytes_transferred": format::bytes(instrumentation.sync.bytes_transferred),
+            "cache_hits": instrumentation.sync.cache_hits,
+            "cache_misses": instrumentation.sync.cache_misses,
+            // The two windows the slice added, each with what folding it cost. The cost lane folds a
+            // pair — its own window and the equal-length one before it — and the standup lane folds
+            // one, so `comparison_sessions_folded` appears on the first and not on the second.
+            "cost_window": self.windows.cost.to_string(),
+            "standup_window": self.windows.standup.to_string(),
+            "lanes": {
+                "cost": cost_lane,
+                "standup": lane_cost_value(
+                    &self.windows.standup,
+                    &standup.sync,
+                    standup.fold_elapsed,
+                    self.standup.standup.sessions,
+                    self.standup.standup.bytes_read,
+                ),
+            },
+            // What a refresh of the whole page costs, which is not the sum of the three lanes'
+            // syncs: they share one blob cache, so the second and third mirrors skip every transfer
+            // the first already made. Measured rather than added.
+            "refresh_elapsed": format::elapsed(self.folds_elapsed),
+            "refresh_elapsed_millis": u64::try_from(self.folds_elapsed.as_millis())
+                .unwrap_or(u64::MAX),
+            "rule_pack": instrumentation.rule_pack.stamp(),
+            "rule_pack_digest": instrumentation.rule_pack.digest(),
+            // Beside the rule pack, and for the same reason it is beside it in the cost report's own
+            // footer: two windows are comparable only when the table that priced them matches, and
+            // a page that showed a delta without saying which revision drew it would be inviting a
+            // comparison it cannot support.
+            "price_table_revision": PRICE_TABLE_REVISION,
+            "redaction_pattern_revision": PATTERN_REVISION,
+            // Text, never a link. See the module docs: Patwari serves unredacted blobs, so a browser
+            // deep-link into it is a transcript disclosure wearing a convenience.
+            "patwari_url": instrumentation.patwari_url,
+            "cache_root": instrumentation.cache_root.display().to_string(),
+            "refresh_interval": self.refresh.to_string(),
+            "refreshed_at": stamp(self.refreshed.at),
+            "generation": self.refreshed.generation,
+            "stale_since": self.refreshed.stale_since.map(stamp),
+            "gaps": gaps_value(&self.coaching.skipped),
+            // A machine-checkable statement of this *surface's* contract. It was already true of
+            // the excerpt route; the standup section makes it true of the document itself, which is
+            // a stronger claim and the one this flag now stands for. The block below says what
+            // scrub stands behind it — the whole of qanungo #8's standing rule for a rendering
+            // surface.
+            "renders_verbatim": true,
+            "redaction": {
+                // Launch-time, identical for every reader, and never a query string: a redaction
+                // control a browser could flip is a redaction bypass with a nicer name.
+                "secrets": self.redactor.redacts_secrets(),
+                "profanity": self.redactor.filters_profanity(),
+                "pattern_revision": PATTERN_REVISION,
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -484,11 +1042,15 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command};
+    use crate::cost::SessionCost;
+    use crate::cost_report::CostInstrumentation;
     use crate::evidence::SessionAnchors;
     use crate::metrics::{Activity, CommandChurn, Compactions, ToolOutcomes};
     use crate::report::Instrumentation;
     use crate::rules;
     use crate::scoring::RulePack;
+    use crate::standup::{RepositoryGroup, Standup};
+    use crate::standup_report::StandupInstrumentation;
     use crate::sync::SyncStats;
 
     fn at(value: &str) -> DateTime<Utc> {
@@ -590,13 +1152,186 @@ mod tests {
         }
     }
 
+    fn windows() -> Windows {
+        Windows {
+            coaching: window("7d"),
+            cost: cost_window("12w"),
+            standup: standup_window("7d"),
+        }
+    }
+
+    fn cost_window(spelling: &str) -> Window {
+        let Command::Dashboard(args) =
+            Cli::parse_from(["qanungo", "dashboard", "--cost-last", spelling]).command
+        else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        args.cost_last
+    }
+
+    fn standup_window(spelling: &str) -> Window {
+        let Command::Dashboard(args) =
+            Cli::parse_from(["qanungo", "dashboard", "--standup-last", spelling]).command
+        else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        args.standup_last
+    }
+
+    /// One claude-code session's worth of billing records, spelled as the 2.1.x envelope spells
+    /// them — the same fixture shape `crate::cost`'s own tests use, so the numbers below can be read
+    /// against the price table by eye.
+    fn cost_session(
+        model: &str,
+        message_id: &str,
+        usage: &str,
+        repository: Option<&str>,
+    ) -> SessionCost {
+        let record = format!(
+            r#"{{"type":"assistant","uuid":"{message_id}-r","timestamp":"2026-08-01T10:00:00.000Z","message":{{"role":"assistant","id":"{message_id}","model":"{model}","content":[{{"type":"text","text":"x"}}],"usage":{usage}}}}}"#
+        );
+        SessionCost {
+            source_hash: "0".repeat(64),
+            source_agent: "claude-code".to_owned(),
+            repository: repository.map(ToOwned::to_owned),
+            archived_at: Some(at("2026-08-10T00:00:00Z")),
+            fold: crate::cost::fold_cost(
+                munshi_transcript::Source::ClaudeCode,
+                2,
+                record.as_bytes(),
+            )
+            .expect("v2 is supported"),
+            bytes_folded: 4096,
+        }
+    }
+
+    fn cost_instrumentation() -> CostInstrumentation {
+        CostInstrumentation {
+            sync: SyncStats {
+                sessions_listed: 3,
+                cache_hits: 3,
+                cache_misses: 0,
+                bytes_transferred: 0,
+                elapsed: Duration::from_millis(240),
+            },
+            fold_elapsed: Duration::from_millis(11),
+            sessions_folded: 1,
+            comparison_sessions_folded: 1,
+            records_read: 12,
+            bytes_folded: 4096,
+            patwari_url: "http://127.0.0.1:8080".to_owned(),
+            cache_root: PathBuf::from("/tmp/qanungo"),
+        }
+    }
+
+    fn folded_cost(sessions: &[SessionCost], previous: Option<&[SessionCost]>) -> FoldedCost {
+        FoldedCost {
+            generated_at: at("2026-08-17T12:00:00Z"),
+            totals: CostTotals::fold(sessions),
+            previous: previous.map(CostTotals::fold),
+            skipped: Vec::new(),
+            instrumentation: cost_instrumentation(),
+        }
+    }
+
+    /// A million output tokens of Opus 5 and a million cached reads, in one repository.
+    fn priced_window() -> FoldedCost {
+        folded_cost(
+            &[cost_session(
+                "claude-opus-5",
+                "msg_1",
+                r#"{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":1000000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":100000}}"#,
+                Some("surdy/qanungo"),
+            )],
+            None,
+        )
+    }
+
+    fn standup_session(title: &str, goal: &str) -> StandupSession {
+        StandupSession {
+            source_hash: "a".repeat(64),
+            archived_at: Some(at("2026-08-16T09:00:00Z")),
+            branch: Some("main".to_owned()),
+            title: title.to_owned(),
+            goal: goal.to_owned(),
+            work_completed: vec!["Split the fold from the document.".to_owned()],
+            decisions: vec!["One payload, one generation.".to_owned()],
+            open_items: vec!["Measure the refresh against production.".to_owned()],
+        }
+    }
+
+    fn folded_standup(standup: Standup) -> FoldedStandup {
+        FoldedStandup {
+            generated_at: at("2026-08-17T12:00:00Z"),
+            standup,
+            instrumentation: StandupInstrumentation {
+                sync: SyncStats {
+                    sessions_listed: 2,
+                    cache_hits: 1,
+                    cache_misses: 1,
+                    bytes_transferred: 2048,
+                    elapsed: Duration::from_millis(45),
+                },
+                fold_elapsed: Duration::from_millis(2),
+                redactor: Redactor::new(),
+                patwari_url: "http://127.0.0.1:8080".to_owned(),
+                cache_root: PathBuf::from("/tmp/qanungo"),
+            },
+        }
+    }
+
+    /// One narrated repository and one gap: enough shape for the section's own assertions, with the
+    /// real grouping path covered end to end in `tests/dashboard.rs`.
+    fn narrated_window() -> Standup {
+        Standup {
+            repositories: vec![RepositoryGroup {
+                repository: "surdy/qanungo".to_owned(),
+                sessions: vec![standup_session(
+                    "Serve the standup and cost views",
+                    "Present two folds that already ship.",
+                )],
+            }],
+            decisions: vec![RolledUp {
+                repository: "surdy/qanungo".to_owned(),
+                text: "One payload, one generation.".to_owned(),
+            }],
+            open_items: vec![RolledUp {
+                repository: "surdy/qanungo".to_owned(),
+                text: "Measure the refresh against production.".to_owned(),
+            }],
+            gaps: vec![SkippedNote {
+                count: 2,
+                reason: "claude-code: munshi wrote a placeholder summary here".to_owned(),
+            }],
+            redaction: RedactionReport::default(),
+            sessions: 1,
+            bytes_read: 4096,
+        }
+    }
+
+    /// The payload, from three folds a test chose.
+    fn build(coaching: Folded, cost: FoldedCost, standup: Standup, redactor: Redactor) -> Value {
+        Payload {
+            windows: &windows(),
+            refresh: &refresh(),
+            coaching: &coaching,
+            cost: &cost,
+            standup: &folded_standup(standup),
+            folds_elapsed: Duration::from_millis(370),
+            refreshed: refreshed(),
+            redactor: &redactor,
+        }
+        .build()
+    }
+
+    /// The coaching lane's own assertions, over a payload whose other two sections are the smallest
+    /// honest thing they can be.
     fn built(sessions: Vec<SessionMetrics>, previous: Vec<SessionMetrics>) -> Value {
-        payload(
-            &window("7d"),
-            &refresh(),
-            &folded(sessions, previous),
-            refreshed(),
-            &Redactor::new(),
+        build(
+            folded(sessions, previous),
+            folded_cost(&[], None),
+            Standup::default(),
+            Redactor::new(),
         )
     }
 
@@ -847,8 +1582,47 @@ mod tests {
     /// long-lived process has, and it states this module's own contract about itself.
     #[test]
     fn the_provenance_block_carries_the_footer_and_the_refresh() {
-        let payload = built(hygiene_window("claude-code", 20, 5), Vec::new());
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            priced_window(),
+            narrated_window(),
+            Redactor::new(),
+        );
         let provenance = &payload["provenance"];
+
+        // The two lanes the slice added, each with the window it was folded over and what folding
+        // it cost — beside the coaching lane's own quantities, which keep their place.
+        assert_eq!(provenance["cost_window"], "12w");
+        assert_eq!(provenance["standup_window"], "7d");
+        let cost = &provenance["lanes"]["cost"];
+        assert_eq!(cost["window"], "12w");
+        assert_eq!(cost["sync"], "240 ms");
+        assert_eq!(cost["fold"], "11 ms");
+        assert_eq!(cost["fold_millis"], 11);
+        assert_eq!(cost["sessions_folded"], 1);
+        assert_eq!(cost["comparison_sessions_folded"], 1);
+        assert_eq!(cost["records_read"], 12);
+        assert_eq!(cost["cache_hits"], 3);
+        let standup = &provenance["lanes"]["standup"];
+        assert_eq!(standup["window"], "7d");
+        assert_eq!(standup["sync"], "45 ms");
+        assert_eq!(standup["fold"], "2 ms");
+        assert_eq!(standup["sessions_folded"], 1);
+        assert_eq!(standup["bytes_folded"], "4.0 KiB");
+        assert_eq!(
+            standup["comparison_sessions_folded"],
+            Value::Null,
+            "a narrative folds one window; there is no arrow to draw",
+        );
+
+        // What a whole refresh costs, measured rather than summed: the three mirrors share one blob
+        // cache, so adding their syncs would over-report what the page actually pays.
+        assert_eq!(provenance["refresh_elapsed"], "370 ms");
+        assert_eq!(provenance["refresh_elapsed_millis"], 370);
+
+        // The price table sits beside the rule pack, because a delta is only comparable when the
+        // table that drew it matches — the same claim the rule-pack stamp makes about scores.
+        assert_eq!(provenance["price_table_revision"], PRICE_TABLE_REVISION);
         assert_eq!(provenance["window"], "7d");
         assert_eq!(provenance["sessions_folded"], 20);
         assert_eq!(provenance["fold"], "7 ms");
@@ -872,16 +1646,467 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The cost section
+    // -----------------------------------------------------------------------
+
+    /// The headline, the models behind it, and the repositories the money went to — the same three
+    /// answers `qanungo cost` prints, in the same order of most expensive first.
+    #[test]
+    fn the_cost_section_carries_the_total_the_models_and_the_repositories() {
+        let totals = folded_cost(
+            &[
+                cost_session(
+                    "claude-opus-5",
+                    "msg_1",
+                    r#"{"output_tokens":1000000,"cache_read_input_tokens":1000000}"#,
+                    Some("surdy/qanungo"),
+                ),
+                cost_session(
+                    "claude-sonnet-5",
+                    "msg_2",
+                    r#"{"output_tokens":1000000}"#,
+                    None,
+                ),
+            ],
+            None,
+        );
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            totals,
+            Standup::default(),
+            Redactor::new(),
+        );
+        let cost = &payload["cost"];
+
+        // 1M Opus output at $25 + 1M cache read at $0.50 + 1M Sonnet output at $10.
+        assert_eq!(cost["priced"]["priced_anything"], true);
+        assert_eq!(cost["priced"]["dollars_rendered"], "$35.50");
+        assert_eq!(cost["priced"]["sessions"], 2);
+        assert_eq!(cost["priced"]["messages"], 2);
+        assert_eq!(
+            cost["window"]["last"], "12w",
+            "its own window, not `--last`"
+        );
+
+        // Most expensive first, and the tokens beside the money in both raw and rendered form.
+        let models = cost["by_model"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["model"], "claude-opus-5");
+        assert_eq!(models[0]["dollars_rendered"], "$25.50");
+        assert_eq!(models[0]["tokens"]["output"]["tokens"], 1_000_000);
+        assert_eq!(models[0]["tokens"]["output"]["rendered"], "1.0M");
+        assert_eq!(models[1]["model"], "claude-sonnet-5");
+        assert_eq!(models[1]["dollars_rendered"], "$10.00");
+
+        // A session captured outside a checkout is its own row with a null name, never folded into
+        // a named repository's.
+        let repositories = cost["by_repository"].as_array().unwrap();
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0]["repository"], "surdy/qanungo");
+        assert_eq!(repositories[0]["dollars_rendered"], "$25.50");
+        assert_eq!(repositories[1]["repository"], Value::Null);
+        assert_eq!(repositories[1]["dollars_rendered"], "$10.00");
+
+        // What caching saved, priced against what sending the tokens again would have cost.
+        assert_eq!(cost["caching"]["read"]["rendered"], "1.0M");
+        assert_eq!(cost["caching"]["read_dollars_rendered"], "$0.50");
+        assert_eq!(cost["caching"]["at_input_rate_rendered"], "$5.00");
+        assert_eq!(cost["caching"]["saving_rendered"], "$4.50");
+
+        assert_eq!(cost["price_table_revision"], PRICE_TABLE_REVISION);
+    }
+
+    /// The lane's honesty rule, held on the wire rather than in a renderer: Copilot records output
+    /// tokens and nothing else, so its rows carry **no money-shaped field anywhere** and there is no
+    /// blended total that would hide the split behind one number. A page cannot render a dollar
+    /// figure it was never handed.
+    #[test]
+    fn copilot_rows_are_token_volumes_and_carry_no_money_anywhere() {
+        let transcript = r#"{"type":"assistant.message","timestamp":"2026-08-01T10:00:00.000Z","data":{"content":"one","messageId":"m1","model":"claude-opus-4.8","outputTokens":128}}"#;
+        let copilot = SessionCost {
+            source_agent: "copilot-cli".to_owned(),
+            fold: crate::cost::fold_cost(
+                munshi_transcript::Source::Copilot,
+                2,
+                transcript.as_bytes(),
+            )
+            .expect("v2 is supported"),
+            ..cost_session("unused", "unused", r#"{"output_tokens":0}"#, None)
+        };
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(&[copilot], None),
+            Standup::default(),
+            Redactor::new(),
+        );
+        let cost = &payload["cost"];
+
+        assert_eq!(cost["copilot"]["basis"], "tokens-only");
+        let rows = cost["copilot"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["model"], "claude-opus-4.8");
+        assert_eq!(rows[0]["messages"], 1);
+        assert_eq!(rows[0]["output"], 128);
+        assert_eq!(rows[0]["output_rendered"], "128");
+
+        // Not "the dollars are zero" — there is no key here that could carry one, at any depth.
+        assert_no_money(&cost["copilot"], "cost.copilot");
+
+        // And the window's own total is untouched by a copilot session: it says nothing was priced,
+        // rather than reporting a blended figure with copilot's tokens silently inside it.
+        assert_eq!(cost["priced"]["priced_anything"], false);
+        assert_eq!(cost["priced"]["dollars"], 0.0);
+        assert_eq!(cost["sessions"]["priced"], 0);
+        assert_eq!(cost["sessions"]["token_only"], 1);
+        assert!(cost["by_model"].as_array().unwrap().is_empty());
+        assert!(cost["by_repository"].as_array().unwrap().is_empty());
+    }
+
+    /// Asserts that no key under `value` is money-shaped and no string under it looks like a dollar
+    /// figure. Recursive, because a page reads leaves and the interesting place to smuggle a number
+    /// is inside a nested row rather than at the top of the block.
+    fn assert_no_money(value: &Value, path: &str) {
+        match value {
+            Value::Object(fields) => {
+                for (key, nested) in fields {
+                    for forbidden in ["dollar", "cost", "price", "credit", "spend", "usd"] {
+                        assert!(
+                            !key.to_ascii_lowercase().contains(forbidden),
+                            "{path}.{key} is money-shaped, and this block is tokens only",
+                        );
+                    }
+                    assert_no_money(nested, &format!("{path}.{key}"));
+                }
+            }
+            Value::Array(items) => {
+                for (index, nested) in items.iter().enumerate() {
+                    assert_no_money(nested, &format!("{path}[{index}]"));
+                }
+            }
+            Value::String(text) => assert!(
+                !text.contains('$'),
+                "{path} renders a dollar figure: {text:?}",
+            ),
+            Value::Number(_) | Value::Bool(_) | Value::Null => {}
+        }
+    }
+
+    /// The delta is drawn under the cost report's own two refusals, and both of them are states a
+    /// reader can tell apart: no comparison window was asked for at all, or one was and it priced
+    /// nothing. Neither is an arrow against zero.
+    #[test]
+    fn the_cost_delta_is_drawn_only_against_a_window_that_priced_something() {
+        let earlier = [cost_session(
+            "claude-sonnet-5",
+            "msg_0",
+            r#"{"output_tokens":1000000}"#,
+            None,
+        )];
+        let compared = folded_cost(
+            &[cost_session(
+                "claude-opus-5",
+                "msg_1",
+                r#"{"output_tokens":1000000}"#,
+                None,
+            )],
+            Some(&earlier),
+        );
+        let section = |cost: FoldedCost| {
+            build(
+                folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+                cost,
+                Standup::default(),
+                Redactor::new(),
+            )["cost"]["comparison"]
+                .clone()
+        };
+
+        // $25.00 this window against $10.00 before it.
+        let moved = section(compared);
+        assert_eq!(moved["state"], "compared");
+        assert_eq!(moved["direction"], "up");
+        assert_eq!(moved["glyph"], "▲");
+        assert_eq!(moved["was_rendered"], "$10.00");
+        assert_eq!(moved["delta_rendered"], "$15.00");
+        assert_eq!(moved["was_sessions"], 1);
+        assert!(moved["opens_at"].as_str().unwrap().ends_with('Z'));
+
+        // Spending less points the other way, and the glyph says so without calling it better.
+        let fell = section(folded_cost(
+            &earlier,
+            Some(&[cost_session(
+                "claude-opus-5",
+                "msg_1",
+                r#"{"output_tokens":1000000}"#,
+                None,
+            )]),
+        ));
+        assert_eq!(fell["direction"], "down");
+        assert_eq!(fell["glyph"], "▼");
+        assert_eq!(fell["delta_rendered"], "$15.00");
+
+        // A comparison window that priced nothing gets a state, never an arrow against zero.
+        let nothing = section(folded_cost(&earlier, Some(&[])));
+        assert_eq!(nothing["state"], "nothing-priced");
+        assert_eq!(nothing["delta"], Value::Null);
+
+        // And a window with no comparison window at all is a third state, not the second one.
+        let absent = section(folded_cost(&earlier, None));
+        assert_eq!(absent["state"], "no-window");
+        assert_eq!(absent["opens_at"], Value::Null);
+    }
+
+    /// Everything the fold counted and refused to price, each reason on its own line with its own
+    /// tokens — a section that merged them could not say whether a gap was a placeholder, a missing
+    /// price row, or a bug.
+    #[test]
+    fn the_cost_sections_flags_name_each_refusal_separately() {
+        let totals = folded_cost(
+            &[
+                cost_session("<synthetic>", "msg_1", r#"{"output_tokens":500}"#, None),
+                cost_session("claude-opus-9", "msg_2", r#"{"output_tokens":700}"#, None),
+                cost_session(
+                    "claude-opus-5",
+                    "msg_3",
+                    r#"{"input_tokens":10,"cache_creation_input_tokens":4096}"#,
+                    None,
+                ),
+            ],
+            None,
+        );
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            totals,
+            Standup::default(),
+            Redactor::new(),
+        );
+        let flagged = &payload["cost"]["flagged"];
+
+        assert_eq!(flagged["any"], true);
+        assert_eq!(flagged["synthetic"]["messages"], 1);
+        assert_eq!(flagged["synthetic"]["tokens"]["output"]["tokens"], 500);
+
+        let unpriced = flagged["unpriced"].as_array().unwrap();
+        assert_eq!(unpriced.len(), 1);
+        assert_eq!(unpriced[0]["messages"], 1);
+        assert!(
+            unpriced[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("no price row for model `claude-opus-9`"),
+            "{unpriced:?}",
+        );
+
+        // A write stated only as a total has no tier and therefore no rate: reported, never charged
+        // at an assumed one.
+        assert_eq!(flagged["untiered_cache_writes"]["tokens"], 4_096);
+        assert_eq!(flagged["untiered_cache_writes"]["rendered"], "4.1k");
+        assert_eq!(flagged["untiered_cache_writes"]["messages"], 1);
+
+        // Nothing was undeduplicatable here, and an absent flag is null rather than a row of zeroes
+        // a page would have to know to hide.
+        assert_eq!(flagged["undeduplicatable"], Value::Null);
+
+        // A clean window flags nothing at all, so the page can elide the whole block.
+        let clean = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            priced_window(),
+            Standup::default(),
+            Redactor::new(),
+        );
+        assert_eq!(clean["cost"]["flagged"]["any"], false);
+        assert_eq!(clean["cost"]["flagged"]["synthetic"], Value::Null);
+    }
+
+    /// A window that read nothing from the cache has no saving to report, and that is a different
+    /// statement from a saving of zero — so the block is absent rather than zeroed.
+    #[test]
+    fn the_caching_block_is_absent_when_nothing_was_read_from_the_cache() {
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(
+                &[cost_session(
+                    "claude-opus-5",
+                    "msg_1",
+                    r#"{"output_tokens":1000}"#,
+                    None,
+                )],
+                None,
+            ),
+            Standup::default(),
+            Redactor::new(),
+        );
+        assert_eq!(payload["cost"]["caching"], Value::Null);
+        assert_eq!(payload["cost"]["priced"]["priced_anything"], true);
+    }
+
+    /// A model id is the archive's string, and a served page is a rendering surface a peer does not
+    /// get to choose characters on — the same clamp the Markdown table's cells pass through.
+    #[test]
+    fn a_hostile_model_id_is_clamped_before_it_reaches_the_cost_section() {
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(
+                &[cost_session(
+                    "evil | model",
+                    "msg_1",
+                    r#"{"output_tokens":10}"#,
+                    Some("back`tick"),
+                )],
+                None,
+            ),
+            Standup::default(),
+            Redactor::new(),
+        );
+        let serialized = serde_json::to_string(&payload["cost"]).unwrap();
+        assert!(!serialized.contains("evil | model"), "{serialized}");
+        assert!(!serialized.contains("back`tick"), "{serialized}");
+        assert!(
+            serialized.contains(format::INVALID_IDENTIFIER),
+            "{serialized}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The standup section
+    // -----------------------------------------------------------------------
+
+    /// The section is the fold's own strings, arranged and not re-worded: the grouping, the
+    /// ordering, the rollups, and the gaps a reader would see in the Markdown.
+    #[test]
+    fn the_standup_section_is_the_folds_own_grouping_and_rollups() {
+        let standup = narrated_window();
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(&[], None),
+            standup.clone(),
+            Redactor::new(),
+        );
+        let section = &payload["standup"];
+
+        assert_eq!(section["window"]["last"], "7d", "its own window");
+        assert_eq!(section["sessions"], 1);
+        assert_eq!(section["repositories_narrated"], 1);
+
+        let group = &section["repositories"][0];
+        assert_eq!(group["repository"], "surdy/qanungo");
+        let served = &group["sessions"][0];
+        let session = &standup.repositories[0].sessions[0];
+        // Equal to the fold's strings, character for character. That is the whole claim this
+        // section makes: it does not re-scrub, re-word, or re-order what the fold produced.
+        assert_eq!(served["title"], session.title);
+        assert_eq!(served["goal"], session.goal);
+        assert_eq!(served["branch"], "main");
+        assert_eq!(served["source_hash"], session.source_hash);
+        assert_eq!(served["archived_at"], "2026-08-16T09:00:00Z");
+        assert_eq!(served["work_completed"], json!(session.work_completed));
+        assert_eq!(served["decisions"], json!(session.decisions));
+        assert_eq!(served["open_items"], json!(session.open_items));
+
+        assert_eq!(section["decisions"][0]["repository"], "surdy/qanungo");
+        assert_eq!(section["decisions"][0]["text"], standup.decisions[0].text);
+        assert_eq!(section["open_items"][0]["text"], standup.open_items[0].text);
+
+        // Gaps are the same shape all three lanes' gaps take, and are counted rather than dropped.
+        assert_eq!(section["gaps"][0]["count"], 2);
+        assert!(
+            section["gaps"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("placeholder"),
+        );
+
+        // A clean scrub is `0` and an empty list, not an absent block: "nothing matched" and "the
+        // scrub was off" are very different sentences, and provenance says which of the two this is.
+        assert_eq!(section["redaction"]["total"], 0);
+        assert!(section["redaction"]["fired"].as_array().unwrap().is_empty());
+    }
+
+    /// An empty window is a served section too: it says nothing was narrated rather than vanishing
+    /// and leaving a reader to guess whether the lane broke.
+    #[test]
+    fn an_unnarrated_window_still_serves_a_standup_section() {
+        let payload = built(hygiene_window("claude-code", 20, 5), Vec::new());
+        let section = &payload["standup"];
+        assert_eq!(section["sessions"], 0);
+        assert_eq!(section["repositories_narrated"], 0);
+        assert!(section["repositories"].as_array().unwrap().is_empty());
+        assert!(section["decisions"].as_array().unwrap().is_empty());
+        assert!(section["gaps"].as_array().unwrap().is_empty());
+        assert_eq!(section["window"]["last"], "7d");
+    }
+
+    /// What a scrub fired travels with the text, as counts against pattern ids and nothing else —
+    /// so a reader looking at a marker can see it was accounted for, and the type serialized here
+    /// has no shape in which it could carry the value it matched.
+    #[test]
+    fn the_standup_section_reports_what_the_scrub_fired_as_counts_only() {
+        let mut redaction = RedactionReport::default();
+        for _ in 0..3 {
+            redaction.absorb(
+                &Redactor::new()
+                    .scrub("ghp_0123456789012345678901234567890123456")
+                    .report,
+            );
+        }
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(&[], None),
+            Standup {
+                redaction,
+                ..narrated_window()
+            },
+            Redactor::new(),
+        );
+        let fired = &payload["standup"]["redaction"];
+        assert_eq!(fired["total"], 3);
+        assert_eq!(fired["fired"][0]["pattern"], "github-token");
+        assert_eq!(fired["fired"][0]["count"], 3);
+        assert!(
+            !serde_json::to_string(fired).unwrap().contains("ghp_"),
+            "a report cannot carry what it matched",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The whole document
+    // -----------------------------------------------------------------------
+
+    /// One refresh, one generation, one document. The three sections are built from three folds in
+    /// a single call, so there is no shape of this payload in which two of them came from different
+    /// refreshes — a torn view across lanes is unrepresentable rather than unlikely.
+    #[test]
+    fn the_three_sections_are_one_generation() {
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            priced_window(),
+            narrated_window(),
+            Redactor::new(),
+        );
+        for section in ["lanes", "cost", "standup"] {
+            assert!(!payload[section].is_null(), "{section} is served");
+        }
+        assert_eq!(payload["provenance"]["generation"], 3);
+        // Each section names the window it is a statement about, and the three differ — which is
+        // exactly why an unlabelled number here would be a wrong one.
+        assert_eq!(payload["window"]["last"], "7d");
+        assert_eq!(payload["cost"]["window"]["last"], "12w");
+        assert_eq!(payload["standup"]["window"]["last"], "7d");
+        assert_eq!(payload["provenance"]["window"], "7d");
+        assert_eq!(payload["provenance"]["cost_window"], "12w");
+        assert_eq!(payload["provenance"]["standup_window"], "7d");
+    }
+
     /// The posture a reader sees is the posture the process was started with — there is no third
     /// state and no per-request one.
     #[test]
     fn the_payload_states_the_redactor_the_process_was_launched_with() {
-        let raw = payload(
-            &window("7d"),
-            &refresh(),
-            &folded(hygiene_window("claude-code", 20, 5), Vec::new()),
-            refreshed(),
-            &Redactor::new().with_secrets(false).with_profanity(true),
+        let raw = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(&[], None),
+            Standup::default(),
+            Redactor::new().with_secrets(false).with_profanity(true),
         );
         assert_eq!(raw["provenance"]["redaction"]["secrets"], false);
         assert_eq!(raw["provenance"]["redaction"]["profanity"], true);
@@ -892,20 +2117,32 @@ mod tests {
     /// good numbers stay, dated by when they stopped being current.
     #[test]
     fn a_failing_refresh_dates_the_numbers_rather_than_hiding_them() {
-        let stale = payload(
-            &window("7d"),
-            &refresh(),
-            &folded(hygiene_window("claude-code", 20, 5), Vec::new()),
-            Refreshed {
+        let coaching = folded(hygiene_window("claude-code", 20, 5), Vec::new());
+        let cost = priced_window();
+        let standup = folded_standup(narrated_window());
+        let stale = Payload {
+            windows: &windows(),
+            refresh: &refresh(),
+            coaching: &coaching,
+            cost: &cost,
+            standup: &standup,
+            folds_elapsed: Duration::from_millis(370),
+            refreshed: Refreshed {
                 generation: 9,
                 at: at("2026-08-17T12:00:00Z"),
                 stale_since: Some(at("2026-08-17T11:30:00Z")),
             },
-            &Redactor::new(),
-        );
+            redactor: &Redactor::new(),
+        }
+        .build();
         assert_eq!(stale["provenance"]["stale_since"], "2026-08-17T11:30:00Z");
         assert_eq!(stale["lanes"].as_array().unwrap().len(), 5);
         assert_eq!(stale["sessions"]["folded"], 20);
+        // Every section keeps its numbers: a page whose refresh failed is out of date, not empty,
+        // and blanking two thirds of it would be hiding facts that are still true of the windows
+        // they were taken over.
+        assert_eq!(stale["cost"]["priced"]["dollars_rendered"], "$26.50");
+        assert_eq!(stale["standup"]["sessions"], 1);
     }
 
     /// A window too long to place an equal-length one before it has no comparison window, so the
@@ -914,12 +2151,11 @@ mod tests {
     fn a_window_with_no_comparison_says_so_and_draws_nothing() {
         let mut folded = folded(hygiene_window("claude-code", 20, 5), Vec::new());
         folded.compared = false;
-        let payload = payload(
-            &window("7d"),
-            &refresh(),
-            &folded,
-            refreshed(),
-            &Redactor::new(),
+        let payload = build(
+            folded,
+            folded_cost(&[], None),
+            Standup::default(),
+            Redactor::new(),
         );
         assert_eq!(payload["window"]["compared"], false);
         assert_eq!(payload["window"]["comparison_opens_at"], Value::Null);

@@ -108,15 +108,15 @@
 //! qanungo dashboard --last 30d
 //! ```
 //!
-//! is the fourth lane and the first that is not a document. It is the coaching report's own
-//! numbers, served: five score cards, the findings under them, a provenance footer, and nothing
-//! else. Four properties are the whole of it:
+//! is the fourth lane and the first that is not a document. It is the other three lanes' own
+//! numbers, served: five score cards, the findings under them, the bill, the week's narrative, a
+//! provenance footer, and nothing else. Four properties are the whole of it:
 //!
-//! - **It is a presentation, not a computation.** [`command::fold_coaching`] is the same call
-//!   `report` makes, on the same window pair, and [`dashboard`] serializes the
-//!   [`command::Folded`] it returns instead of rendering it as Markdown. A dashboard with its own
-//!   fold would drift from the CLI beside it, and "the page and the terminal disagree about my
-//!   scores" is not a bug anybody can act on.
+//! - **It is a presentation, not a computation.** [`command::fold_coaching`],
+//!   [`command::fold_cost`], and [`command::fold_standup`] are the same three calls `report`,
+//!   `cost`, and `standup` make, and [`dashboard`] serializes what they return instead of rendering
+//!   it as Markdown. A dashboard with its own fold would drift from the CLI beside it, and "the page
+//!   and the terminal disagree about my scores" is not a bug anybody can act on.
 //! - **In memory, on a timer.** A long-lived process re-syncs and re-folds every `--refresh`,
 //!   swaps the served payload atomically, and pushes an SSE event so open pages re-fetch; a request
 //!   is a memcpy. Per the 2026-08-24 grilling, process memory is the "disposable materialization"
@@ -149,6 +149,30 @@
 //!   already be in the local cache, so no browser can induce archive traffic; only anchors the
 //!   current payload names resolve at all; and [`RedactionArgs`](cli::RedactionArgs) is read once
 //!   at startup, never per request. `--no-redact` on a routable bind gets its own very loud line.
+//!
+//! ## The standup-and-cost slice
+//!
+//! The page was one lane's numbers; it is now three. `--cost-last` (default `12w`) and
+//! `--standup-last` (default `7d`) join `--last` (default `30d`), each defaulting to what its own
+//! command defaults to, and one refresh folds all three. Four properties:
+//!
+//! - **Zero new computation, zero new rules.** `cost` and `standup` got the seam `report` got for
+//!   V1: [`command::fold_cost`] and [`command::fold_standup`] are the bodies those commands had,
+//!   and each command is now that call plus its renderer. Both documents are byte-for-byte what
+//!   they were.
+//! - **One generation, three sections.** The three folds happen in one call and publish one
+//!   [`dashboard::Payload`], so a reader can never see a bill from one refresh beside a standup from
+//!   another. A torn view across lanes is unrepresentable rather than unlikely.
+//! - **The redaction line is now three lines, and says so.** Coaching and cost carry no verbatim, by
+//!   construction, as their documents do. Standup carries prose scrubbed *by the fold* —
+//!   [`command::FoldedStandup`] holds no pre-scrub string for a surface to leak — and the served
+//!   section's strings are pinned equal to the fold's, so the page and `qanungo standup` cannot
+//!   disagree and a second scrub cannot creep in.
+//! - **Copilot's honesty rule rides the wire.** Copilot rows are token volumes with no money-shaped
+//!   field anywhere and no blended total: a page cannot render a dollar figure it was never handed.
+//!
+//! What remains: scope selection by repository and harness, the timeline, and the heatmap — the
+//! last still blocked on munshi#77's local-offset pull.
 
 pub mod cache;
 pub mod cli;
