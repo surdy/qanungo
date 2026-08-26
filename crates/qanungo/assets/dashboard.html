@@ -2131,6 +2131,11 @@ function drawHeatmap(cells) {
   for (let day = 0; day < 7; day += 1) {
     for (let hour = 0; hour < 24; hour += 1) {
       const cell = byKey.get(day * 24 + hour);
+      // Presence is "a session began here", not the current measure's magnitude: on the
+      // active-hours measure a covered cell can read zero, and it must still show as a cell
+      // that work began in rather than as an empty slot. Its intensity still tracks the
+      // measure (the floor for a zero), so the reader never loses the started session.
+      const present = Boolean(cell) && cell.sessions > 0;
       const value = cell ? heatValue(cell) : 0;
       const x = HEATMAP.padLeft + hour * HEATMAP.cellWidth;
       const y = HEATMAP.padTop + day * HEATMAP.cellHeight;
@@ -2138,14 +2143,14 @@ function drawHeatmap(cells) {
       const label = shape("title");
       label.textContent = heatCellTitle(day, hour, cell);
       group.appendChild(label);
-      const rect = set(shape("rect", value > 0 ? "cell" : "cell empty"), {
+      const rect = set(shape("rect", present ? "cell" : "cell empty"), {
         x: x + HEATMAP.gap / 2,
         y: y + HEATMAP.gap / 2,
         width: HEATMAP.cellWidth - HEATMAP.gap,
         height: HEATMAP.cellHeight - HEATMAP.gap,
         rx: 3,
       });
-      if (value > 0) {
+      if (present) {
         rect.setAttribute(
           "fill-opacity",
           (HEATMAP.minInk + (1 - HEATMAP.minInk) * (value / max)).toFixed(3)
@@ -2194,7 +2199,7 @@ function heatmapTable(cells, series) {
   const cell = (value) => (heatMeasure === "sessions" ? String(value) : value.toFixed(1) + "h");
   const value = (part) => (heatMeasure === "sessions" ? part.sessions : part.seconds / 3600);
   const rows = cells
-    .filter((entry) => heatValue(entry) > 0)
+    .filter((entry) => entry.sessions > 0)
     .map((entry) => [
       WEEKDAYS[entry.weekday],
       hourRange(entry.hour),
@@ -2241,7 +2246,7 @@ function heatmapNote(heatmap, cells) {
 }
 
 function paintHeatmap(data, entry, column) {
-  const heatmap = entry ? entry.heatmap : data.heatmap;
+  const heatmap = scopeIsRepository(entry) ? entry.heatmap : data.heatmap;
   const series = timelineSeries(data, column);
   const cells = heatmapCells(heatmap, series);
   drawHeatmapLegend(cells);
@@ -2249,7 +2254,7 @@ function paintHeatmap(data, entry, column) {
   document.getElementById("heatmap-note").textContent = heatmapNote(heatmap, cells);
   document
     .getElementById("heatmap-table")
-    .replaceChildren(...(cells.some((cell) => heatValue(cell) > 0) ? [heatmapTable(cells, series)] : []));
+    .replaceChildren(...(cells.some((cell) => cell.sessions > 0) ? [heatmapTable(cells, series)] : []));
 }
 
 /* The pre-folded scope the reader chose, or null for the whole window. Looked up by

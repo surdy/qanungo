@@ -3782,6 +3782,45 @@ fn the_device_scope_groups_the_window_by_the_host_the_manifest_recorded() {
     }
 }
 
+/// The payload contract the page's heatmap fallback rests on: the whole window carries a `heatmap`,
+/// every repository scope carries its own, and a device scope carries **none** — the heatmap is cut
+/// by repository, not device, so under a device the page must read `data.heatmap` rather than a key
+/// that is not there. Pinned so a change cannot silently reintroduce the crash a device selection
+/// once caused (the page has no test of its own; this guards the shape it depends on).
+#[test]
+fn a_device_scope_carries_no_heatmap_while_the_window_and_repository_scopes_do() {
+    let base = spawn_archive(device_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args(&base, &directory.path().join("qanungo"));
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let payload = payload_of(address);
+
+    assert!(
+        payload["heatmap"].is_object(),
+        "the whole window carries a heatmap: {payload}",
+    );
+    for repository in payload["scopes"]["repositories"].as_array().unwrap() {
+        assert!(
+            repository["heatmap"].is_object(),
+            "a repository scope carries its own heatmap: {repository}",
+        );
+    }
+    let devices = payload["scopes"]["devices"].as_array().unwrap();
+    assert!(
+        !devices.is_empty(),
+        "the device archive produced device scopes to check",
+    );
+    for device in devices {
+        assert!(
+            device.get("heatmap").map(|h| h.is_null()).unwrap_or(true),
+            "a device scope carries no heatmap (the page falls back to the window's): {device}",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The heatmap (qanungo #5, the habits view on local time)
 // ---------------------------------------------------------------------------
