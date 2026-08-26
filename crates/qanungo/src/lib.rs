@@ -183,10 +183,14 @@
 //!   the session count in the subtitle above them. It is grouped per scope by the same selection the
 //!   scores are, and it carries numbers and ISO dates and no string at all. See [`timeline`].
 //!
-//! What remains: per-device scope (waiting on a hostname to accrue in the archive) and the 7×24
-//! heatmap. The heatmap is the view UTC genuinely breaks — "at 1 a.m." and "on a Sunday" are the
-//! claims a missing offset misplaces — and it waits on munshi#77's local-offset pull *accruing* in
-//! the archive; the capture side shipped 2026-08-25.
+//! - **The heatmap is that fold on the operator's own clock.** Sessions and active time per **local
+//!   hour of the weekday the work began** — each session's transcript first-activity instant shifted
+//!   by its own [`metrics::SessionMetrics::utc_offset`], because "at 1 a.m." and "on a Sunday" are
+//!   exactly the claims UTC misplaces. A session with no recorded offset is on no cell and counted,
+//!   the same refusal the timeline makes for a missing archive time. Same selection per scope, and
+//!   numbers and grid indices and no string at all. See [`heatmap`].
+//!
+//! What remains: per-device scope, waiting on a hostname to accrue in the archive.
 
 pub mod cache;
 pub mod cli;
@@ -197,6 +201,7 @@ pub mod dashboard;
 pub mod dashboard_server;
 pub mod evidence;
 pub mod format;
+pub mod heatmap;
 pub mod http;
 pub mod metrics;
 pub mod patwari;

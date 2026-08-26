@@ -362,6 +362,24 @@ summary {
    is a guard and not a plan. */
 .chart .sx { fill: var(--ink-muted); }
 
+/* The heatmap. Unlike the timeline it colours by *intensity, not identity*: one
+   hue at a fill-opacity set from the cell's magnitude, so a darker cell is a
+   busier local hour. The opacity is the only per-cell number this file writes;
+   the hue is the stylesheet's, so it stays theme-aware. Empty cells carry the
+   rule colour so seven rows of twenty-four read as a grid rather than as floating
+   marks. The per-harness split is not in the colour — it is in the tooltip and
+   the table — because stacking here would fight the intensity the grid is for. */
+.heat { display: block; }
+.heat .cell { fill: var(--series-1); stroke: var(--surface); stroke-width: 1; }
+.heat .cell.empty { fill: var(--rule); fill-opacity: 1; }
+.heat .hit { fill: transparent; }
+.heat .axis-text { fill: var(--ink-muted); font-size: 10px; font-family: inherit; }
+/* The intensity legend: a low-to-high strip of the one hue, so a reader knows the
+   colour is a quantity. Swatches wear the series colour and vary only in opacity,
+   which the script sets inline from the same floor the cells use. */
+.heat-scale { display: flex; align-items: center; gap: 0.3rem; font-size: 0.78rem; color: var(--ink-2); }
+.heat-swatch { width: 0.85rem; height: 0.85rem; border-radius: 2px; background: var(--series-1); flex: none; }
+
 /* The cost section. A headline, then tables — which are the honest shape for a
    priced breakdown and the one the CLI already uses, so a reader comparing the two
    is comparing rows to rows. Each table scrolls inside its own box rather than
@@ -491,6 +509,33 @@ footer .archive { overflow-wrap: anywhere; }
     </div>
     <p class="note" id="timeline-note"></p>
     <div id="timeline-table"></div>
+  </section>
+
+  <!--
+    The habits heatmap. Its <svg> is written here for the same reason the timeline's
+    is: an element the HTML parser built is already in the SVG namespace, so the
+    script reads that namespace off it and this file never writes a namespace URL,
+    which keeps the page's "loads nothing from anywhere" check a grep rather than a
+    judgement call.
+  -->
+  <section aria-labelledby="heatmap-heading">
+    <h2 id="heatmap-heading">Habits</h2>
+    <div class="chart-controls">
+      <label for="heatmap-measure">Measure</label>
+      <select id="heatmap-measure">
+        <option value="sessions">Sessions</option>
+        <option value="active">Active hours</option>
+      </select>
+      <div class="legend" id="heatmap-legend"></div>
+    </div>
+    <div class="chart-frame">
+      <svg id="heatmap-chart" class="heat" role="img" aria-labelledby="heatmap-title heatmap-desc">
+        <title id="heatmap-title"></title>
+        <desc id="heatmap-desc"></desc>
+      </svg>
+    </div>
+    <p class="note" id="heatmap-note"></p>
+    <div id="heatmap-table"></div>
   </section>
 
   <section aria-labelledby="findings-heading">
@@ -1923,6 +1968,273 @@ function paintTimeline(data, entry, column) {
     .replaceChildren(...(columns.length ? [timelineTable(columns, series)] : []));
 }
 
+/* ------------------------------------------------------------------------
+ * The habits heatmap: the same fold on the operator's own clock.
+ *
+ * A 7×24 grid — weekday down, local hour across — of when in the operator's own
+ * day the work began. Every number was computed in Rust and arrives as an integer
+ * on a (weekday, hour) cell that Rust already shifted into the capturing machine's
+ * local time. This file colours a cell by magnitude and labels the two axes; it
+ * counts nothing and sums only across the harnesses of one cell, which the payload
+ * already split. It builds no date through `Date`: the weekday and the hour are
+ * indices into the two static label lists below, and re-expressing a local hour
+ * through the reader's own zone is the exact confusion this whole view avoids.
+ *
+ * Unlike the timeline it does not stack the harnesses — it sums them to one
+ * intensity, because a heatmap's colour is a quantity, not an identity. The split
+ * is in the tooltip and the table.
+ * ------------------------------------------------------------------------ */
+
+const HEATMAP = {
+  padLeft: 34,
+  padTop: 18,
+  padRight: 8,
+  padBottom: 6,
+  cellWidth: 22,
+  cellHeight: 20,
+  gap: 2,
+  /* The faintest a non-empty cell is drawn. A single session in a quiet hour must
+     still read as ink and not as an empty slot, so the intensity scale starts
+     here rather than at zero opacity. */
+  minInk: 0.16,
+};
+
+/* Monday-first, because num_days_from_monday is the index Rust sends: 0 is Monday
+   and 6 is Sunday. */
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/* The heatmap's own measure, held apart from the timeline's so a reader can keep
+   sessions on one view and hours on the other. */
+let heatMeasure = "sessions";
+
+/* One entry per (weekday, hour) cell the payload carries, each summed over the
+   selected series — every harness, or exactly the one a scope picked, on the same
+   selection rule the timeline uses. */
+function heatmapCells(heatmap, series) {
+  return heatmap.cells.map((cell) => {
+    const parts = series.map((entry) => ({
+      series: entry,
+      sessions: cell.sessions[entry.index] || 0,
+      seconds: cell.active_seconds[entry.index] || 0,
+    }));
+    return {
+      weekday: cell.weekday,
+      hour: cell.hour,
+      parts,
+      sessions: parts.reduce((total, part) => total + part.sessions, 0),
+      seconds: parts.reduce((total, part) => total + part.seconds, 0),
+    };
+  });
+}
+
+function heatValue(cell) {
+  return heatMeasure === "sessions" ? cell.sessions : cell.seconds / 3600;
+}
+
+/* Two-digit hour, and the hour after it, as a local range: `09:00–10:00`. Built
+   from the integer hour and never from a date, so it means the same thing in every
+   reader's zone. Hour 23 wraps to `00:00`. */
+function hourRange(hour) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return pad(hour) + ":00–" + pad((hour + 1) % 24) + ":00";
+}
+
+/* What one cell says when a reader points at it: the local weekday and hour range,
+   both measures, and the harnesses inside it. Set as an SVG <title>, which is the
+   group's accessible name and its tooltip at once. */
+function heatCellTitle(weekday, hour, cell) {
+  const parts = [WEEKDAYS[weekday] + " " + hourRange(hour)];
+  if (!cell || cell.sessions === 0) {
+    parts.push("no session began here");
+    return parts.join(" · ");
+  }
+  parts.push(cell.sessions + (cell.sessions === 1 ? " session" : " sessions"));
+  parts.push(activeHours(cell.seconds) + "h active");
+  for (const part of cell.parts) {
+    if (!part.sessions) continue;
+    parts.push(part.series.label + " " + part.sessions + " · " + activeHours(part.seconds) + "h");
+  }
+  return parts.join(" · ");
+}
+
+/* The grid itself, into the <svg> the document already carries. */
+function drawHeatmap(cells) {
+  const chart = document.getElementById("heatmap-chart");
+  const ns = chart.namespaceURI;
+  const shape = (tag, className) => {
+    const node = document.createElementNS(ns, tag);
+    if (className) node.setAttribute("class", className);
+    return node;
+  };
+  const set = (node, attributes) => {
+    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+    return node;
+  };
+
+  const width = HEATMAP.padLeft + 24 * HEATMAP.cellWidth + HEATMAP.padRight;
+  const height = HEATMAP.padTop + 7 * HEATMAP.cellHeight + HEATMAP.padBottom;
+  set(chart, { width, height, viewBox: "0 0 " + width + " " + height });
+
+  const title = document.getElementById("heatmap-title");
+  const desc = document.getElementById("heatmap-desc");
+  title.textContent =
+    heatMeasure === "sessions"
+      ? "Sessions by the local hour of the week their work began"
+      : "Active hours by the local hour of the week each session began (attributed to that hour)";
+  desc.textContent = cells.length
+    ? "A seven-by-twenty-four grid, weekday down and local hour across, coloured by how much work" +
+      " began in each hour of the operator's own day. The same numbers are in the table below."
+    : "No session in this window could be placed on a local clock.";
+
+  const byKey = new Map();
+  for (const cell of cells) byKey.set(cell.weekday * 24 + cell.hour, cell);
+  const max = Math.max(1, ...cells.map(heatValue));
+
+  const nodes = [];
+  /* Weekday labels down the left, one per row. */
+  for (let day = 0; day < 7; day += 1) {
+    const label = shape("text", "axis-text");
+    const y = HEATMAP.padTop + day * HEATMAP.cellHeight + HEATMAP.cellHeight / 2 + 3;
+    set(label, { x: HEATMAP.padLeft - 6, y, "text-anchor": "end" });
+    label.textContent = WEEKDAYS[day];
+    nodes.push(label);
+  }
+  /* Hour labels across the top, every three hours — enough to read the axis
+     without a number over each of twenty-four columns. */
+  for (let hour = 0; hour <= 21; hour += 3) {
+    const label = shape("text", "axis-text");
+    const x = HEATMAP.padLeft + hour * HEATMAP.cellWidth + HEATMAP.cellWidth / 2;
+    set(label, { x, y: HEATMAP.padTop - 6, "text-anchor": "middle" });
+    label.textContent = String(hour);
+    nodes.push(label);
+  }
+  /* Every slot in the grid gets a rect — the empty ones too, so the shape reads as
+     a grid. A non-empty cell's opacity is the intensity floor plus its share of
+     the busiest cell, so the darkest cell is full and the quietest still shows. */
+  for (let day = 0; day < 7; day += 1) {
+    for (let hour = 0; hour < 24; hour += 1) {
+      const cell = byKey.get(day * 24 + hour);
+      const value = cell ? heatValue(cell) : 0;
+      const x = HEATMAP.padLeft + hour * HEATMAP.cellWidth;
+      const y = HEATMAP.padTop + day * HEATMAP.cellHeight;
+      const group = shape("g");
+      const label = shape("title");
+      label.textContent = heatCellTitle(day, hour, cell);
+      group.appendChild(label);
+      const rect = set(shape("rect", value > 0 ? "cell" : "cell empty"), {
+        x: x + HEATMAP.gap / 2,
+        y: y + HEATMAP.gap / 2,
+        width: HEATMAP.cellWidth - HEATMAP.gap,
+        height: HEATMAP.cellHeight - HEATMAP.gap,
+        rx: 3,
+      });
+      if (value > 0) {
+        rect.setAttribute(
+          "fill-opacity",
+          (HEATMAP.minInk + (1 - HEATMAP.minInk) * (value / max)).toFixed(3)
+        );
+      }
+      group.appendChild(rect);
+      nodes.push(group);
+    }
+  }
+  chart.replaceChildren(title, desc, ...nodes);
+}
+
+/* The intensity legend: a low-to-high strip of the one hue, so a reader learns the
+   colour is a quantity. Absent when the grid is empty, where there is no scale to
+   describe. */
+function drawHeatmapLegend(cells) {
+  const legend = document.getElementById("heatmap-legend");
+  if (!cells.length) {
+    legend.replaceChildren();
+    return;
+  }
+  const max = Math.max(1, ...cells.map(heatValue));
+  const scale = el("div", "heat-scale");
+  scale.appendChild(el("span", null, "less"));
+  for (const step of [0, 0.25, 0.5, 0.75, 1]) {
+    const swatch = el("span", "heat-swatch");
+    swatch.style.opacity = (HEATMAP.minInk + (1 - HEATMAP.minInk) * step).toFixed(3);
+    scale.appendChild(swatch);
+  }
+  const top = heatMeasure === "sessions" ? max + (max === 1 ? " session" : " sessions") : activeHours(max * 3600) + "h";
+  scale.appendChild(el("span", null, "more (to " + top + ")"));
+  legend.replaceChildren(scale);
+}
+
+/* The same numbers as a table, behind a disclosure — the non-empty cells only,
+   because a full 168-row table would bury the handful that carry anything. It is
+   what makes the grid legible to a reader whose screen or colour vision cannot
+   separate two opacities. */
+function heatmapTable(cells, series) {
+  const heading = [
+    { label: "Weekday" },
+    { label: "Local hour" },
+    ...series.map((entry) => ({ label: entry.label, figure: true })),
+    { label: "Total", figure: true },
+  ];
+  const cell = (value) => (heatMeasure === "sessions" ? String(value) : value.toFixed(1) + "h");
+  const value = (part) => (heatMeasure === "sessions" ? part.sessions : part.seconds / 3600);
+  const rows = cells
+    .filter((entry) => heatValue(entry) > 0)
+    .map((entry) => [
+      WEEKDAYS[entry.weekday],
+      hourRange(entry.hour),
+      ...entry.parts.map((part) => cell(value(part))),
+      cell(heatValue(entry)),
+    ]);
+  const details = el("details");
+  details.appendChild(el("summary", null, "The numbers behind the grid"));
+  details.appendChild(table(null, heading, rows));
+  return details;
+}
+
+function heatmapNote(heatmap, cells) {
+  const covered =
+    "Work began in " +
+    heatmap.cells_covered +
+    (heatmap.cells_covered === 1 ? " local hour-of-week slot" : " local hour-of-week slots") +
+    " this window. ";
+  const basis =
+    "A cell is the local hour of the weekday each session's work began — the transcript's own" +
+    " first-activity time shifted by the capturing machine's UTC offset, not archive time and not" +
+    " the reader's zone. This is the view a wrong clock misplaces: 'at 1 a.m.' and 'on a Sunday'" +
+    " are exactly the claims a missing offset gets wrong. The active-hours measure attributes a" +
+    " session's whole active time to the hour it began, because the fold keeps no finer per-hour" +
+    " breakdown to spread it across.";
+  const noOffset = heatmap.no_offset
+    ? " " +
+      heatmap.no_offset +
+      (heatmap.no_offset === 1 ? " session carries" : " sessions carry") +
+      " no recorded offset and " +
+      (heatmap.no_offset === 1 ? "is" : "are") +
+      " on no cell, counted not guessed."
+    : "";
+  const undated = heatmap.undated
+    ? " " +
+      heatmap.undated +
+      (heatmap.undated === 1 ? " session has" : " sessions have") +
+      " an offset but no readable activity time and " +
+      (heatmap.undated === 1 ? "is" : "are") +
+      " on no cell."
+    : "";
+  const empty = cells.length ? "" : " Nothing to draw in this scope.";
+  return covered + basis + noOffset + undated + empty;
+}
+
+function paintHeatmap(data, entry, column) {
+  const heatmap = entry ? entry.heatmap : data.heatmap;
+  const series = timelineSeries(data, column);
+  const cells = heatmapCells(heatmap, series);
+  drawHeatmapLegend(cells);
+  drawHeatmap(cells);
+  document.getElementById("heatmap-note").textContent = heatmapNote(heatmap, cells);
+  document
+    .getElementById("heatmap-table")
+    .replaceChildren(...(cells.some((cell) => heatValue(cell) > 0) ? [heatmapTable(cells, series)] : []));
+}
+
 /* The pre-folded scope the reader chose, or null for the whole window. Looked up by
    label rather than by position, so a refresh that reorders the list (it is ordered
    busiest-first) cannot silently move a selection onto a different repository. */
@@ -2075,6 +2387,7 @@ function paint() {
     .replaceChildren(...lanes.map((lane) => laneTile(lane, column)));
 
   paintTimeline(data, entry, column);
+  paintHeatmap(data, entry, column);
 
   const findings = document.getElementById("findings");
   const cards = data.findings
@@ -2231,6 +2544,13 @@ function wireScopeControls() {
      toggle picks which of the two integers already on the page becomes a height. */
   document.getElementById("timeline-measure").addEventListener("change", (event) => {
     measure = event.target.value === "active" ? "active" : "sessions";
+    paint();
+  });
+  /* The heatmap's own measure, on its own state, so the two views do not move
+     together. Same reasoning as the timeline's toggle: both integers were folded
+     before the document was published; this picks which one becomes intensity. */
+  document.getElementById("heatmap-measure").addEventListener("change", (event) => {
+    heatMeasure = event.target.value === "active" ? "active" : "sessions";
     paint();
   });
 }
