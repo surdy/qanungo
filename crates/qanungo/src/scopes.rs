@@ -54,6 +54,30 @@
 //! [`crate::standup::Standup::fold`]. The two agree on every ordinary session and are allowed to
 //! disagree, so the served scope list is the **union** of what all three sections labelled, and a
 //! scope with nothing to show in a section says so rather than rendering an empty one silently.
+//!
+//! # The device axis is a second grouping of the same facts
+//!
+//! [`by_device`] is [`by_repository`] again, cut over [`SessionMetrics::hostname`] instead of
+//! [`SessionMetrics::repository`] — the machine the snapshot manifest recorded the capture running
+//! on, which the shared plumbing folds onto each session with no second read of a transcript.
+//! Everything above holds word for word: the group is the **rendered** label ([`device_label`],
+//! clamped then scrubbed), a session the archive named no host for gets its own [`NO_DEVICE`] bucket
+//! that sorts last everywhere, and the served list is a selection of this fold handed back to
+//! [`Scorecard::fold_refs`](crate::scoring::Scorecard::fold_refs) — never a second formula and never
+//! a second fold.
+//!
+//! It sits *beside* the repository axis for the same reason the harness axis sits *inside* it, and
+//! that difference is the whole of the design. **Harness is already folded** —
+//! [`Scorecard::fold_refs`](crate::scoring::Scorecard::fold_refs) scores per `source_agent` and
+//! blends — so a device scope carries the per-harness split for free, exactly as a repository scope
+//! does, and the page's harness control picks a column out of whichever scope is selected without a
+//! second fold or a cross product on the wire. **Device is not folded**: it is a session-subset axis
+//! like the repository, so a device *and* a repository selected at once would name a
+//! `repository ∩ device` cell this fold never produced. The payload therefore carries the two as
+//! independent groupings and the page treats them as alternatives — one primary narrowing at a time,
+//! each already holding the free harness dimension — rather than serializing a product of scorecards
+//! that no arithmetic here stands behind. Two copies of a number are two things that can disagree;
+//! a scope for a pair nobody folded would be worse, a number with nothing behind it at all.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -166,6 +190,119 @@ pub fn by_repository<'a>(
     scopes
 }
 
+/// The bucket a session the archive recorded no hostname for is grouped under.
+///
+/// A capture written before the capture side began stamping a host (only the synthetic
+/// `deployment-smoke` session in the real archive, but a general state, not that one row) has no
+/// device to attribute it to. It is spelled as a sentence for the same reason [`NO_REPOSITORY`] is:
+/// so it cannot be confused with a device actually named that, and so one page does not spell "we
+/// do not know" two ways.
+pub const NO_DEVICE: &str = "no device recorded";
+
+/// An archive-stated hostname, as every control in this crate renders an identifier: clamped, then
+/// scrubbed.
+///
+/// `None` — a capture from before the metadata existed — is [`NO_DEVICE`], spelled as a sentence
+/// precisely so it cannot be confused with a device actually called that, exactly as
+/// [`repository_label`] treats a missing repository.
+///
+/// The order is [`identifier_field`]'s and is argued there: the clamp has to judge the archive's
+/// own bytes, or a 200-character token could launder itself into a renderable marker and be waved
+/// through by a clamp that never saw what it really was. A hostname reaches a `<select>` no less
+/// than a repository does, so it is scrubbed on the same reasoning.
+pub fn device_label(hostname: Option<&str>, redactor: &Redactor) -> String {
+    match hostname {
+        Some(hostname) => identifier_field(hostname, redactor),
+        None => NO_DEVICE.to_owned(),
+    }
+}
+
+/// One device's slice of a folded window, in both halves of the window pair.
+///
+/// [`RepositoryScope`] over the hostname axis, and the same *view* of the fold: it borrows its
+/// [`SessionMetrics`] rather than cloning them, for the reason that type gives. What differs is only
+/// which archive fact the label is taken from — [`SessionMetrics::hostname`], off the snapshot's own
+/// manifest, rather than the repository the listing projected — and, because nothing else on the
+/// page groups by host, this scope has no foreign labels of its own to reconcile against.
+#[derive(Debug)]
+pub struct DeviceScope<'a> {
+    /// The rendered label, and the group key. See the module docs.
+    pub label: String,
+    /// Whether the archive named a device at all. `false` is the [`NO_DEVICE`] bucket.
+    pub attributed: bool,
+    /// The reported window's sessions on this device, in the fold's own order.
+    pub sessions: Vec<&'a SessionMetrics>,
+    /// The comparison window's, grouped identically — which is what makes a device scope's trend
+    /// arrow the same statement as the whole window's, taken over less.
+    pub previous: Vec<&'a SessionMetrics>,
+}
+
+impl DeviceScope<'_> {
+    /// How many sessions each harness contributed to this scope's reported window, by rendered
+    /// label — the *same* rendering the lane columns and the evidence tags use, clamped then
+    /// scrubbed. A count keyed on a label the control spells differently is a count nobody can line
+    /// up with anything. Identical to [`RepositoryScope::by_harness`]: the harness axis does not
+    /// know which primary scope it is being counted inside.
+    pub fn by_harness(&self, redactor: &Redactor) -> BTreeMap<String, usize> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for session in &self.sessions {
+            *counts
+                .entry(identifier_field(&session.source_agent, redactor))
+                .or_default() += 1;
+        }
+        counts
+    }
+}
+
+/// Every device scope a served document can offer, busiest first.
+///
+/// [`by_repository`] again, keyed on [`device_label`] and bucketed under [`NO_DEVICE`]. `also`
+/// carries labels another section might already render — it is kept for symmetry with the repository
+/// axis and its foreign-label reconciliation, though today no other section cuts by host, so the
+/// dashboard passes nothing. Order is the same: attributed before the residue, then busiest, then
+/// the label so the list is stable across runs, and the unattributed bucket always last.
+pub fn by_device<'a>(
+    folded: &'a Folded,
+    redactor: &Redactor,
+    also: impl IntoIterator<Item = String>,
+) -> Vec<DeviceScope<'a>> {
+    let mut reported: BTreeMap<String, Vec<&'a SessionMetrics>> = BTreeMap::new();
+    let mut previous: BTreeMap<String, Vec<&'a SessionMetrics>> = BTreeMap::new();
+    for (sessions, into) in [
+        (&folded.sessions, &mut reported),
+        (&folded.previous, &mut previous),
+    ] {
+        for session in sessions {
+            let label = device_label(session.hostname.as_deref(), redactor);
+            into.entry(label).or_default().push(session);
+        }
+    }
+
+    let labels: BTreeSet<String> = reported
+        .keys()
+        .chain(previous.keys())
+        .cloned()
+        .chain(also)
+        .collect();
+    let mut scopes: Vec<DeviceScope<'a>> = labels
+        .into_iter()
+        .map(|label| DeviceScope {
+            attributed: label != NO_DEVICE,
+            sessions: reported.get(&label).cloned().unwrap_or_default(),
+            previous: previous.get(&label).cloned().unwrap_or_default(),
+            label,
+        })
+        .collect();
+    scopes.sort_by(|left, right| {
+        left.attributed
+            .cmp(&right.attributed)
+            .reverse()
+            .then_with(|| right.sessions.len().cmp(&left.sessions.len()))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    scopes
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -209,6 +346,16 @@ mod tests {
             reviews: ReviewActivity::default(),
             anchors: SessionAnchors::default(),
             bytes_folded: 0,
+        }
+    }
+
+    /// The same session builder, told which host the manifest recorded. `session` leaves it
+    /// `None` — the [`NO_DEVICE`] bucket — so the device tests set it here rather than reaching
+    /// into a struct literal a dozen fields wide.
+    fn on(index: usize, source_agent: &str, hostname: Option<&str>) -> SessionMetrics {
+        SessionMetrics {
+            hostname: hostname.map(ToOwned::to_owned),
+            ..session(index, source_agent, None)
         }
     }
 
@@ -342,5 +489,114 @@ mod tests {
         let long = repository_label(Some(&"a".repeat(200)), &redactor);
         assert_eq!(long, crate::format::INVALID_IDENTIFIER);
         assert_eq!(repository_label(None, &redactor), NO_REPOSITORY);
+    }
+
+    /// The device axis groups exactly as the repository axis does — both windows by the same key,
+    /// busiest first, the unrecorded bucket last — and the per-harness split inside a device scope
+    /// is the harness axis it carries for free. This is the reconciliation the module docs promise:
+    /// a device scope's sessions are a *selection*, so their per-harness counts add back to the
+    /// scope's own fold.
+    #[test]
+    fn devices_group_both_windows_busiest_first_with_the_unrecorded_bucket_last() {
+        let folded = folded(
+            vec![
+                on(1, "claude-code", None),
+                on(2, "claude-code", Some("macbookpro")),
+                on(3, "claude-code", Some("j2vjcmqmyx")),
+                on(4, "copilot-cli", Some("macbookpro")),
+                on(5, "claude-code", Some("macbookpro")),
+            ],
+            vec![
+                on(6, "claude-code", Some("j2vjcmqmyx")),
+                on(7, "claude-code", Some("oldhost")),
+            ],
+        );
+        let scopes = by_device(&folded, &Redactor::new(), None);
+        let labels: Vec<&str> = scopes.iter().map(|scope| scope.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                // Three sessions, then one each in label order, then the residue.
+                "macbookpro",
+                "j2vjcmqmyx",
+                // Present only in the comparison window: a real scope with nothing to score.
+                "oldhost",
+                NO_DEVICE,
+            ],
+        );
+        assert_eq!(scopes[0].sessions.len(), 3);
+        assert_eq!(scopes[0].previous.len(), 0);
+        assert_eq!(scopes[1].sessions.len(), 1);
+        assert_eq!(scopes[1].previous.len(), 1);
+        assert_eq!(scopes[2].sessions.len(), 0);
+        assert_eq!(scopes[2].previous.len(), 1);
+        assert!(!scopes[3].attributed);
+        assert_eq!(scopes[3].sessions.len(), 1);
+        assert_eq!(
+            scopes[0].by_harness(&Redactor::new()),
+            BTreeMap::from([("claude-code".to_owned(), 2), ("copilot-cli".to_owned(), 1),]),
+        );
+    }
+
+    /// A device label the fold never saw still becomes a scope when another section renders it, and
+    /// scores nothing rather than a phantom number — the same union-and-honest-silence rule the
+    /// repository axis holds, kept for symmetry even though no shipped section cuts by host yet.
+    #[test]
+    fn a_device_from_another_section_joins_the_list_with_nothing_to_score() {
+        let folded = folded(vec![on(1, "claude-code", Some("macbookpro"))], vec![]);
+        let scopes = by_device(
+            &folded,
+            &Redactor::new(),
+            [
+                "quadhost".to_owned(),
+                // Already present: the union must not double it.
+                "macbookpro".to_owned(),
+            ],
+        );
+        let labels: Vec<&str> = scopes.iter().map(|scope| scope.label.as_str()).collect();
+        assert_eq!(labels, vec!["macbookpro", "quadhost"]);
+        assert!(scopes[1].sessions.is_empty());
+        let card = Scorecard::fold_refs(&scopes[1].sessions);
+        assert!(card.harnesses.is_empty());
+        for lane in Lane::ALL {
+            assert_eq!(card.fleet(lane), None, "{lane:?} invented a blend");
+        }
+    }
+
+    /// A hostname carrying a newline, a pipe, or a credential shape is clamped and scrubbed before
+    /// it is ever a group key, and two hostile names that render alike are one option, not two —
+    /// the anti-smuggling property [`repository_label`] holds, restated on the host axis because a
+    /// hostname reaches the same `<select>`.
+    #[test]
+    fn a_hostile_hostname_is_clamped_and_scrubbed_before_it_is_a_group() {
+        let hostile = "macbook\nsecond-line";
+        let folded = folded(
+            vec![
+                on(1, "claude-code", Some(hostile)),
+                on(2, "claude-code", Some("also|bad")),
+            ],
+            vec![],
+        );
+        let scopes = by_device(&folded, &Redactor::new(), None);
+        assert_eq!(scopes.len(), 1, "both render alike, so both are one option");
+        assert_eq!(scopes[0].label, crate::format::INVALID_IDENTIFIER);
+        assert_eq!(scopes[0].sessions.len(), 2);
+    }
+
+    /// The clamp runs before the scrub, so a hostname too long to be an identifier cannot launder
+    /// itself into a renderable marker — [`crate::evidence::identifier_field`]'s argument, restated
+    /// on the control the host axis builds.
+    #[test]
+    fn a_token_shaped_hostname_is_judged_by_the_clamp_first() {
+        let redactor = Redactor::new();
+        // Well inside the clamp: it reaches the scrub intact and leaves as a marker.
+        let planted = "ghp_FAKEfake0123456789ABCDEFabcdef012345";
+        let short = device_label(Some(planted), &redactor);
+        assert_ne!(short, crate::format::INVALID_IDENTIFIER);
+        assert!(!short.contains(planted), "{short}");
+        // Past the clamp's ceiling: replaced wholesale, never scrubbed down to something renderable.
+        let long = device_label(Some(&"a".repeat(200)), &redactor);
+        assert_eq!(long, crate::format::INVALID_IDENTIFIER);
+        assert_eq!(device_label(None, &redactor), NO_DEVICE);
     }
 }

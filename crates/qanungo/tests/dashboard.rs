@@ -49,6 +49,11 @@ struct ArchivedSession {
     /// The repository the archive's own session projection records, which is what the cost lane
     /// cuts by. `None` is a session captured outside a checkout, and gets its own row.
     repository: Option<String>,
+    /// The host the snapshot manifest's `capture.source_metadata` records the capture running on,
+    /// which is what the per-device scope groups by. `None` is a capture from before the metadata
+    /// existed — the manifest carries an empty `source_metadata` — and lands in the `NO_DEVICE`
+    /// bucket.
+    hostname: Option<String>,
 }
 
 impl ArchivedSession {
@@ -69,6 +74,7 @@ impl ArchivedSession {
             summary_artifact_id: format!("{:02x}", index.wrapping_add(50)).repeat(16),
             summary_sha256: String::new(),
             repository: None,
+            hostname: None,
         }
     }
 
@@ -103,6 +109,14 @@ impl ArchivedSession {
     /// lane reads the summary's own, and the two are different facts about a session.
     fn in_repository(mut self, repository: &str) -> Self {
         self.repository = Some(repository.to_owned());
+        self
+    }
+
+    /// Sets the host the snapshot manifest records the capture running on — the fact the per-device
+    /// scope groups by. A session left without one stays in the `NO_DEVICE` bucket, the state of a
+    /// capture written before the metadata existed.
+    fn on_device(mut self, hostname: &str) -> Self {
+        self.hostname = Some(hostname.to_owned());
         self
     }
 
@@ -277,7 +291,7 @@ fn snapshot_document(session: &ArchivedSession) -> String {
             "manifest":{{"schema_version":1,
                 "session":{{"source_agent":"{}","source_session_id":"harness"}},
                 "capture":{{"captured_at":"{}","source_cursor":null,
-                    "source_state_hash":null,"source_metadata":{{}},"project":null,
+                    "source_state_hash":null,"source_metadata":{},"project":null,
                     "repository":null,"branch":null,"source_agent_version":null,
                     "artifact_set_version":2,"munshi_version":null}},
                 "artifacts":[]}},
@@ -299,6 +313,7 @@ fn snapshot_document(session: &ArchivedSession) -> String {
         session.snapshot_id,
         session.source_agent,
         session.completed_at,
+        source_metadata(session),
         session.artifact_id,
         session.transcript.len(),
         session.original_sha256,
@@ -331,6 +346,16 @@ fn summary_artifact(session: &ArchivedSession) -> String {
         session.summary_artifact_id,
         session.summary_artifact_id,
     )
+}
+
+/// The capture's `source_metadata` object: `{"hostname":"…"}` when the session names a device, and
+/// the empty `{}` — the real state of a capture written before the metadata existed — otherwise.
+/// This is the manifest field qanungo's per-device scope groups by.
+fn source_metadata(session: &ArchivedSession) -> String {
+    match &session.hostname {
+        Some(hostname) => format!(r#"{{"hostname":"{hostname}"}}"#),
+        None => "{}".to_owned(),
+    }
 }
 
 fn json_response(body: &str) -> Vec<u8> {
@@ -546,6 +571,51 @@ fn canary_archive() -> Vec<ArchivedSession> {
             &transcript("rules/unreviewed-ship.jsonl"),
             5,
         ),
+    ]
+}
+
+/// A window that ran on more than one machine, so the per-device scope has something to group.
+///
+/// Three real hosts and two states no host name renders: a session captured before the metadata
+/// existed (`None`, the `NO_DEVICE` bucket) and one whose recorded hostname carries a pipe — a valid
+/// JSON string the identifier clamp still refuses, so it reaches the wire as `INVALID_IDENTIFIER`
+/// rather than as a raw option. `macbookpro` carries both harnesses, so the scope's per-harness
+/// split is a claim with two terms to reconcile.
+fn device_archive() -> Vec<ArchivedSession> {
+    vec![
+        ArchivedSession::new(
+            21,
+            "claude-code",
+            &transcript("rules/marathon-session.jsonl"),
+            2,
+        )
+        .on_device("macbookpro"),
+        ArchivedSession::new(
+            22,
+            "claude-code",
+            &transcript("rules/high-tool-error-rate.jsonl"),
+            3,
+        )
+        .on_device("macbookpro"),
+        ArchivedSession::new(
+            23,
+            "copilot-cli",
+            &transcript("cost/copilot-billing.jsonl"),
+            4,
+        )
+        .on_device("macbookpro"),
+        ArchivedSession::new(24, "claude-code", &transcript("rules/retry-loop.jsonl"), 5)
+            .on_device("j2vjcmqmyx"),
+        // No hostname on the manifest: the capture predates the metadata, the `NO_DEVICE` bucket.
+        ArchivedSession::new(
+            25,
+            "claude-code",
+            &transcript("cost/claude-billing.jsonl"),
+            6,
+        ),
+        // A hostile hostname the clamp refuses.
+        ArchivedSession::new(26, "claude-code", &transcript("rules/babysitting.jsonl"), 7)
+            .on_device("host|evil"),
     ]
 }
 
@@ -2718,9 +2788,11 @@ fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
 
     for anchor in [
         r#"id="scope-repository""#,
+        r#"id="scope-device""#,
         r#"id="scope-harness""#,
         r#"id="scope-note""#,
         "data.scopes.repositories",
+        "data.scopes.devices",
         "data.scopes.harnesses",
         "citedInScope",
         "scopedCostSection",
@@ -2730,11 +2802,26 @@ fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
     }
 
     // Narrowing is a string comparison against labels the server wrote, never a rule re-evaluated
-    // here — the payload is the single source of every number on the page.
-    assert!(
-        body.contains("evidence.repository !== scope.repository"),
-        "findings are narrowed by the payload's own tags",
-    );
+    // here — the payload is the single source of every number on the page. Both primary axes narrow
+    // the findings this way.
+    for narrowing in [
+        "evidence.repository !== scope.repository",
+        "evidence.device !== scope.device",
+    ] {
+        assert!(
+            body.contains(narrowing),
+            "findings are narrowed by the payload's own tags: {narrowing}",
+        );
+    }
+
+    // Repository and device are exclusive primary axes: choosing one clears the other, so the
+    // payload never has to carry a repository × device cell no fold produced.
+    for exclusivity in ["scope.device = null;", "scope.repository = null;"] {
+        assert!(
+            body.contains(exclusivity),
+            "the two primary axes clear each other: {exclusivity}",
+        );
+    }
 
     // Remembering the scope is a convenience, so every access to storage is guarded and a page with
     // nothing stored renders the whole window.
@@ -2754,7 +2841,8 @@ fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
         assert!(opened > closed, "{guarded} is not inside a try");
     }
     assert!(
-        body.contains("if (!raw) return { repository: null, harness: null };"),
+        body.contains("const empty = { repository: null, device: null, harness: null };")
+            && body.contains("if (!raw) return empty;"),
         "nothing stored renders the whole window",
     );
 
@@ -3577,4 +3665,102 @@ fn an_ordinary_harness_label_is_unchanged_by_the_scrub() {
         standup.contains("copilot-cli: no snapshot of this session carries a `summary.md`"),
         "the gap line names the harness the archive named: {standup}",
     );
+}
+
+/// The per-device scope: the same fold cut by the host the manifest recorded, mirroring the
+/// repository scope. The list is busiest-first with the unrecorded bucket last, a hostile hostname
+/// is clamped before it is ever an option, and each device scope's numbers reconcile to the sessions
+/// the selection holds — a device scope is a *selection* of the fold, never a second one.
+#[test]
+fn the_device_scope_groups_the_window_by_the_host_the_manifest_recorded() {
+    let base = spawn_archive(device_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args(&base, &directory.path().join("qanungo"));
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let payload = payload_of(address);
+    let devices = payload["scopes"]["devices"]
+        .as_array()
+        .expect("a device axis");
+
+    // Busiest first, then the singles by label, then the unrecorded residue last. The hostile
+    // hostname is on the wire as the clamp's marker, never as its raw bytes.
+    let labels: Vec<&str> = devices
+        .iter()
+        .map(|scope| scope["device"].as_str().expect("a device label"))
+        .collect();
+    let unattributed = payload["scopes"]["unattributed_device"].as_str().unwrap();
+    assert_eq!(
+        labels,
+        vec![
+            "macbookpro",
+            qanungo::format::INVALID_IDENTIFIER,
+            "j2vjcmqmyx",
+            unattributed,
+        ],
+    );
+    assert_eq!(unattributed, qanungo::scopes::NO_DEVICE);
+
+    // The residue is honestly unattributed, the busiest device is attributed, and the raw hostile
+    // string appears nowhere in the served document.
+    assert_eq!(devices[3]["attributed"], false);
+    assert_eq!(devices[0]["attributed"], true);
+    assert!(
+        !payload.to_string().contains("host|evil"),
+        "the raw hostname is off the wire",
+    );
+
+    // Each device's folded count, and they sum to the whole window: the scopes partition it.
+    assert_eq!(devices[0]["sessions"]["folded"], 3);
+    assert_eq!(devices[1]["sessions"]["folded"], 1);
+    assert_eq!(devices[2]["sessions"]["folded"], 1);
+    assert_eq!(devices[3]["sessions"]["folded"], 1);
+    let summed: u64 = devices
+        .iter()
+        .map(|scope| scope["sessions"]["folded"].as_u64().unwrap())
+        .sum();
+    assert_eq!(summed, payload["sessions"]["folded"].as_u64().unwrap());
+
+    // The busiest device carries both harnesses, and its per-harness split says so.
+    assert_eq!(devices[0]["sessions"]["by_harness"]["claude-code"], 2);
+    assert_eq!(devices[0]["sessions"]["by_harness"]["copilot-cli"], 1);
+
+    // Reconciliation: the macbookpro scope's lanes are exactly `Scorecard::fold_refs` over the
+    // folded sessions that ran on macbookpro — the same arithmetic as the whole window, over less.
+    let folded = command::fold_coaching(&args.archive, &args.last, &args.redaction.redactor())
+        .expect("the window folds");
+    let macbook: Vec<_> = folded
+        .sessions
+        .iter()
+        .filter(|session| session.hostname.as_deref() == Some("macbookpro"))
+        .collect();
+    assert_eq!(macbook.len(), 3);
+    let card = Scorecard::fold_refs(&macbook);
+    for lane in Lane::ALL {
+        let served = devices[0]["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == lane.key())
+            .unwrap_or_else(|| panic!("{lane:?} is in the device scope"));
+        match card.fleet(lane) {
+            Some(blend) => {
+                assert_eq!(served["fleet"]["state"], "scored", "{lane:?}");
+                assert_eq!(served["fleet"]["score"], blend.score, "{lane:?}");
+            }
+            None => assert_ne!(served["fleet"]["state"], "scored", "{lane:?}"),
+        }
+    }
+
+    // Every finding's evidence rows carry a device tag drawn from the same label set, so selecting a
+    // device narrows the findings the way selecting a repository does.
+    let device_labels: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
+    for finding in payload["findings"].as_array().unwrap() {
+        for evidence in finding["evidence"].as_array().unwrap() {
+            let tag = evidence["device"].as_str().expect("an evidence device tag");
+            assert!(device_labels.contains(tag), "unknown device tag {tag}");
+        }
+    }
 }

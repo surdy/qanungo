@@ -163,9 +163,13 @@
 //! # Scopes, and the rule they do not bend
 //!
 //! [`Payload::scopes_section`] adds every repository scope to the same document: one pre-folded
-//! entry per repository, each carrying the five lanes and what fired inside it. The numbers are
-//! [`crate::scopes`]'s selection of this fold handed back to [`Scorecard::fold_refs`] — never a
-//! second formula, and never a second fold of a transcript.
+//! entry per repository, each carrying the five lanes and what fired inside it, and every **device**
+//! scope beside them — the second primary axis, the same fold grouped by the host the manifest
+//! recorded rather than the repository the listing projected. The numbers are [`crate::scopes`]'s
+//! selection of this fold handed back to [`Scorecard::fold_refs`] — never a second formula, and
+//! never a second fold of a transcript. The two primary axes do not cross: harness is folded and so
+//! rides free inside either, but a repository *and* a device at once would name a cell no fold here
+//! produced, so the page narrows by one or the other. See [`crate::scopes`].
 //!
 //! Two properties are worth naming here because they are what a reviewer should check. The
 //! **all/all scope is the top-level section**, unchanged and unduplicated: a scope control that
@@ -192,12 +196,13 @@
 //!
 //! # What this slice leaves out
 //!
-//! Per-**device** scope and the 7×24 heatmap. Per-device waits on a hostname to accrue in the
-//! archive — the capture side shipped on 2026-08-25, so the field exists and the history does not,
-//! and a control whose only option is "the machine I deployed from" is a control that says nothing.
-//! The heatmap now waits only on offset-*bearing* sessions accruing, on the same reasoning: UTC
-//! misplaces every late-night and weekend claim the view exists to make. Each is a later slice over
-//! this same payload, not a change to it.
+//! The 7×24 heatmap. Per-**device** scope is now here — the archive has accrued more than one host
+//! since the capture side shipped on 2026-08-25, so a device control now has something to say — and
+//! it is exactly a repository scope over [`SessionMetrics::hostname`]: a second primary axis on the
+//! same payload, not a change to it. The heatmap still waits on offset-*bearing* sessions accruing,
+//! on the reasoning the timeline section gives: UTC misplaces every late-night and weekend claim
+//! the view exists to make, and a per-day volume survives a missing offset where "at 1 a.m." does
+//! not. It is a later slice over this same payload.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -215,7 +220,7 @@ use crate::pricing::PRICE_TABLE_REVISION;
 use crate::redaction::{PATTERN_REVISION, RedactionReport, Redactor};
 use crate::report::{self, SkippedNote, stamp};
 use crate::rules::Finding;
-use crate::scopes::{self, RepositoryScope};
+use crate::scopes::{self, DeviceScope, NO_DEVICE, RepositoryScope};
 use crate::scoring::{Lane, LaneScore, Scorecard, Trend};
 use crate::standup::{NO_REPOSITORY, RolledUp, StandupSession};
 use crate::timeline::Timeline;
@@ -602,11 +607,19 @@ impl Payload<'_> {
         let columns = report::harness_columns(&now_all, before_all.as_ref());
 
         let scopes = scopes::by_repository(folded, self.redactor, self.foreign_labels());
+        // The second primary axis: the same fold grouped by the host the manifest recorded, not the
+        // repository the listing projected. It carries no foreign labels because no other section
+        // cuts by host, and it does not cross with the repository axis — see [`scopes`] and the
+        // page's mutually-exclusive primary controls. Its per-harness split is folded in, exactly as
+        // the repository axis's is, so the page's one harness control narrows a device scope too.
+        let devices = scopes::by_device(folded, self.redactor, None);
         json!({
             // The bucket a session with no repository lands in, named once so the page can match
             // the cost lane's `null` row and the standup lane's own heading against it rather than
             // spelling the sentence a second time in JavaScript.
             "unattributed": NO_REPOSITORY,
+            // The device axis's own residue sentence, named here for the same reason.
+            "unattributed_device": NO_DEVICE,
             "harnesses": columns
                 .iter()
                 .map(|column| evidence::identifier_field(column, self.redactor))
@@ -615,6 +628,19 @@ impl Payload<'_> {
                 .iter()
                 .map(|scope| {
                     scope_value(
+                        scope,
+                        compared,
+                        &columns,
+                        &folded.findings,
+                        tags,
+                        self.redactor,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "devices": devices
+                .iter()
+                .map(|scope| {
+                    device_scope_value(
                         scope,
                         compared,
                         &columns,
@@ -789,6 +815,84 @@ fn scope_findings_value(
                     continue;
                 };
                 if tag.repository != scope.label {
+                    continue;
+                }
+                total += 1;
+                *by_harness.entry(tag.harness.as_str()).or_default() += 1;
+            }
+            json!({
+                "rule": finding.rule.key(),
+                "sessions_affected": total,
+                "by_harness": by_harness,
+            })
+        })
+        .collect()
+}
+
+/// One device scope: [`scope_value`] over the host axis.
+///
+/// Every field is the same and computed the same way — [`Scorecard::fold_refs`] over the scope's
+/// selection, the per-harness lanes, the scope's own calendar — because a device scope is a
+/// selection of the same fold, not a different one. Only two things differ, both of them the axis's
+/// identity: the label serializes under `device` rather than `repository`, and the per-scope finding
+/// counts are cut by the session's rendered device label rather than its repository. The page's
+/// harness control reads a column out of the `lanes` here exactly as it does out of a repository
+/// scope's; the harness split is folded in, so nothing is a device × harness cross product.
+fn device_scope_value(
+    scope: &DeviceScope<'_>,
+    compared: bool,
+    columns: &[String],
+    findings: &[Finding],
+    tags: &ScopeTags,
+    redactor: &Redactor,
+) -> Value {
+    let now = Scorecard::fold_refs(&scope.sessions);
+    let before = compared.then(|| Scorecard::fold_refs(&scope.previous));
+    let previous_days = if compared {
+        Timeline::fold(scope.previous.iter().copied())
+    } else {
+        Timeline::default()
+    };
+    json!({
+        "device": scope.label,
+        "attributed": scope.attributed,
+        "sessions": {
+            "folded": scope.sessions.len(),
+            "comparison_folded": scope.previous.len(),
+            "by_harness": scope.by_harness(redactor),
+        },
+        "lanes": Lane::ALL
+            .iter()
+            .map(|lane| lane_value(*lane, &now, before.as_ref(), columns, redactor))
+            .collect::<Vec<_>>(),
+        "timeline": timeline_value(
+            &Timeline::fold(scope.sessions.iter().copied()),
+            &previous_days,
+            columns,
+        ),
+        "findings": device_scope_findings_value(scope, findings, tags),
+    })
+}
+
+/// What each rule fired on inside one device scope, per harness — [`scope_findings_value`] cut by
+/// the device tag instead of the repository tag. Every rule that fired anywhere in the window gets a
+/// row, including a zero here, for the reason the repository version gives: a zero is a reading and a
+/// missing key is not.
+fn device_scope_findings_value(
+    scope: &DeviceScope<'_>,
+    findings: &[Finding],
+    tags: &ScopeTags,
+) -> Value {
+    findings
+        .iter()
+        .map(|finding| {
+            let mut by_harness: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut total = 0_usize;
+            for evidence in &finding.evidence {
+                let Some(tag) = tags.get(evidence.source_hash.as_str()) else {
+                    continue;
+                };
+                if tag.device != scope.label {
                     continue;
                 }
                 total += 1;
@@ -1202,19 +1306,21 @@ fn trend_value(trend: Option<Trend>) -> Value {
 /// ([`crate::rules::RuleId::evidence_kind`]), and the page renders it rather than deciding for
 /// itself: anchors for a rule that counted events, timestamps and counts for one that measured a
 /// shape, and both for fire-and-forget, which did each in a different component.
-/// Which scope each folded session belongs to, by `source_hash`: the rendered repository label and
-/// the rendered harness label, and nothing else.
+/// Which scope each folded session belongs to, by `source_hash`: the rendered repository label, the
+/// rendered device label, and the rendered harness label, and nothing else.
 ///
-/// The **same two strings** the scopes section groups by and the lane columns are keyed on, so the
+/// The **same three strings** the scopes section groups by and the lane columns are keyed on, so the
 /// page can narrow a finding list it already holds by comparing labels rather than by recomputing
 /// anything. That equality is the contract: a tag is a claim about which scope's numbers a row is
 /// counted in, and it is pinned by a test that reconciles the tags against the per-scope fire
 /// counts serialized beside them.
 type ScopeTags = BTreeMap<String, ScopeTag>;
 
-/// One session's scope membership, as the wire spells it.
+/// One session's scope membership, as the wire spells it. The device label is the second primary
+/// axis; the harness label is the free sub-axis both primary axes carry.
 struct ScopeTag {
     repository: String,
+    device: String,
     harness: String,
 }
 
@@ -1236,6 +1342,7 @@ impl Payload<'_> {
                             session.repository.as_deref(),
                             self.redactor,
                         ),
+                        device: scopes::device_label(session.hostname.as_deref(), self.redactor),
                         harness: evidence::identifier_field(&session.source_agent, self.redactor),
                     },
                 )
@@ -1270,11 +1377,16 @@ fn finding_value(
                 "source_hash": evidence.source_hash,
                 // Which scope this cited session is in, so the page can narrow the list without a
                 // second request and without any scoring of its own. Identifiers, not content:
-                // the repository the archive projected onto the session's snapshot and the harness
-                // label, each rendered exactly as the scopes section renders it.
+                // the repository the archive projected onto the session's snapshot, the device its
+                // manifest recorded, and the harness label, each rendered exactly as the scopes
+                // section renders it — so selecting a device narrows this list the same way a
+                // repository does.
                 "repository": tags
                     .get(evidence.source_hash.as_str())
                     .map(|tag| tag.repository.clone()),
+                "device": tags
+                    .get(evidence.source_hash.as_str())
+                    .map(|tag| tag.device.clone()),
                 "harness": tags
                     .get(evidence.source_hash.as_str())
                     .map(|tag| tag.harness.clone()),

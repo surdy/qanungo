@@ -453,6 +453,10 @@ footer .archive { overflow-wrap: anywhere; }
       <select id="scope-repository"></select>
     </div>
     <div class="scope-field">
+      <label for="scope-device">Device</label>
+      <select id="scope-device"></select>
+    </div>
+    <div class="scope-field">
       <label for="scope-harness">Harness</label>
       <select id="scope-harness"></select>
     </div>
@@ -535,36 +539,47 @@ const el = (tag, className, text) => {
 let generation = null;
 
 /*
- * The scope. Two labels, each null for "everything" — never an index, because the
- * payload's repository order is busiest-first and a refresh may reorder it, and a
- * remembered position would silently become a different repository.
+ * The scope. Three labels, each null for "everything" — never an index, because the
+ * payload's order is busiest-first and a refresh may reorder it, and a remembered
+ * position would silently become a different repository or device.
  *
- * Every number a scope shows was computed in Rust. Selecting a repository picks a
- * pre-folded scope out of the payload; selecting a harness picks a column out of that
- * scope, which is a number that is already there because the scorecard is folded per
- * harness. Nothing here averages, weights, or re-scores anything: this file narrows
- * lists and reads fields.
+ * Repository and device are the two PRIMARY axes, and they are alternatives: each picks
+ * a pre-folded scope out of the payload, but the payload holds no repository × device
+ * cell (that pair is a selection no fold produced), so choosing one clears the other.
+ * Harness is the free sub-axis — selecting it picks a column out of whichever primary
+ * scope is active, a number already there because the scorecard is folded per harness.
+ * Nothing here averages, weights, or re-scores anything: this file narrows lists and
+ * reads fields.
  */
 const SCOPE_KEY = "qanungo.scope";
 let current = null;
-let scope = { repository: null, harness: null };
+let scope = { repository: null, device: null, harness: null };
 
 /* Remembering the scope is a convenience for one viewer in one browser, so every
    access is guarded and every failure is silent: a private window, cleared site data,
    or a browser configured to refuse storage must render the page exactly as a fresh
    one does, which is with nothing selected. */
 function readRememberedScope() {
+  const empty = { repository: null, device: null, harness: null };
   try {
     const raw = window.localStorage.getItem(SCOPE_KEY);
-    if (!raw) return { repository: null, harness: null };
+    if (!raw) return empty;
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return { repository: null, harness: null };
-    return {
+    if (!parsed || typeof parsed !== "object") return empty;
+    const remembered = {
       repository: typeof parsed.repository === "string" ? parsed.repository : null,
+      device: typeof parsed.device === "string" ? parsed.device : null,
       harness: typeof parsed.harness === "string" ? parsed.harness : null,
     };
+    /* The two primary axes are exclusive, so a store that somehow holds both (an older
+       build, a hand-edited value) is not one this page can render — device wins and the
+       repository is dropped, the same precedence the live controls enforce. */
+    if (remembered.repository !== null && remembered.device !== null) {
+      remembered.repository = null;
+    }
+    return remembered;
   } catch (error) {
-    return { repository: null, harness: null };
+    return empty;
   }
 }
 
@@ -834,11 +849,13 @@ const EVIDENCE_KIND = {
 };
 
 /* Whether a cited session belongs to the chosen scope. The payload tags every
-   evidence row with the repository and harness labels the scopes section groups by,
-   so this is a comparison of two strings the server wrote — never a rule re-evaluated
-   here. */
+   evidence row with the repository, device, and harness labels the scopes section groups
+   by, so this is a comparison of strings the server wrote — never a rule re-evaluated
+   here. Repository and device are exclusive, so at most one of the first two ever
+   filters; harness narrows within whichever primary axis is active. */
 function citedInScope(evidence) {
   if (scope.repository !== null && evidence.repository !== scope.repository) return false;
+  if (scope.device !== null && evidence.device !== scope.device) return false;
   if (scope.harness !== null && evidence.harness !== scope.harness) return false;
   return true;
 }
@@ -1925,12 +1942,39 @@ function paintTimeline(data, entry, column) {
 
 /* The pre-folded scope the reader chose, or null for the whole window. Looked up by
    label rather than by position, so a refresh that reorders the list (it is ordered
-   busiest-first) cannot silently move a selection onto a different repository. */
+   busiest-first) cannot silently move a selection onto a different repository or device.
+
+   The two primary axes are exclusive, and a device wins if both are somehow set — the
+   same precedence the controls and the remembered scope enforce — so this never has to
+   invent a repository × device cell the payload does not carry. A device scope and a
+   repository scope have the identical shape (lanes, timeline, sessions, findings); they
+   differ only in which label key they carry, which `primaryLabel` reads. */
 function chosenScope(data) {
-  if (scope.repository === null) return null;
-  return (
-    data.scopes.repositories.find((entry) => entry.repository === scope.repository) || null
-  );
+  if (scope.device !== null) {
+    return data.scopes.devices.find((entry) => entry.device === scope.device) || null;
+  }
+  if (scope.repository !== null) {
+    return (
+      data.scopes.repositories.find((entry) => entry.repository === scope.repository) || null
+    );
+  }
+  return null;
+}
+
+/* The label of whichever primary axis an entry belongs to. A repository scope carries
+   `repository`, a device scope carries `device`; the whole-window entry is null. */
+function primaryLabel(entry) {
+  if (!entry) return null;
+  return entry.repository !== undefined ? entry.repository : entry.device;
+}
+
+/* Whether the active primary scope is a repository — the only axis the bill and the
+   narrative are cut by. A device scope narrows the scores, the timeline and the findings
+   (every session it holds is device-tagged), but the cost lane groups by repository and
+   the standup by the repository a summary names, and neither carries a host, so under a
+   device the two sections stay at the whole window. */
+function scopeIsRepository(entry) {
+  return Boolean(entry) && entry.repository !== undefined;
 }
 
 function chosenColumn(data) {
@@ -1955,6 +1999,20 @@ function fillScopeControls(data) {
   );
   if (scope.repository !== null && chosenRepository < 0) scope.repository = null;
   repositories.value = chosenRepository >= 0 ? String(chosenRepository) : "";
+
+  const devices = document.getElementById("scope-device");
+  const deviceOptions = [option("", "All devices")];
+  data.scopes.devices.forEach((entry, index) => {
+    deviceOptions.push(
+      option(String(index), entry.device + " (" + entry.sessions.folded + ")")
+    );
+  });
+  devices.replaceChildren(...deviceOptions);
+  const chosenDevice = data.scopes.devices.findIndex(
+    (entry) => entry.device === scope.device
+  );
+  if (scope.device !== null && chosenDevice < 0) scope.device = null;
+  devices.value = chosenDevice >= 0 ? String(chosenDevice) : "";
 
   const harnesses = document.getElementById("scope-harness");
   const harnessOptions = [option("", "All harnesses (fleet)")];
@@ -1996,13 +2054,17 @@ function scopedFolded(data, entry, column) {
 function scopeSentence(data, entry, column) {
   if (!entry && column < 0) {
     return (
-      "Showing the whole window. Choose a repository or a harness to narrow the scores, the " +
-      "findings, and — for a repository — the bill and the narrative. Every scope is folded " +
-      "server-side and shipped with this payload; nothing here recomputes a score."
+      "Showing the whole window. Choose a repository or a device to narrow the scores, the " +
+      "timeline and the findings — and, for a repository, the bill and the narrative too — or a " +
+      "harness to cut any of those by harness. Repository and device are alternatives: picking " +
+      "one clears the other, because the payload holds no repository-and-device combination. " +
+      "Every scope is folded server-side and shipped with this payload; nothing here recomputes " +
+      "a score."
     );
   }
+  const onDevice = Boolean(entry) && !scopeIsRepository(entry);
   const parts = [];
-  if (entry) parts.push(entry.repository);
+  if (entry) parts.push(primaryLabel(entry));
   if (column >= 0) parts.push(data.scopes.harnesses[column]);
   let sentence =
     "Scoped to " +
@@ -2015,14 +2077,22 @@ function scopeSentence(data, entry, column) {
   sentence +=
     column >= 0
       ? "A harness scope shows that harness's own score rather than the fleet blend, and narrows " +
-        "the findings to its sessions. The bill and the narrative carry no harness cut, so they " +
-        "are shown by repository alone."
+        "the findings to its sessions. The bill and the narrative carry no harness cut."
       : "Fleet inside a scope is the unweighted mean over the harnesses present in that scope, " +
         "under the same roster rule as the whole window.";
-  if (entry && entry.sessions.folded === 0) {
+  if (onDevice) {
     sentence +=
-      " No coaching session in this window was listed under this repository — it is on the list " +
-      "because the bill or the narrative names it — so the lanes above have nothing to read.";
+      " This is the device the capture ran on. It narrows the scores, the timeline and the " +
+      "findings; the bill is grouped by repository and the narrative by the repository a summary " +
+      "names, and neither carries a host, so both stay at the whole window below.";
+  }
+  if (entry && entry.sessions.folded === 0) {
+    sentence += onDevice
+      ? " No coaching session in this window ran on this device, so the lanes above have nothing " +
+        "to read."
+      : " No coaching session in this window was listed under this repository — it is on the " +
+        "list because the bill or the narrative names it — so the lanes above have nothing to " +
+        "read.";
   }
   return sentence;
 }
@@ -2097,17 +2167,20 @@ function paint() {
     findings.replaceChildren(...cards);
   }
 
+  // Only a repository narrows the bill and the narrative — a device does not, so under a device
+  // scope (or none) these stay whole-window. See `scopeIsRepository`.
+  const byRepository = scopeIsRepository(entry);
   document
     .getElementById("cost")
     .replaceChildren(
-      ...(entry
+      ...(byRepository
         ? scopedCostSection(data.cost, entry.repository, data.scopes.unattributed)
         : costSection(data.cost))
     );
   document
     .getElementById("standup")
     .replaceChildren(
-      ...(entry
+      ...(byRepository
         ? scopedStandupSection(data.standup, entry.repository)
         : standupSection(data.standup)),
       el("p", "note", standupScrubNote(data.standup, provenance.redaction))
@@ -2203,28 +2276,55 @@ function render(data) {
 
 /* Changing the scope re-renders from the payload already in hand. It fetches nothing:
    every scope was folded before this document was published, which is the whole reason
-   there is no query string on this route. */
-function scopeChanged() {
+   there is no query string on this route.
+
+   `changed` names the control the reader just touched. Repository and device are the two
+   exclusive primary axes: whichever one was just set to a value wins, and the other is
+   cleared in both the model and the DOM, so the controls never offer a repository-and-
+   device pair the payload does not carry. Harness is the free sub-axis and clears
+   neither. */
+function applyScope(changed) {
   if (!current) return;
+  const repoSelect = document.getElementById("scope-repository");
+  const deviceSelect = document.getElementById("scope-device");
   scope.repository = labelAt(
     current.scopes.repositories.map((entry) => entry.repository),
-    document.getElementById("scope-repository").value
+    repoSelect.value
+  );
+  scope.device = labelAt(
+    current.scopes.devices.map((entry) => entry.device),
+    deviceSelect.value
   );
   scope.harness = labelAt(
     current.scopes.harnesses,
     document.getElementById("scope-harness").value
   );
+  if (changed === "repository" && scope.repository !== null) {
+    scope.device = null;
+    deviceSelect.value = "";
+  } else if (changed === "device" && scope.device !== null) {
+    scope.repository = null;
+    repoSelect.value = "";
+  }
   rememberScope();
   paint();
 }
 
 function wireScopeControls() {
-  document.getElementById("scope-repository").addEventListener("change", scopeChanged);
-  document.getElementById("scope-harness").addEventListener("change", scopeChanged);
+  document
+    .getElementById("scope-repository")
+    .addEventListener("change", () => applyScope("repository"));
+  document
+    .getElementById("scope-device")
+    .addEventListener("change", () => applyScope("device"));
+  document
+    .getElementById("scope-harness")
+    .addEventListener("change", () => applyScope("harness"));
   document.getElementById("scope-reset").addEventListener("click", () => {
     document.getElementById("scope-repository").value = "";
+    document.getElementById("scope-device").value = "";
     document.getElementById("scope-harness").value = "";
-    scopeChanged();
+    applyScope("reset");
   });
   /* Changing the measure redraws from the payload in hand, exactly as changing the
      scope does. Both series were folded before this document was published; the
