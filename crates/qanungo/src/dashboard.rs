@@ -190,19 +190,29 @@
 //! transcript's own clock and not the reader's local one — the clock the window was cut on, which is
 //! the only one the counts can reconcile against, and the page says so in its own words rather than
 //! only here. It carries **numbers and ISO dates and no string at all**, because the harness axis is
-//! the payload's existing one and a day row is positional against it. And it is why the **7×24
-//! heatmap is still not here**: a per-day volume survives a missing offset, and "at 1 a.m." does
-//! not. See [`crate::timeline`].
+//! the payload's existing one and a day row is positional against it. And it is the clock that lets
+//! the timeline reconcile where the heatmap below cannot: a per-day volume survives a missing offset
+//! and "at 1 a.m." does not. See [`crate::timeline`].
+//!
+//! # The heatmap, and the clock it is honest about instead
+//!
+//! [`Payload::heatmap_section`] adds the *other* clock: the same fold laid on the operator's own
+//! day. A cell is a **local hour of the weekday the work began** — the transcript's first-activity
+//! instant shifted by the session's own `utc_offset` — because "at 1 a.m." and "on a Sunday" are
+//! precisely the two claims UTC misplaces, and the heatmap is the view that exists to make them. It
+//! is grouped by the same selection per scope, carries **grid indices and no string at all**, and a
+//! session with no recorded offset is on no cell and counted, the same refusal the timeline makes
+//! for a missing archive time. See [`crate::heatmap`].
 //!
 //! # What this slice leaves out
 //!
-//! The 7×24 heatmap. Per-**device** scope is now here — the archive has accrued more than one host
-//! since the capture side shipped on 2026-08-25, so a device control now has something to say — and
-//! it is exactly a repository scope over [`SessionMetrics::hostname`]: a second primary axis on the
-//! same payload, not a change to it. The heatmap still waits on offset-*bearing* sessions accruing,
-//! on the reasoning the timeline section gives: UTC misplaces every late-night and weekend claim
-//! the view exists to make, and a per-day volume survives a missing offset where "at 1 a.m." does
-//! not. It is a later slice over this same payload.
+//! Both views this section used to defer are now here: the heatmap above, and the per-**device**
+//! scope — exactly a repository scope over [`SessionMetrics::hostname`], a second primary axis on
+//! the same payload rather than a change to it, made worth building by the archive accruing more
+//! than one host since the capture side shipped on 2026-08-25. What stays out is two *combinations*,
+//! not views: the bill is still whole-window under a device (cost groups by repository and carries
+//! no host — a later `cost.rs` fold), and the heatmap is cut by repository, not device, so a
+//! per-device habits grid is a free later combination over this same payload.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -215,6 +225,7 @@ use crate::command::{Folded, FoldedCost, FoldedStandup};
 use crate::cost::{CopilotTokens, CostTotals, Flagged, PricedTokens, TokenTally};
 use crate::evidence::{self, EventAnchor, EvidenceIndex};
 use crate::format;
+use crate::heatmap::Heatmap;
 use crate::metrics::{SessionMetrics, Totals};
 use crate::pricing::PRICE_TABLE_REVISION;
 use crate::redaction::{PATTERN_REVISION, RedactionReport, Redactor};
@@ -352,11 +363,16 @@ impl Payload<'_> {
             .as_object_mut()
             .expect("the coaching section is an object");
         let timeline = self.timeline_section();
+        let heatmap = self.heatmap_section();
         fields.insert("cost".to_owned(), self.cost_section());
         fields.insert("standup".to_owned(), self.standup_section());
         fields.insert("scopes".to_owned(), self.scopes_section(&tags));
-        fields.insert("provenance".to_owned(), self.provenance(&timeline));
+        fields.insert(
+            "provenance".to_owned(),
+            self.provenance(&timeline, &heatmap),
+        );
         fields.insert("timeline".to_owned(), timeline);
+        fields.insert("heatmap".to_owned(), heatmap);
         document
     }
 
@@ -368,10 +384,10 @@ impl Payload<'_> {
     /// A day is the **UTC calendar day of the session's archive completion time**, and the page
     /// prints that sentence rather than leaving it in this comment. It is the clock the window
     /// itself was cut on, which is the whole reason it is the right one: the bars sum back to the
-    /// session count in the subtitle above them. It is emphatically **not local time** — the
-    /// archive states an instant and does not yet state the offset the machine was on — which is
-    /// why the 7×24 heatmap stays deferred and this view does not. A per-day volume survives UTC;
-    /// "at 1 a.m." does not. See [`crate::timeline`].
+    /// session count in the subtitle above them. It is emphatically **not local time** — that is
+    /// the heatmap's clock, off the transcript's own instant and the machine's offset. A per-day
+    /// volume survives UTC and reconciles; "at 1 a.m." does not, which is why that claim lives on the
+    /// heatmap and this view stays on archive time. See [`crate::timeline`].
     ///
     /// # Numbers and dates, nothing else
     ///
@@ -405,6 +421,38 @@ impl Payload<'_> {
             Timeline::default()
         };
         timeline_value(&Timeline::fold(&folded.sessions), &previous, &columns)
+    }
+
+    /// The coaching window on the operator's own clock: which local hour of which weekday the work
+    /// began in, by harness.
+    ///
+    /// # Local time, said out loud
+    ///
+    /// A cell is a **local hour of the weekday the session's first activity fell on** — the
+    /// transcript's own first-record instant shifted by the session's recorded `utc_offset`. It is
+    /// the one view UTC breaks: "at 1 a.m." and "on a Sunday" are exactly the claims a UTC clock
+    /// misplaces, which is why the timeline could ship on archive time and this could not until the
+    /// offset accrued. The page prints that sentence rather than leaving it here. See
+    /// [`crate::heatmap`].
+    ///
+    /// # No offset, no cell
+    ///
+    /// A session whose snapshot recorded no offset is on no cell and counted — surfaced the way the
+    /// timeline surfaces its undated count, never guessed onto an hour by assuming a zone. This is a
+    /// single-window section (no comparison half): a habits grid is a shape, and a shape reads
+    /// against itself, not against a shifted copy of itself.
+    ///
+    /// # Numbers and indices, nothing else
+    ///
+    /// Like the timeline, the section carries **no string at all** — a cell is a weekday index, an
+    /// hour, and two arrays positional against `scopes.harnesses`. The weekday and hour *labels* are
+    /// the page's, and the page builds no date through `Date`.
+    fn heatmap_section(&self) -> Value {
+        let folded = self.coaching;
+        let now = Scorecard::fold(&folded.sessions);
+        let before = folded.compared.then(|| Scorecard::fold(&folded.previous));
+        let columns = report::harness_columns(&now, before.as_ref());
+        heatmap_value(&Heatmap::fold(&folded.sessions), &columns)
     }
 
     /// The coaching lane: the window pair, the five lanes, and the findings under them.
@@ -752,6 +800,60 @@ const EMPTY_DAY: crate::timeline::DayCell = crate::timeline::DayCell {
     active_seconds: 0,
 };
 
+/// One window's local hour-of-week grid: the sparse list of cells a session started in, plus the
+/// two counts of sessions that could not be placed on a local clock at all.
+///
+/// `cells_covered` is served beside the list rather than left to be counted from it, the same
+/// provenance courtesy the timeline extends its `days_covered`. `no_offset` and `undated` are the
+/// sessions on no cell — the first is the general real state this whole view waited on (a capture
+/// from before the offset metadata existed), the second a session with an offset but no readable
+/// first-activity instant — so the page can say why the cells are a few short instead of the reader
+/// discovering it.
+fn heatmap_value(heatmap: &Heatmap, columns: &[String]) -> Value {
+    json!({
+        "cells": cells_value(heatmap, columns),
+        "cells_covered": heatmap.cells_covered(),
+        "no_offset": heatmap.no_offset,
+        "undated": heatmap.undated,
+    })
+}
+
+/// One window's local hour-of-week cells, ordered `(weekday, hour)`, each a weekday index, an hour,
+/// and two arrays indexed by the payload's harness axis.
+///
+/// **Dense over the columns and sparse over the grid**, exactly as the timeline is dense over
+/// harnesses and sparse over the calendar: every cell carries one entry per harness — a zero where
+/// that harness started nothing — while a slot nothing began in is simply absent, because a 7×24
+/// grid must not decide what a scope costs to serve.
+fn cells_value(heatmap: &Heatmap, columns: &[String]) -> Value {
+    heatmap
+        .cells
+        .iter()
+        .map(|cell| {
+            let hours: Vec<&crate::heatmap::HourCell> = columns
+                .iter()
+                .map(|column| cell.harnesses.get(column).unwrap_or(&EMPTY_HOUR))
+                .collect();
+            json!({
+                "weekday": cell.weekday,
+                "hour": cell.hour,
+                "sessions": hours.iter().map(|hour| hour.sessions).collect::<Vec<_>>(),
+                "active_seconds": hours
+                    .iter()
+                    .map(|hour| hour.active_seconds)
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+/// The zero a harness that started nothing in a cell contributes — the heatmap's [`EMPTY_DAY`], and
+/// the majority of the cells in any real grid.
+const EMPTY_HOUR: crate::heatmap::HourCell = crate::heatmap::HourCell {
+    sessions: 0,
+    active_seconds: 0,
+};
+
 /// One repository scope: what it holds, what it scores, and what fired inside it.
 fn scope_value(
     scope: &RepositoryScope<'_>,
@@ -788,6 +890,10 @@ fn scope_value(
             &previous_days,
             columns,
         ),
+        // The scope's own habits grid, from the same selection its scores and calendar are taken
+        // over — so a narrowed page's cells sum to that page's own session count. One axis, one
+        // fold, no comparison half: see `Payload::heatmap_section`.
+        "heatmap": heatmap_value(&Heatmap::fold(scope.sessions.iter().copied()), columns),
         "findings": scope_findings_value(scope, findings, tags),
     })
 }
@@ -1516,10 +1622,11 @@ impl Payload<'_> {
     /// [`lane_cost_value`], and every one of the three names the window it was taken over, because
     /// three folds over three spans in one document is exactly where an unlabelled number becomes a
     /// wrong one.
-    /// `timeline` is the section [`Payload::timeline_section`] already built, handed in rather than
-    /// rebuilt: the footer quotes three of its figures, and a footer that recomputed them could
-    /// come to quote a different day count from the one drawn above it.
-    fn provenance(&self, timeline: &Value) -> Value {
+    /// `timeline` and `heatmap` are the sections [`Payload::timeline_section`] and
+    /// [`Payload::heatmap_section`] already built, handed in rather than rebuilt: the footer quotes
+    /// a few of their figures, and a footer that recomputed them could come to quote a different
+    /// count from the one drawn above it.
+    fn provenance(&self, timeline: &Value, heatmap: &Value) -> Value {
         let instrumentation = &self.coaching.instrumentation;
         let cost = &self.cost.instrumentation;
         let standup = &self.standup.instrumentation;
@@ -1598,13 +1705,26 @@ impl Payload<'_> {
             // window: a fortnight with four working days in it covered four days, and a footer that
             // said fourteen would be quoting the calendar rather than the archive. `basis` names the
             // clock in one word so a reader of the raw payload does not have to infer it from a
-            // module comment they cannot see — and names it as **archive time in UTC**, which is
-            // why the 7×24 heatmap is not on this page.
+            // module comment they cannot see — and names it as **archive time in UTC**, the clock
+            // that reconciles, as against the heatmap's local one below.
             "timeline": {
                 "basis": "archive-completion-utc",
                 "days_covered": timeline["days_covered"],
                 "comparison_days_covered": timeline["comparison_days_covered"],
                 "undated": timeline["undated"],
+            },
+            // The heatmap's own basis, in the same spot and the same one-word register. It is
+            // **local time off the transcript's own first-activity instant** — a different clock
+            // from the timeline's archive-UTC, which is the whole reason both views exist. Its
+            // provenance figures are the two ways a session leaves the grid: no recorded offset, or
+            // an offset but no readable activity time. Both should be near-zero on today's archive
+            // and both are served rather than assumed, so a reader can see why the cells are a few
+            // short of the count above them.
+            "heatmap": {
+                "basis": "first-activity-local",
+                "cells_covered": heatmap["cells_covered"],
+                "no_offset": heatmap["no_offset"],
+                "undated": heatmap["undated"],
             },
             // A machine-checkable statement of this *surface's* contract. It was already true of
             // the excerpt route; the standup section makes it true of the document itself, which is

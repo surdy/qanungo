@@ -54,6 +54,10 @@ struct ArchivedSession {
     /// existed — the manifest carries an empty `source_metadata` — and lands in the `NO_DEVICE`
     /// bucket.
     hostname: Option<String>,
+    /// The capturing machine's UTC offset the snapshot manifest recorded (`-07:00`), when it
+    /// recorded one. `None` is a capture from before the offset metadata existed — the state the
+    /// heatmap places on no cell and counts. Written into the manifest's `capture.source_metadata`.
+    utc_offset: Option<String>,
 }
 
 impl ArchivedSession {
@@ -75,7 +79,15 @@ impl ArchivedSession {
             summary_sha256: String::new(),
             repository: None,
             hostname: None,
+            utc_offset: None,
         }
+    }
+
+    /// Records the capturing machine's UTC offset on this session's snapshot manifest — the fact the
+    /// heatmap shifts a transcript instant into a local hour by. Only the heatmap reads it.
+    fn with_utc_offset(mut self, offset: &str) -> Self {
+        self.utc_offset = Some(offset.to_owned());
+        self
     }
 
     /// Attaches a `summary.md` to this session's snapshot, so the standup lane has something to
@@ -291,7 +303,7 @@ fn snapshot_document(session: &ArchivedSession) -> String {
             "manifest":{{"schema_version":1,
                 "session":{{"source_agent":"{}","source_session_id":"harness"}},
                 "capture":{{"captured_at":"{}","source_cursor":null,
-                    "source_state_hash":null,"source_metadata":{},"project":null,
+                    "source_state_hash":null,"source_metadata":{source_metadata},"project":null,
                     "repository":null,"branch":null,"source_agent_version":null,
                     "artifact_set_version":2,"munshi_version":null}},
                 "artifacts":[]}},
@@ -313,7 +325,6 @@ fn snapshot_document(session: &ArchivedSession) -> String {
         session.snapshot_id,
         session.source_agent,
         session.completed_at,
-        source_metadata(session),
         session.artifact_id,
         session.transcript.len(),
         session.original_sha256,
@@ -322,7 +333,23 @@ fn snapshot_document(session: &ArchivedSession) -> String {
         session.artifact_id,
         session.artifact_id,
         summary_artifact(session),
+        source_metadata = source_metadata(session),
     )
+}
+
+/// The manifest's `capture.source_metadata` object: the capturing machine's `hostname` (the fact the
+/// per-device scope groups by) and its `utc_offset` (the fact the heatmap reads), each present only
+/// when the session names it. The empty `{}` — a capture written before the metadata existed — is
+/// what every other fixture here stays in.
+fn source_metadata(session: &ArchivedSession) -> String {
+    let mut fields = Vec::new();
+    if let Some(hostname) = &session.hostname {
+        fields.push(format!(r#""hostname":"{hostname}""#));
+    }
+    if let Some(offset) = &session.utc_offset {
+        fields.push(format!(r#""utc_offset":"{offset}""#));
+    }
+    format!("{{{}}}", fields.join(","))
 }
 
 /// The snapshot's second artifact, when it has one. A snapshot with no `summary.md` is what the
@@ -346,16 +373,6 @@ fn summary_artifact(session: &ArchivedSession) -> String {
         session.summary_artifact_id,
         session.summary_artifact_id,
     )
-}
-
-/// The capture's `source_metadata` object: `{"hostname":"…"}` when the session names a device, and
-/// the empty `{}` — the real state of a capture written before the metadata existed — otherwise.
-/// This is the manifest field qanungo's per-device scope groups by.
-fn source_metadata(session: &ArchivedSession) -> String {
-    match &session.hostname {
-        Some(hostname) => format!(r#"{{"hostname":"{hostname}"}}"#),
-        None => "{}".to_owned(),
-    }
 }
 
 fn json_response(body: &str) -> Vec<u8> {
@@ -3762,5 +3779,214 @@ fn the_device_scope_groups_the_window_by_the_host_the_manifest_recorded() {
             let tag = evidence["device"].as_str().expect("an evidence device tag");
             assert!(device_labels.contains(tag), "unknown device tag {tag}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The heatmap (qanungo #5, the habits view on local time)
+// ---------------------------------------------------------------------------
+
+/// A window whose sessions carry a known UTC offset, so the local hour each lands on is a fact this
+/// test decides rather than one the archive's zone decides for it.
+///
+/// Every session shares the marathon fixture, whose own first record is `2026-08-10T09:00:00Z` — a
+/// **Monday** — so the offset is the whole of what moves it into a local hour:
+///
+/// | # | Harness | Offset | Local start | Cell `(weekday, hour)` | Repository |
+/// | --- | --- | --- | --- | --- | --- |
+/// | 1 | claude-code | `-07:00` | Mon 02:00 | `(0, 2)` | `surdy/qanungo` |
+/// | 2 | claude-code | `-07:00` | Mon 02:00 | `(0, 2)` | `surdy/qanungo` |
+/// | 3 | copilot-cli | `+05:30` | (its own first record) | — | `surdy/qanungo` |
+/// | 4 | claude-code | none | — | on no cell, `no_offset` | `surdy/munshi` |
+///
+/// Placement is on the transcript's own fixed instant, so a cell is stable year to year; the
+/// sessions stay in the window because `archived_at` is relative (`hours_ago`). Session 3 uses a
+/// copilot transcript whose first record this table does not pin — it exists to widen the harness
+/// axis and to be a session on *some* cell, not to assert a particular one.
+fn offset_archive() -> Vec<ArchivedSession> {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let copilot = transcript("munshi/copilot-1.0.76-compaction.jsonl");
+    vec![
+        ArchivedSession::new(1, "claude-code", &clean, 1)
+            .with_utc_offset("-07:00")
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(2, "claude-code", &clean, 2)
+            .with_utc_offset("-07:00")
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(3, "copilot-cli", &copilot, 3)
+            .with_utc_offset("+05:30")
+            .in_repository("surdy/qanungo"),
+        // No offset recorded — the state the heatmap places on no cell and counts.
+        ArchivedSession::new(4, "claude-code", &clean, 4).in_repository("surdy/munshi"),
+    ]
+}
+
+/// Every session placed across a heatmap's cells, over the harness columns.
+fn placed_sessions(heatmap: &serde_json::Value) -> u64 {
+    heatmap["cells"]
+        .as_array()
+        .expect("a cell list")
+        .iter()
+        .flat_map(|cell| cell["sessions"].as_array().expect("one count per harness"))
+        .map(|count| count.as_u64().expect("a count"))
+        .sum()
+}
+
+/// One cell out of a heatmap, by its local `(weekday, hour)`.
+fn cell_at(heatmap: &serde_json::Value, weekday: u64, hour: u64) -> Option<&serde_json::Value> {
+    heatmap["cells"]
+        .as_array()
+        .expect("a cell list")
+        .iter()
+        .find(|cell| {
+            cell["weekday"].as_u64() == Some(weekday) && cell["hour"].as_u64() == Some(hour)
+        })
+}
+
+/// The slice's own claim: the window laid on the operator's own clock — the local hour of the
+/// weekday each session's work *began*, shifted from the transcript's instant by the session's own
+/// offset — with the offset-less session counted on no cell.
+#[test]
+fn the_heatmap_lays_the_window_on_local_hours_of_the_week() {
+    let (address, _directory) = spawn_dashboard(offset_archive());
+    let payload = payload_of(address);
+    let heatmap = &payload["heatmap"];
+
+    // The two -07:00 claude sessions began Monday 09:00Z, which is Monday 02:00 local: cell (0, 2),
+    // both on the claude column of the payload's one harness axis.
+    let harnesses: Vec<&str> = payload["scopes"]["harnesses"]
+        .as_array()
+        .expect("the harness axis")
+        .iter()
+        .map(|label| label.as_str().unwrap())
+        .collect();
+    assert_eq!(harnesses, vec!["claude-code", "copilot-cli"]);
+    let monday_two_am = cell_at(heatmap, 0, 2).expect("the -07:00 sessions' local cell");
+    assert_eq!(monday_two_am["sessions"], serde_json::json!([2, 0]));
+    assert_eq!(
+        heatmap["cells_covered"],
+        heatmap["cells"].as_array().unwrap().len(),
+    );
+
+    // The offset-less session is on no cell, counted — the same refusal the timeline makes for a
+    // missing archive time, for the reason this whole view waited on.
+    assert_eq!(heatmap["no_offset"], 1);
+    assert_eq!(heatmap["undated"], 0);
+
+    // Reconciliation: placed + unplaceable == the window's own folded count.
+    let folded = payload["sessions"]["folded"].as_u64().expect("a count");
+    assert_eq!(folded, 4);
+    assert_eq!(
+        placed_sessions(heatmap)
+            + heatmap["no_offset"].as_u64().unwrap()
+            + heatmap["undated"].as_u64().unwrap(),
+        folded,
+    );
+
+    // Positional against the one harness axis, in the heatmap as in the lanes: every cell's two
+    // arrays are exactly as wide as the roster.
+    for cell in heatmap["cells"].as_array().unwrap() {
+        assert_eq!(cell["sessions"].as_array().unwrap().len(), harnesses.len());
+        assert_eq!(
+            cell["active_seconds"].as_array().unwrap().len(),
+            harnesses.len()
+        );
+    }
+
+    // The footer names the clock in one word, and it is a *different* clock from the timeline's
+    // archive-UTC — local, off the transcript's first activity.
+    let provenance = &payload["provenance"]["heatmap"];
+    assert_eq!(provenance["basis"], "first-activity-local");
+    assert_eq!(provenance["cells_covered"], heatmap["cells_covered"]);
+    assert_eq!(provenance["no_offset"], 1);
+    assert_eq!(provenance["undated"], 0);
+}
+
+/// Narrowing to a repository narrows the grid with it, and each scope's cells reconcile to that
+/// scope's own count — including a scope whose every session is unplaceable, which is all counts and
+/// no cells rather than a phantom one.
+#[test]
+fn every_heatmap_scope_reconciles_to_its_own_count() {
+    let (address, _directory) = spawn_dashboard(offset_archive());
+    let payload = payload_of(address);
+
+    // The whole window first.
+    let whole = &payload["heatmap"];
+    assert_eq!(
+        placed_sessions(whole)
+            + whole["no_offset"].as_u64().unwrap()
+            + whole["undated"].as_u64().unwrap(),
+        payload["sessions"]["folded"].as_u64().unwrap(),
+    );
+
+    // surdy/qanungo holds the three offset-bearing sessions: all placed, none counted off-grid.
+    let qanungo = &scope_of(&payload, "surdy/qanungo")["heatmap"];
+    assert_eq!(qanungo["no_offset"], 0);
+    assert_eq!(placed_sessions(qanungo), 3);
+    assert_eq!(
+        cell_at(qanungo, 0, 2).expect("the -07:00 cell")["sessions"],
+        serde_json::json!([2, 0])
+    );
+
+    // surdy/munshi holds only the offset-less session: no cell at all, one counted.
+    let munshi = &scope_of(&payload, "surdy/munshi")["heatmap"];
+    assert_eq!(munshi["cells_covered"], 0);
+    assert_eq!(munshi["cells"], serde_json::json!([]));
+    assert_eq!(munshi["no_offset"], 1);
+
+    // Every scope reconciles against its own two counts — the numbers the page's own sentence
+    // quotes.
+    for scope in payload["scopes"]["repositories"].as_array().unwrap() {
+        let heatmap = &scope["heatmap"];
+        assert_eq!(
+            placed_sessions(heatmap)
+                + heatmap["no_offset"].as_u64().unwrap()
+                + heatmap["undated"].as_u64().unwrap(),
+            scope["sessions"]["folded"].as_u64().unwrap(),
+            "{} draws a different number of sessions from the one it counts",
+            scope["repository"],
+        );
+    }
+}
+
+/// The section's hard invariant: **numbers and nothing else** — not a weekday name, not a harness
+/// label, not even an ISO date (the heatmap has no dates, only indices). Every leaf is a
+/// non-negative integer, top level and in every scope, so there is nowhere for an archive-written
+/// byte to hide.
+#[test]
+fn the_heatmap_section_is_integers_and_nothing_else() {
+    let (address, _directory) = spawn_dashboard(offset_archive());
+    let payload = payload_of(address);
+
+    let mut leaves = 0;
+    assert_heatmap_leaves(&payload["heatmap"], "heatmap", &mut leaves);
+    for scope in payload["scopes"]["repositories"].as_array().unwrap() {
+        assert_heatmap_leaves(&scope["heatmap"], "scope heatmap", &mut leaves);
+    }
+    assert!(leaves > 20, "the walk visited only {leaves} leaves");
+}
+
+/// Asserts that every leaf under a heatmap block is a non-negative integer. Recurses, because the
+/// interesting places for a string to hide are the cell rows.
+fn assert_heatmap_leaves(value: &serde_json::Value, path: &str, leaves: &mut usize) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields {
+                assert_heatmap_leaves(field, &format!("{path}.{key}"), leaves);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                assert_heatmap_leaves(item, &format!("{path}[{index}]"), leaves);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            *leaves += 1;
+            assert!(
+                number.as_i64().is_some_and(|value| value >= 0),
+                "{path} is {number}, which is not a count",
+            );
+        }
+        other => panic!("{path} is {other}, which the heatmap never serves"),
     }
 }
