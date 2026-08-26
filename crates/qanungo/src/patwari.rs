@@ -212,6 +212,15 @@ pub struct SnapshotDetail {
     pub source_agent: String,
     pub artifact_set_version: u16,
     pub artifacts: Vec<ListedArtifact>,
+    /// The host the capture ran on, as the manifest's `capture.source_metadata.hostname` stated
+    /// it. `None` on a snapshot whose manifest carries no `source_metadata`, or no `hostname`
+    /// within it — a real archive state on captures written before the metadata existed, parsed
+    /// rather than guessed.
+    pub hostname: Option<String>,
+    /// The capturing host's UTC offset (e.g. `-07:00`), as the manifest's
+    /// `capture.source_metadata.utc_offset` stated it. `None` on the same older captures as
+    /// [`SnapshotDetail::hostname`], for the same reason.
+    pub utc_offset: Option<String>,
 }
 
 impl SnapshotDetail {
@@ -241,10 +250,22 @@ impl SnapshotDetail {
             .iter()
             .map(listed_artifact)
             .collect::<Result<Vec<_>, _>>()?;
+        // Presentation-only provenance, absent on older captures: parsed to `Option`, never made
+        // a requirement, so a snapshot missing `source_metadata` still reads.
+        let hostname = nested_str(
+            value,
+            &["manifest", "capture", "source_metadata", "hostname"],
+        );
+        let utc_offset = nested_str(
+            value,
+            &["manifest", "capture", "source_metadata", "utc_offset"],
+        );
         Ok(Self {
             source_agent,
             artifact_set_version,
             artifacts,
+            hostname,
+            utc_offset,
         })
     }
 
@@ -1010,6 +1031,8 @@ mod tests {
         let detail = SnapshotDetail {
             source_agent: "claude-code".to_owned(),
             artifact_set_version: 2,
+            hostname: None,
+            utc_offset: None,
             artifacts: vec![
                 ListedArtifact {
                     artifact_id: "a".to_owned(),
@@ -1047,5 +1070,70 @@ mod tests {
         };
         assert!(transcript_only.summary().is_none());
         assert!(transcript_only.transcript().is_some());
+    }
+
+    /// A base snapshot document with everything `from_document` requires, so a test can vary only
+    /// the `capture.source_metadata` it is probing.
+    fn snapshot_document(source_metadata: Value) -> Value {
+        let mut capture = serde_json::json!({ "artifact_set_version": 2 });
+        if !source_metadata.is_null() {
+            capture["source_metadata"] = source_metadata;
+        }
+        serde_json::json!({
+            "manifest": {
+                "session": { "source_agent": "claude-code" },
+                "capture": capture,
+            },
+            "artifacts": [],
+        })
+    }
+
+    /// The metadata is presentation-only provenance the index caches inline with the rest of the
+    /// document, so parsing it in the one document reader carries it onto both the wire and the
+    /// cache paths at once.
+    #[test]
+    fn from_document_reads_the_capture_source_metadata_when_it_is_present() {
+        let document = snapshot_document(serde_json::json!({
+            "hostname": "macbookpro",
+            "utc_offset": "-07:00",
+        }));
+        let detail = SnapshotDetail::from_document(&document).unwrap();
+        assert_eq!(detail.hostname.as_deref(), Some("macbookpro"));
+        assert_eq!(detail.utc_offset.as_deref(), Some("-07:00"));
+    }
+
+    /// A capture written before the metadata existed carries no `source_metadata`, and one written
+    /// mid-migration may carry only one of the two keys — or a non-string where a string was
+    /// expected. Every such shape is a real snapshot this build reads as having no such fact,
+    /// rather than a protocol error or a guess.
+    #[test]
+    fn from_document_reads_absent_or_partial_source_metadata_as_none() {
+        // No `source_metadata` at all.
+        let bare = SnapshotDetail::from_document(&snapshot_document(Value::Null)).unwrap();
+        assert_eq!(bare.hostname, None);
+        assert_eq!(bare.utc_offset, None);
+
+        // Present, but each key missing on its own, or not a string.
+        let hostname_only = SnapshotDetail::from_document(&snapshot_document(serde_json::json!({
+            "hostname": "macbookpro",
+        })))
+        .unwrap();
+        assert_eq!(hostname_only.hostname.as_deref(), Some("macbookpro"));
+        assert_eq!(hostname_only.utc_offset, None);
+
+        let offset_only = SnapshotDetail::from_document(&snapshot_document(serde_json::json!({
+            "utc_offset": "-07:00",
+        })))
+        .unwrap();
+        assert_eq!(offset_only.hostname, None);
+        assert_eq!(offset_only.utc_offset.as_deref(), Some("-07:00"));
+
+        let not_a_string = SnapshotDetail::from_document(&snapshot_document(serde_json::json!({
+            "hostname": 7,
+            "utc_offset": false,
+        })))
+        .unwrap();
+        assert_eq!(not_a_string.hostname, None);
+        assert_eq!(not_a_string.utc_offset, None);
     }
 }

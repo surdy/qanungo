@@ -227,6 +227,8 @@ mod tests {
             source_agent: source_agent.to_owned(),
             repository: None,
             archived_at: archived_at.map(at),
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: timestamps.first().copied(),

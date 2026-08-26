@@ -891,6 +891,27 @@ pub struct SessionMetrics {
     /// answering a question nobody asked. `None` — an archive time this build could not parse —
     /// places the session on no day at all and is counted rather than guessed onto one.
     pub archived_at: Option<DateTime<Utc>>,
+    /// The host the *snapshot's manifest* recorded the capture running on, when it recorded one.
+    /// Unlike [`SessionMetrics::repository`], this is a fact off the manifest rather than the
+    /// listing row, carried from
+    /// [`MirroredSession::hostname`](crate::sync::MirroredSession) without a second fold.
+    ///
+    /// **Nothing scores it and no rule reads it.** It is here so a *presentation* can group the
+    /// per-session facts a fold already produced — the dashboard's per-device scope — without
+    /// re-reading a manifest to find out where the work ran. Carrying it changes no number: the
+    /// rule pack does not stamp it, `Scorecard` does not group by it, and the Markdown report
+    /// renders it nowhere. `None` on a capture written before the metadata existed — a real state,
+    /// not a defect.
+    pub hostname: Option<String>,
+    /// The capturing host's UTC offset (e.g. `-07:00`), off the same snapshot manifest as
+    /// [`SessionMetrics::hostname`] and carried from
+    /// [`MirroredSession::utc_offset`](crate::sync::MirroredSession).
+    ///
+    /// **Nothing scores it and no rule reads it**, exactly as with [`SessionMetrics::hostname`].
+    /// It is here so a *presentation* can place the per-session facts a fold already produced on a
+    /// local-time clock — the activity heatmap — without re-reading a manifest. Carrying it changes
+    /// no number. `None` on the same older captures, for the same reason.
+    pub utc_offset: Option<String>,
     /// The artifact-set contract the snapshot declared, carried so an anchored event can be read
     /// back out of the cached blob with the same interpreter the fold used. Nothing scores it.
     pub artifact_set_version: u16,
@@ -1367,6 +1388,8 @@ mod tests {
             source_agent: "claude-code".to_owned(),
             repository: None,
             archived_at: None,
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             summary: fold.summary,
             tools: fold.tools,
@@ -1820,6 +1843,8 @@ mod tests {
             source_agent: "claude-code".to_owned(),
             repository: None,
             archived_at: None,
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(at(date)),
@@ -1918,6 +1943,8 @@ mod tests {
             source_agent: "claude-code".to_owned(),
             repository: None,
             archived_at: None,
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(start),

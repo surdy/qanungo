@@ -826,6 +826,8 @@ mod tests {
             source_agent: "claude-code".to_owned(),
             repository: None,
             archived_at: None,
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             anchors: SessionAnchors::default(),
             summary: SessionSummary {
@@ -913,6 +915,8 @@ mod tests {
                     source_agent: "claude-code".to_owned(),
                     repository: None,
                     archived_at: None,
+                    hostname: None,
+                    utc_offset: None,
                     artifact_set_version: 2,
                     anchors: SessionAnchors::default(),
                     summary: SessionSummary {

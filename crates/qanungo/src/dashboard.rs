@@ -1582,6 +1582,8 @@ mod tests {
                     archived_at: Some(
                         at("2026-08-11T09:00:00Z") + TimeDelta::days(index as i64 % 5),
                     ),
+                    hostname: None,
+                    utc_offset: None,
                     artifact_set_version: 2,
                     summary: SessionSummary {
                         user_requests: 4,

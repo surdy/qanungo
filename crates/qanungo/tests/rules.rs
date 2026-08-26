@@ -39,6 +39,8 @@ fn fold(relative: &str, source_agent: &str) -> SessionMetrics {
         source_agent: source_agent.to_owned(),
         repository: None,
         archived_at: None,
+        hostname: None,
+        utc_offset: None,
         artifact_set_version: 2,
         summary: folded.summary,
         tools: folded.tools,

@@ -535,6 +535,10 @@ fn fold_one(cache: &BlobCache, mirrored: &MirroredSession) -> Result<SessionMetr
         // the only clock a per-day count can be made to reconcile against the window's own session
         // count. Nothing below reads it either.
         archived_at: mirrored.archived_at,
+        // Off the snapshot's manifest, carried the same presentation-only way: a per-device scope
+        // and an activity heatmap read them, nothing below does.
+        hostname: mirrored.hostname.clone(),
+        utc_offset: mirrored.utc_offset.clone(),
         // Carried, not re-derived: the excerpt route reads the anchored event back with the same
         // interpreter this fold used, and the snapshot is what states which contract that is.
         artifact_set_version: mirrored.artifact_set_version,
@@ -867,6 +871,8 @@ mod tests {
             size_bytes: 0,
             archived_at: archived_at.map(at),
             repository: None,
+            hostname: None,
+            utc_offset: None,
         }
     }
 

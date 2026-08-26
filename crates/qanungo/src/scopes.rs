@@ -194,6 +194,8 @@ mod tests {
             source_agent: source_agent.to_owned(),
             repository: repository.map(ToOwned::to_owned),
             archived_at: None,
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             summary: SessionSummary {
                 first_timestamp: Some(first),

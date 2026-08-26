@@ -938,6 +938,8 @@ mod tests {
             source_agent: source_agent.to_owned(),
             repository: None,
             archived_at: None,
+            hostname: None,
+            utc_offset: None,
             artifact_set_version: 2,
             anchors: SessionAnchors::default(),
             summary: SessionSummary {

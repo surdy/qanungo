@@ -71,6 +71,8 @@ impl Archive {
             size_bytes: bytes.len() as u64,
             archived_at: Some(at(archived_at)),
             repository: Some("whatever-the-projection-said".to_owned()),
+            hostname: None,
+            utc_offset: None,
         }
     }
 

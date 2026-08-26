@@ -152,6 +152,15 @@ pub struct MirroredSession {
     /// real state — a session captured outside a checkout — and the cost lane gives it its own
     /// row rather than merging it into a named repository's.
     pub repository: Option<String>,
+    /// The host the snapshot's manifest recorded the capture running on. Unlike
+    /// [`MirroredSession::repository`], this comes from the *snapshot* the artifact was read from,
+    /// not the listing row — it lives only on the manifest. `None` on a capture written before the
+    /// metadata existed, carried for a presentation to scope by and read by nothing here.
+    pub hostname: Option<String>,
+    /// The capturing host's UTC offset (e.g. `-07:00`), from the same snapshot manifest and for
+    /// the same presentation-only reason as [`MirroredSession::hostname`]. `None` on older
+    /// captures.
+    pub utc_offset: Option<String>,
 }
 
 /// Snapshots of one session this client will look through when its `latest_snapshot` turns out
@@ -413,6 +422,10 @@ fn mirrored(
         // A fallback sibling's own completion time would be a different clock reading.
         archived_at: parse_archive_time(&session.completed_at),
         repository: session.repository.clone(),
+        // These two, unlike `repository`, come from the snapshot actually read rather than the
+        // listing row: they live only on the manifest, so a fallback sibling states its own.
+        hostname: snapshot.hostname.clone(),
+        utc_offset: snapshot.utc_offset.clone(),
     }
 }
 
@@ -579,6 +592,8 @@ mod tests {
             source_agent: source_agent.to_owned(),
             artifact_set_version: 2,
             artifacts: logical_paths.iter().copied().map(artifact).collect(),
+            hostname: None,
+            utc_offset: None,
         }
     }
 
@@ -603,6 +618,34 @@ mod tests {
             Artifact::Summary.usable(&unknown),
             "the standup lane must still see a session whose manifest this build cannot place",
         );
+    }
+
+    /// The manifest's capture metadata rides onto the mirror record from the snapshot actually
+    /// read — not the listing row, which never carries it — so a presentation downstream can scope
+    /// by host or place on a clock without a second fold.
+    #[test]
+    fn mirrored_carries_the_snapshots_capture_metadata() {
+        let session = ListedSession {
+            session_id: "1".repeat(32),
+            source_agent: "claude-code".to_owned(),
+            snapshot_id: "2".repeat(32),
+            completed_at: "2026-08-16T10:00:00.000Z".to_owned(),
+            repository: Some("surdy/qanungo".to_owned()),
+        };
+        let mut snap = snapshot("claude-code", &[TRANSCRIPT_LOGICAL_PATH]);
+        snap.hostname = Some("macbookpro".to_owned());
+        snap.utc_offset = Some("-07:00".to_owned());
+        let wanted = artifact(TRANSCRIPT_LOGICAL_PATH);
+
+        let record = mirrored(&session, &snap, &wanted);
+        assert_eq!(record.hostname.as_deref(), Some("macbookpro"));
+        assert_eq!(record.utc_offset.as_deref(), Some("-07:00"));
+
+        // A snapshot whose manifest predates the metadata leaves both `None` on the record.
+        let older = snapshot("claude-code", &[TRANSCRIPT_LOGICAL_PATH]);
+        let record = mirrored(&session, &older, &wanted);
+        assert_eq!(record.hostname, None);
+        assert_eq!(record.utc_offset, None);
     }
 
     /// Each lane is blind to exactly the snapshot that lacks *its* artifact, which is what makes
