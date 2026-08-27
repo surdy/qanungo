@@ -3604,6 +3604,9 @@ fn document(lane: &str, base: &str, cache: &std::path::Path) -> String {
         Command::Report(args) => command::report(args, &mut out).expect("the report renders"),
         Command::Cost(args) => command::cost(args, &mut out).expect("the cost report renders"),
         Command::Standup(args) => command::standup(args, &mut out).expect("the standup renders"),
+        // Ask is a document lane too, but this helper drives the three windowed lanes by name and
+        // never supplies the query ask requires, so a run reaching here is a test wiring mistake.
+        Command::Ask(_) => panic!("`{lane}` is not driven by this helper"),
         Command::Dashboard(_) => panic!("`{lane}` is not a document lane"),
     }
     String::from_utf8(out).expect("a document is UTF-8")

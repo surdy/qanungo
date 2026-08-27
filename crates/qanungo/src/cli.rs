@@ -61,6 +61,13 @@ pub const DEFAULT_STANDUP_WINDOW: &str = "7d";
 /// from the terminal beside it.
 pub const DEFAULT_COST_WINDOW: &str = "12w";
 
+/// How many ranked matches `qanungo ask` prints when nobody says otherwise.
+///
+/// **A tunable, not a decision.** Ten is enough to see the shape of what matched without turning a
+/// search into a document, and `--limit` widens or narrows it. Because the ranking is total, the
+/// tenth line is the tenth-*best* match and not merely the tenth one the fold happened to read.
+pub const DEFAULT_ASK_LIMIT: usize = 10;
+
 /// Where `qanungo dashboard` listens when nobody says otherwise.
 ///
 /// **Loopback**, because a surface with no authentication has to be opt-in to being reachable at
@@ -122,6 +129,8 @@ pub enum Command {
     Cost(CostArgs),
     /// Narrate recent archived sessions from their own summaries, as Markdown on stdout.
     Standup(StandupArgs),
+    /// Search the archived summaries for a plain-language query, ranked, as Markdown on stdout.
+    Ask(AskArgs),
     /// Serve the coaching report's own numbers as a read-only web page, refreshed in the
     /// background.
     Dashboard(DashboardArgs),
@@ -212,6 +221,45 @@ pub struct StandupArgs {
     /// How far back to narrate, as `<count><unit>` with unit `h`, `d`, or `w`.
     #[arg(long = "last", default_value = DEFAULT_STANDUP_WINDOW, value_parser = parse_window)]
     pub last: Window,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
+
+    #[command(flatten)]
+    pub redaction: RedactionArgs,
+}
+
+/// The ask lane (qanungo #10): plain-language search over the summaries munshi already wrote.
+///
+/// This is qanungo's no-editor answer to "have I touched the payments API?" — the session-recall
+/// funnel's first stage, given a command surface. It searches the same `summary.md` records the
+/// standup lane narrates, so it flattens [`RedactionArgs`] for the same reason: a matched snippet
+/// is archived prose, and prose reaches the screen only through the scrub.
+///
+/// # No default window, unlike every other lane
+///
+/// `report`, `cost`, and `standup` each default to a window, because each answers a question about
+/// a stretch of recent time. Ask does not: "have I ever done this" is a question about *all* of
+/// history, and a lane that quietly searched only the last week would answer a narrower question
+/// than the one that was typed and call an absence a "no". So `--last` is optional here, and its
+/// absence means the whole archive. When it is given it narrows the search on the same grammar,
+/// for the reader who does mean "lately".
+#[derive(Debug, Args)]
+pub struct AskArgs {
+    /// The words to search for. Matched case-insensitively against each summary's own text; very
+    /// short and very common words are dropped first, so a query cannot rank every session equally
+    /// on the strength of the word "the".
+    pub query: String,
+
+    /// Narrow the search to `<count><unit>` of history, with unit `h`, `d`, or `w`. Omitted, the
+    /// search covers the whole archive — see this struct's own note for why that is the default.
+    #[arg(long = "last", value_parser = parse_window)]
+    pub last: Option<Window>,
+
+    /// How many ranked matches to print. Refused rather than clamped below one: a search that can
+    /// show nothing is not a narrower search, it is a broken one.
+    #[arg(long = "limit", default_value_t = DEFAULT_ASK_LIMIT, value_parser = parse_limit)]
+    pub limit: usize,
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
@@ -385,6 +433,18 @@ fn parse_concurrency(value: &str) -> Result<usize, String> {
             "must be between 1 and {} — Patwari is a LAN archive with a modest concurrency limit",
             crate::sync::MAX_CONCURRENCY,
         ));
+    }
+    Ok(count)
+}
+
+/// Refuses a result limit of zero rather than printing a search that can match nothing: somebody
+/// who typed `--limit 0` has a belief about what the tool will do, and an empty ranking is not it.
+fn parse_limit(value: &str) -> Result<usize, String> {
+    let count: usize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a result count"))?;
+    if count == 0 {
+        return Err("a limit of zero would print no matches".to_owned());
     }
     Ok(count)
 }
@@ -563,8 +623,56 @@ mod tests {
         assert!(Cli::try_parse_from(["qanungo", "standup", "--no-redact"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "dashboard", "--no-redact"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "dashboard", "--filter-profanity"]).is_ok());
+        // Ask renders matched summary prose, so it flattens the flags like the other two content
+        // lanes — with a query, since the query is required.
+        assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--no-redact"]).is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--filter-profanity"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
         assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
+    }
+
+    /// Ask is the one lane with no default window: a run with just a query searches the whole
+    /// archive, and `--last` is what narrows it. The query itself is required — a search with no
+    /// terms is a usage error, not an empty run.
+    #[test]
+    fn ask_searches_all_history_until_a_window_narrows_it() {
+        let Command::Ask(args) = Cli::parse_from(["qanungo", "ask", "payments API"]).command else {
+            panic!("`ask` parses as the ask command");
+        };
+        assert_eq!(args.query, "payments API");
+        assert!(args.last.is_none(), "no window means all of history");
+        assert_eq!(args.limit, DEFAULT_ASK_LIMIT);
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+
+        let Command::Ask(scoped) =
+            Cli::parse_from(["qanungo", "ask", "payments", "--last", "30d"]).command
+        else {
+            panic!("`ask` parses as the ask command");
+        };
+        assert_eq!(
+            scoped.last.map(|window| window.delta()),
+            Some(TimeDelta::days(30))
+        );
+
+        // No query is a usage error, and the window still shares the one grammar.
+        assert!(Cli::try_parse_from(["qanungo", "ask"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--last", "5m"]).is_err());
+    }
+
+    /// A result limit is refused at zero rather than clamped, and defaults to ten.
+    #[test]
+    fn ask_refuses_a_limit_of_zero() {
+        assert_eq!(parse_limit("1").unwrap(), 1);
+        assert_eq!(parse_limit("25").unwrap(), 25);
+        for bad in ["0", "-1", "lots", ""] {
+            assert!(parse_limit(bad).is_err(), "`{bad}` must be refused");
+        }
+        assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--limit", "0"]).is_err());
+        let Command::Ask(args) = Cli::parse_from(["qanungo", "ask", "x", "--limit", "3"]).command
+        else {
+            panic!("`ask` parses as the ask command");
+        };
+        assert_eq!(args.limit, 3);
     }
 
     /// The dashboard's scrub is decided once, on the command line, and typing nothing is the safe

@@ -79,8 +79,10 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
+use crate::ask::{Ask, Query};
+use crate::ask_report::{AskInstrumentation, AskReport};
 use crate::cache::BlobCache;
-use crate::cli::{ArchiveArgs, CostArgs, ReportArgs, StandupArgs, Window};
+use crate::cli::{ArchiveArgs, AskArgs, CostArgs, ReportArgs, StandupArgs, Window};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
 use crate::evidence;
@@ -425,6 +427,109 @@ pub fn standup(args: &StandupArgs, out: &mut impl Write) -> Result<(), CommandEr
         .map_err(CommandError::Output)
 }
 
+/// What `fold_ask` returns: the ranked search plus what it cost, the same triple the other folds
+/// hand their renderer.
+pub struct FoldedAsk {
+    pub generated_at: DateTime<Utc>,
+    pub ask: Ask,
+    pub instrumentation: AskInstrumentation,
+}
+
+/// Searches one scope of archived summaries against a query and ranks the matches (qanungo #10).
+///
+/// `window` is `None` for the whole archive and `Some` to narrow to a window on the same clock the
+/// other lanes cut on. Everything the fold reads is a `summary.md` the cache already holds; the
+/// scoring is [`Ask::fold`]'s, and the scrub happens there, so [`FoldedAsk`] — like [`FoldedStandup`]
+/// — carries no pre-scrub string for any surface to leak.
+///
+/// # Errors
+///
+/// Returns an error when the cache is unusable or the archive cannot be listed. A session with no
+/// readable summary is *unsearchable*, counted on the result and never a failed run.
+pub fn fold_ask(
+    archive: &ArchiveArgs,
+    window: Option<&Window>,
+    query: &Query,
+    redactor: Redactor,
+    limit: usize,
+) -> Result<FoldedAsk, CommandError> {
+    let prepared = match window {
+        Some(window) => Prepared::mirror(archive, window, Artifact::Summary, Reach::WindowOnly)?,
+        None => Prepared::mirror_all(archive, Artifact::Summary)?,
+    };
+
+    let fold_started = Instant::now();
+    let placed = prepared.placement();
+    // Every session the window listed that never reaches a score is counted, never dropped — the
+    // same honesty the other three lanes keep. There are three such populations, disjoint: the
+    // mirror's own skips (a snapshot with no `summary.md` at all, or one unreadable at fetch time —
+    // these are in `mirror.skipped`, not in `mirror.sessions`, so `placement` never sees them), the
+    // sessions the archive dated outside the searched window (`placed.unplaceable`), and the ones
+    // whose cached summary this build then failed to read or parse (the `Err` arm below).
+    let mut unsearchable = placed.unplaceable + prepared.mirror.skipped.len();
+    let mut read = Vec::with_capacity(placed.reported.len());
+    for session in &placed.reported {
+        match crate::standup::read_summary(&prepared.cache, session) {
+            Ok(summary) => read.push(summary),
+            Err(_) => unsearchable += 1,
+        }
+    }
+    let ask = Ask::fold(query, &read, &redactor, limit, unsearchable);
+    let fold_elapsed = fold_started.elapsed();
+
+    let instrumentation = AskInstrumentation {
+        sync: prepared.mirror.stats.clone(),
+        fold_elapsed,
+        redactor,
+        patwari_url: prepared.patwari_url.clone(),
+        cache_root: prepared.cache.root().to_path_buf(),
+    };
+    Ok(FoldedAsk {
+        generated_at: prepared.generated_at,
+        ask,
+        instrumentation,
+    })
+}
+
+/// Runs `qanungo ask`, writing Markdown to `out`.
+///
+/// The query is parsed before anything touches the archive: a query with no searchable word in it
+/// is answered on the spot ([`crate::ask_report::no_searchable_terms`]) rather than mirroring the
+/// whole archive to rank nothing.
+///
+/// # Errors
+///
+/// Returns an error on the same conditions the other lanes do. A session with no readable summary
+/// is a counted non-match, never a failed run.
+pub fn ask(args: &AskArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let query = Query::parse(&args.query);
+    if query.is_empty() {
+        return out
+            .write_all(crate::ask_report::no_searchable_terms(&args.query).as_bytes())
+            .map_err(CommandError::Output);
+    }
+    let folded = fold_ask(
+        &args.archive,
+        args.last.as_ref(),
+        &query,
+        args.redaction.redactor(),
+        args.limit,
+    )?;
+    let markdown = AskReport {
+        raw_query: &args.query,
+        query: &query,
+        window: args.last.as_ref(),
+        limit: args.limit,
+        generated_at: folded.generated_at,
+        ask: &folded.ask,
+        instrumentation: &folded.instrumentation,
+    }
+    .render();
+
+    out.write_all(markdown.as_bytes())
+        .map_err(CommandError::Output)
+}
+
 /// How much history a lane asks the mirror for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
@@ -459,6 +564,52 @@ impl Prepared {
         artifact: Artifact,
         reach: Reach,
     ) -> Result<Self, CommandError> {
+        let generated_at = Utc::now();
+        let opens_at = window.opens_at(generated_at);
+        // A lane that draws no comparison has none, which is the same state a window too long to
+        // double is already in: `placement` then puts anything older in neither half, and the
+        // listing never asked for it in the first place.
+        let comparison_opens_at = match reach {
+            Reach::WindowPair => window.comparison_opens_at(generated_at),
+            Reach::WindowOnly => None,
+        };
+        // The mirror is asked for both windows at once when there is a comparison window to ask
+        // for.
+        let activity_from = comparison_opens_at.unwrap_or(opens_at);
+        Self::mirror_since(
+            archive,
+            artifact,
+            generated_at,
+            opens_at,
+            comparison_opens_at,
+            activity_from,
+        )
+    }
+
+    /// Opens the cache and mirrors *all* of history: list from the epoch, no comparison window, and
+    /// — because `opens_at` is the epoch too — [`Placement`] then puts every listed session in the
+    /// reported half. What a lane that ranks across the whole archive rather than trending two
+    /// windows needs (qanungo #10). It is a distinct entry point rather than a `--last` sentinel so
+    /// the window grammar keeps meaning one thing, and the "search everything" intent is a shape in
+    /// the code rather than a magic duration.
+    fn mirror_all(archive: &ArchiveArgs, artifact: Artifact) -> Result<Self, CommandError> {
+        let generated_at = Utc::now();
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0)
+            .expect("the Unix epoch is a representable instant");
+        Self::mirror_since(archive, artifact, generated_at, epoch, None, epoch)
+    }
+
+    /// The shared tail of both constructors: open the cache, connect, and mirror from an explicit
+    /// lower bound. The three instants the window is cut on are passed in so the two callers agree
+    /// exactly on how a session is placed, the way the two document lanes already had to.
+    fn mirror_since(
+        archive: &ArchiveArgs,
+        artifact: Artifact,
+        generated_at: DateTime<Utc>,
+        opens_at: DateTime<Utc>,
+        comparison_opens_at: Option<DateTime<Utc>>,
+        activity_from: DateTime<Utc>,
+    ) -> Result<Self, CommandError> {
         let cache = match &archive.cache_dir {
             Some(dir) => BlobCache::open(dir),
             None => BlobCache::open_default(),
@@ -471,20 +622,7 @@ impl Prepared {
                 source,
             })?;
 
-        let generated_at = Utc::now();
-        let opens_at = window.opens_at(generated_at);
-        // A lane that draws no comparison has none, which is the same state a window too long to
-        // double is already in: `placement` then puts anything older in neither half, and the
-        // listing never asked for it in the first place.
-        let comparison_opens_at = match reach {
-            Reach::WindowPair => window.comparison_opens_at(generated_at),
-            Reach::WindowOnly => None,
-        };
-        // The mirror is asked for both windows at once when there is a comparison window to ask
-        // for.
-        let activity_from = comparison_opens_at
-            .unwrap_or(opens_at)
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let activity_from = activity_from.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let mirror = sync::sync(
             &client,
             &cache,

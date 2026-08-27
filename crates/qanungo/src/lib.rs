@@ -192,6 +192,8 @@
 //!
 //! What remains: per-device scope, waiting on a hostname to accrue in the archive.
 
+pub mod ask;
+pub mod ask_report;
 pub mod cache;
 pub mod cli;
 pub mod command;

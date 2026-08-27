@@ -226,7 +226,11 @@ fn render_session(out: &mut String, session: &StandupSession) {
 
 /// The sentence the document says about its own scrub, stated from the redactor that ran rather
 /// than from what was asked for.
-fn redaction_line(redactor: Redactor, report: &RedactionReport) -> String {
+///
+/// Shared with the ask lane ([`crate::ask_report`]), which renders the same kind of scrubbed
+/// archive prose and needs the same footer sentence — a second copy would be one edit away from two
+/// documents making subtly different promises about the same scrub.
+pub(crate) fn redaction_line(redactor: Redactor, report: &RedactionReport) -> String {
     let scrub = match (redactor.redacts_secrets(), redactor.filters_profanity()) {
         (true, true) => "scrubbed for secrets and masked for profanity",
         (true, false) => "scrubbed for secrets",
@@ -251,8 +255,9 @@ fn redaction_line(redactor: Redactor, report: &RedactionReport) -> String {
 }
 
 /// What fired, as `id×count` pairs in pattern order. Counts only, by construction: a
-/// [`RedactionReport`] has nothing else to render.
-fn redaction_counts(report: &RedactionReport) -> String {
+/// [`RedactionReport`] has nothing else to render. Shared with the ask lane for the same reason
+/// [`redaction_line`] is.
+pub(crate) fn redaction_counts(report: &RedactionReport) -> String {
     if report.is_empty() {
         return "none".to_owned();
     }
