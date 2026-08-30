@@ -244,6 +244,16 @@ pub struct StandupArgs {
 /// than the one that was typed and call an absence a "no". So `--last` is optional here, and its
 /// absence means the whole archive. When it is given it narrows the search on the same grammar,
 /// for the reader who does mean "lately".
+///
+/// # `--verbatim` is the funnel's next stage, not a second search
+///
+/// A summary is a curated record, so a ranking over summaries answers "which session was this
+/// about" and stops there. `--verbatim` picks the funnel up where it stops: it takes the hits this
+/// run is going to *show* and searches their transcripts for the same terms. That is a bounded
+/// escalation — at most `--limit` transcripts, most of them already cached — and deliberately not
+/// an archive-wide full-text search, which would mean mirroring every transcript in the archive to
+/// answer one question. The boundary that comes with it is stated in the document: a session no
+/// summary matched is a session this never digs into.
 #[derive(Debug, Args)]
 pub struct AskArgs {
     /// The words to search for. Matched case-insensitively against each summary's own text; very
@@ -260,6 +270,13 @@ pub struct AskArgs {
     /// show nothing is not a narrower search, it is a broken one.
     #[arg(long = "limit", default_value_t = DEFAULT_ASK_LIMIT, value_parser = parse_limit)]
     pub limit: usize,
+
+    /// Also search the transcripts behind the matches that are shown, and quote the lines that hit.
+    /// This digs into the sessions the summaries found — not the whole archive — so it fetches at
+    /// most `--limit` transcripts, and a session no summary matched is still not searched. Excerpts
+    /// are scrubbed like every other line this lane quotes.
+    #[arg(long = "verbatim")]
+    pub verbatim: bool,
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
@@ -642,6 +659,7 @@ mod tests {
         assert_eq!(args.query, "payments API");
         assert!(args.last.is_none(), "no window means all of history");
         assert_eq!(args.limit, DEFAULT_ASK_LIMIT);
+        assert!(!args.verbatim, "the escalation is opt-in");
         assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
 
         let Command::Ask(scoped) =
@@ -657,6 +675,40 @@ mod tests {
         // No query is a usage error, and the window still shares the one grammar.
         assert!(Cli::try_parse_from(["qanungo", "ask"]).is_err());
         assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--last", "5m"]).is_err());
+    }
+
+    /// `--verbatim` is a plain opt-in switch that composes with everything else the lane takes: a
+    /// window, a limit, and the redaction flags. It takes no value — how far the escalation
+    /// reaches is `--limit`'s business, and a second knob for the same bound would let the two
+    /// disagree.
+    #[test]
+    fn verbatim_is_an_opt_in_switch_that_composes_with_the_other_ask_flags() {
+        let Command::Ask(args) = Cli::parse_from([
+            "qanungo",
+            "ask",
+            "payments",
+            "--verbatim",
+            "--last",
+            "12w",
+            "--limit",
+            "3",
+            "--no-redact",
+        ])
+        .command
+        else {
+            panic!("`ask` parses as the ask command");
+        };
+        assert!(args.verbatim);
+        assert_eq!(args.limit, 3);
+        assert_eq!(
+            args.last.map(|window| window.delta()),
+            Some(TimeDelta::weeks(12))
+        );
+        assert!(args.redaction.no_redact);
+
+        // It is a flag, not an option, and it belongs to this lane alone.
+        assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--verbatim", "5"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "standup", "--verbatim"]).is_err());
     }
 
     /// A result limit is refused at zero rather than clamped, and defaults to ten.

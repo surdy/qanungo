@@ -65,6 +65,8 @@ impl Archive {
             .store(&source_hash, &bytes)
             .expect("the cache accepts a blob");
         MirroredSession {
+            session_id: "1".repeat(32),
+            snapshot_id: "2".repeat(32),
             source_hash,
             source_agent: "claude-code".to_owned(),
             artifact_set_version: 2,

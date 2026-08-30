@@ -127,6 +127,22 @@ impl Artifact {
 /// One session's artifact, present in the cache and ready to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirroredSession {
+    /// The archive's own id for the session this artifact was read for, off the listing row.
+    ///
+    /// Carried so a lane that decides *after* the mirror ran that it also wants the session's
+    /// **other** artifact can resolve one without re-listing the window — which is exactly what
+    /// `ask --verbatim` does: it mirrors summaries, ranks them, and only then escalates into the
+    /// transcripts of the handful of sessions it is going to show ([`fetch`]). Nothing in a fold
+    /// reads it.
+    pub session_id: String,
+    /// The snapshot the archive *projected* for this session, off the same listing row — not
+    /// necessarily the snapshot the artifact was read from, when the munshi #78 sibling walk had to
+    /// look past it ([`usable_snapshot`]).
+    ///
+    /// The projection is deliberately what is kept: an escalation to a second artifact starts where
+    /// this run started and makes the same walk for itself, because the sibling carrying a
+    /// `summary.md` is not necessarily the one carrying the transcript.
+    pub snapshot_id: String,
     /// The artifact's content hash — cache key and cited evidence in one.
     pub source_hash: String,
     /// The harness that produced it, from the snapshot's canonical manifest.
@@ -321,48 +337,101 @@ fn mirror_session(
     session: &ListedSession,
     requests: &Requests,
 ) -> Outcome {
-    let skip = |source_agent: &str, reason: SkipReason| {
-        Outcome::Skipped(Skip {
-            source_agent: source_agent.to_owned(),
-            reason,
-        })
+    match resolve(
+        client,
+        cache,
+        artifact,
+        &session.session_id,
+        &session.snapshot_id,
+        &session.source_agent,
+        requests,
+    ) {
+        Ok(resolved) => Outcome::Mirrored {
+            session: mirrored(session, &resolved.snapshot, &resolved.wanted),
+            lookup: resolved.lookup,
+            transferred_bytes: resolved.transferred_bytes,
+        },
+        Err(skip) => Outcome::Skipped(skip),
+    }
+}
+
+/// One session's artifact, resolved from the archive and present in the cache: which snapshot
+/// carries it and which artifact that is, together with what getting there cost.
+struct Resolved {
+    snapshot: SnapshotDetail,
+    wanted: ListedArtifact,
+    lookup: crate::cache::Lookup,
+    /// Stored bytes actually pulled over the wire: zero on a cache hit.
+    transferred_bytes: u64,
+}
+
+/// The archive-side half of mirroring: resolve `artifact` for one session and make sure the cache
+/// holds its bytes.
+///
+/// Keyed on the two ids and a fallback label rather than on a listing row, because the escalation
+/// path ([`fetch`]) holds a [`MirroredSession`] rather than a [`ListedSession`] and has to make
+/// *exactly* this walk — the same index confirmation, the same sibling fallback, the same
+/// verified-then-committed download. Two resolutions that could disagree about which snapshot
+/// carries a session's artifact would be two clients wearing one name.
+///
+/// `listed_agent` names the harness only for the failure before any snapshot has been read; every
+/// later skip names the agent whichever snapshot was actually examined stated.
+fn resolve(
+    client: &ReadClient,
+    cache: &BlobCache,
+    artifact: Artifact,
+    session_id: &str,
+    snapshot_id: &str,
+    listed_agent: &str,
+    requests: &Requests,
+) -> Result<Resolved, Skip> {
+    let skip = |source_agent: &str, reason: SkipReason| Skip {
+        source_agent: source_agent.to_owned(),
+        reason,
     };
-    if let Some(session) = held_via_index(cache, artifact, session) {
+    if let Some((snapshot, wanted)) = held_via_index(cache, artifact, snapshot_id) {
         requests.snapshots_indexed.fetch_add(1, Ordering::Relaxed);
-        return Outcome::Mirrored {
-            session,
+        return Ok(Resolved {
+            snapshot,
+            wanted,
             lookup: crate::cache::Lookup::Hit,
             transferred_bytes: 0,
-        };
+        });
     }
-    let snapshot = match fetch_snapshot(client, cache, &session.snapshot_id, requests) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return skip(
-                &session.source_agent,
-                SkipReason::Unreadable(error.to_string()),
-            );
-        }
-    };
+    let snapshot = fetch_snapshot(client, cache, snapshot_id, requests)
+        .map_err(|error| skip(listed_agent, SkipReason::Unreadable(error.to_string())))?;
     let source_agent = snapshot.source_agent.clone();
-    let snapshot = match usable_snapshot(client, cache, artifact, session, snapshot, requests) {
+    let snapshot = match usable_snapshot(
+        client,
+        cache,
+        artifact,
+        session_id,
+        snapshot_id,
+        snapshot,
+        requests,
+    ) {
         Ok(Resolution::Usable(snapshot)) => snapshot,
-        Ok(Resolution::Unusable(reason)) => return skip(&source_agent, reason),
+        Ok(Resolution::Unusable(reason)) => return Err(skip(&source_agent, reason)),
         // The listing itself failed, so what this session holds is unknown. Saying "no such
         // artifact" here would be reporting a fact this run never learned.
-        Err(error) => return skip(&source_agent, SkipReason::Unreadable(error.to_string())),
+        Err(error) => {
+            return Err(skip(
+                &source_agent,
+                SkipReason::Unreadable(error.to_string()),
+            ));
+        }
     };
-    let Some(wanted) = artifact.of(&snapshot) else {
-        return skip(&source_agent, SkipReason::MissingArtifact(artifact));
+    let Some(wanted) = artifact.of(&snapshot).cloned() else {
+        return Err(skip(&source_agent, SkipReason::MissingArtifact(artifact)));
     };
-    let mirrored = mirrored(session, &snapshot, wanted);
 
-    if cache.contains(&mirrored.source_hash) {
-        return Outcome::Mirrored {
-            session: mirrored,
+    if cache.contains(&wanted.original_sha256) {
+        return Ok(Resolved {
+            snapshot,
+            wanted,
             lookup: crate::cache::Lookup::Hit,
             transferred_bytes: 0,
-        };
+        });
     }
     // The artifact is streamed straight into a staged cache write: it is never held in memory,
     // and it becomes a blob only once the download has verified every digest and size the archive
@@ -370,38 +439,101 @@ fn mirror_session(
     // aborted transfer leaves the cache exactly as it found it. A summary is kilobytes and could
     // be held in a `String` instead — but then the two lanes would cache by two different routes,
     // and only one of them would be the one that refuses unverified bytes.
-    let mut staged = match cache.stage(&mirrored.source_hash) {
-        Ok(staged) => staged,
-        Err(error) => {
-            return skip(
-                &snapshot.source_agent,
-                SkipReason::Unreadable(format!("cache write failed: {error}")),
-            );
-        }
-    };
-    let receipt = match client.download_artifact(wanted, artifact.declared_ceiling(), &mut staged) {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            return skip(
-                &snapshot.source_agent,
-                SkipReason::Unreadable(error.to_string()),
-            );
-        }
-    };
-    if let Err(error) = staged.commit() {
-        return skip(
+    let mut staged = cache.stage(&wanted.original_sha256).map_err(|error| {
+        skip(
             &snapshot.source_agent,
             SkipReason::Unreadable(format!("cache write failed: {error}")),
-        );
-    }
-    Outcome::Mirrored {
-        session: mirrored,
+        )
+    })?;
+    let receipt = client
+        .download_artifact(&wanted, artifact.declared_ceiling(), &mut staged)
+        .map_err(|error| {
+            skip(
+                &snapshot.source_agent,
+                SkipReason::Unreadable(error.to_string()),
+            )
+        })?;
+    staged.commit().map_err(|error| {
+        skip(
+            &snapshot.source_agent,
+            SkipReason::Unreadable(format!("cache write failed: {error}")),
+        )
+    })?;
+    Ok(Resolved {
+        snapshot,
+        wanted,
         lookup: crate::cache::Lookup::Miss,
         // What the receipt counted crossing the wire, not what the listing promised would: the
         // two agree by the time a download succeeds, and counting the measurement keeps the
         // footer a record of the transfer rather than a restatement of the plan.
         transferred_bytes: receipt.stored_bytes,
-    }
+    })
+}
+
+/// One artifact fetched for a *single* already-mirrored session, outside the window mirror.
+///
+/// What an escalation gets back: enough to open the blob and interpret it, plus what asking for it
+/// cost, so a lane that fetches a few transcripts can instrument the escalation the way [`sync`]
+/// instruments a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    /// The artifact's content hash — the cache key its bytes are under.
+    pub source_hash: String,
+    /// The harness stated by the snapshot this artifact was actually read from, which is not
+    /// necessarily the one that carried the session's other artifact.
+    pub source_agent: String,
+    pub artifact_set_version: u16,
+    /// Decompressed size, as the archive declared it and the download verified it.
+    pub size_bytes: u64,
+    pub lookup: crate::cache::Lookup,
+    /// Stored bytes that crossed the wire: zero on a cache hit.
+    pub transferred_bytes: u64,
+    /// Whether the snapshot index settled this session outright — no request of any kind.
+    pub snapshot_indexed: bool,
+    /// Snapshot documents requested from the archive for this one session.
+    pub snapshots_fetched: u64,
+}
+
+/// Fetches one *other* artifact of a session the mirror already listed (qanungo #10's
+/// `--verbatim`).
+///
+/// The window mirror moves one artifact for every session it listed, which is the right shape for
+/// a lane that folds all of them and the wrong shape for one that reads a second artifact of a
+/// handful. This is that second shape: one session, one artifact, the same resolution walk, and no
+/// listing at all. Archive traffic is therefore whatever the caller's own bound is — for the ask
+/// lane, the hits it is going to show.
+///
+/// # Errors
+///
+/// Returns the [`Skip`] this session would have been recorded as by a mirror run for `artifact`:
+/// no snapshot carries it, no interpreter reads it, or the archive could not be read. A caller
+/// states that rather than dropping the session, exactly as the mirror's own skip list is stated.
+pub fn fetch(
+    client: &ReadClient,
+    cache: &BlobCache,
+    artifact: Artifact,
+    session: &MirroredSession,
+) -> Result<Fetched, Skip> {
+    let requests = Requests::default();
+    let resolved = resolve(
+        client,
+        cache,
+        artifact,
+        &session.session_id,
+        &session.snapshot_id,
+        &session.source_agent,
+        &requests,
+    )?;
+    Ok(Fetched {
+        source_hash: resolved.wanted.original_sha256,
+        source_agent: resolved.snapshot.source_agent,
+        artifact_set_version: resolved.snapshot.artifact_set_version,
+        size_bytes: resolved.wanted.original_size_bytes,
+        lookup: resolved.lookup,
+        transferred_bytes: resolved.transferred_bytes,
+        snapshot_indexed: requests.snapshots_indexed.load(Ordering::Relaxed) > 0,
+        snapshots_fetched: requests.snapshots_fetched.load(Ordering::Relaxed),
+    })
 }
 
 /// The mirror's record of a session read from `snapshot`, whichever snapshot that is.
@@ -411,6 +543,12 @@ fn mirrored(
     wanted: &ListedArtifact,
 ) -> MirroredSession {
     MirroredSession {
+        // Both ids come off the *listing row*: the session the window selected and the snapshot it
+        // projected. An escalation to this session's other artifact re-walks from the projection,
+        // so it must be the projection that is remembered rather than whichever sibling this run
+        // ended up reading.
+        session_id: session.session_id.clone(),
+        snapshot_id: session.snapshot_id.clone(),
         source_hash: wanted.original_sha256.clone(),
         // Both taken from whichever snapshot actually carries the artifact: a fallback sibling
         // states its own provenance, and a degenerate snapshot's is not evidence about it.
@@ -438,18 +576,18 @@ fn mirrored(
 fn held_via_index(
     cache: &BlobCache,
     artifact: Artifact,
-    session: &ListedSession,
-) -> Option<MirroredSession> {
-    let document = cache.snapshot_document(&session.snapshot_id)?;
+    snapshot_id: &str,
+) -> Option<(SnapshotDetail, ListedArtifact)> {
+    let document = cache.snapshot_document(snapshot_id)?;
     let document: Value = serde_json::from_slice(&document).ok()?;
     let snapshot = SnapshotDetail::from_document(&document).ok()?;
     if !artifact.usable(&snapshot) {
         return None;
     }
-    let wanted = artifact.of(&snapshot)?;
+    let wanted = artifact.of(&snapshot)?.clone();
     cache
         .contains(&wanted.original_sha256)
-        .then(|| mirrored(session, &snapshot, wanted))
+        .then_some((snapshot, wanted))
 }
 
 /// Fetches a snapshot's document from the archive, indexes it, and parses it.
@@ -518,7 +656,8 @@ fn usable_snapshot(
     client: &ReadClient,
     cache: &BlobCache,
     artifact: Artifact,
-    session: &ListedSession,
+    session_id: &str,
+    snapshot_id: &str,
     projected: SnapshotDetail,
     requests: &Requests,
 ) -> Result<Resolution, PatwariError> {
@@ -532,12 +671,12 @@ fn usable_snapshot(
         .is_some()
         .then(|| projected.source_agent.clone());
 
-    let siblings = client.session_snapshots(&session.session_id)?;
+    let siblings = client.session_snapshots(session_id)?;
     for sibling in siblings
         .iter()
         // The projected one is where we started; re-reading it would cost a request to learn
         // what this run already knows.
-        .filter(|sibling| sibling.snapshot_id != session.snapshot_id)
+        .filter(|sibling| sibling.snapshot_id != snapshot_id)
         .take(MAX_FALLBACK_PROBES)
     {
         let detail = fetch_snapshot(client, cache, &sibling.snapshot_id, requests)?;

@@ -217,6 +217,35 @@ pub struct AskHit {
     pub snippet: String,
     /// The rubric score, carried so the document can show how far apart the matches were.
     pub score: u32,
+    /// Where in the searched slice this hit was read from — the index into the `read` argument
+    /// [`Ask::fold`] scored.
+    ///
+    /// Not rendered. It exists so a caller holding both the ranking and the sessions it was folded
+    /// from can escalate from a ranked hit back to *its* session — which is what `--verbatim` does
+    /// ([`crate::verbatim`]) — without matching on the content hash, which two byte-identical
+    /// summaries would make ambiguous.
+    pub searched_index: usize,
+    /// What the transcript escalation found for this hit, or `None` when none was asked for.
+    ///
+    /// Filled in after the ranking, by the only caller that can: the fold above reads the cache and
+    /// this needs the archive. `None` is what keeps a run without `--verbatim` byte-identical to
+    /// one from before this existed — the renderer prints nothing at all for it.
+    pub verbatim: Option<Escalation>,
+}
+
+/// What the transcript escalation found for one shown hit — or why there was nothing to look at.
+///
+/// The second arm is why this is an enum rather than an [`Option`] of the first: a hit whose
+/// transcript could not be fetched, interpreted, or read is **not** a hit with no matches, and
+/// rendering it as one would turn "I could not look" into "there is nothing there". Every shown hit
+/// gets one of these two, so the block under a ranking accounts for every session the escalation
+/// touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Escalation {
+    /// The transcript was fetched, interpreted, and searched.
+    Searched(crate::verbatim::SessionVerbatim),
+    /// There was no transcript to search for this session, in the mirror's own words.
+    Unavailable(String),
 }
 
 /// Everything one ask document is rendered from.
@@ -262,7 +291,7 @@ impl Ask {
 
         let mut bytes_read = 0;
         let mut hits: Vec<AskHit> = Vec::new();
-        for summary in read {
+        for (searched_index, summary) in read.iter().enumerate() {
             bytes_read += summary.bytes_read;
             let Some(scored) = score(query, &summary.archived.summary, &summary.archived.project)
             else {
@@ -292,6 +321,8 @@ impl Ask {
                 matched: scored.matched,
                 snippet: snippet(&scrub(&scored.snippet)),
                 score: scored.score,
+                searched_index,
+                verbatim: None,
             });
         }
 
@@ -425,7 +456,11 @@ fn field_entries<'a>(
 /// Cuts an already-scrubbed snippet to [`MAX_SNIPPET_CHARS`], on a character boundary, marking a
 /// cut with an ellipsis. Collapses internal whitespace so a multi-line summary entry renders as one
 /// readable line.
-fn snippet(scrubbed: &str) -> String {
+///
+/// Shared with [`crate::verbatim`], which quotes transcript lines on the same terms and by the same
+/// pipeline — scrub first, then collapse, then clip — so the lane cuts every quotation it prints at
+/// one length by one rule.
+pub(crate) fn snippet(scrubbed: &str) -> String {
     let collapsed = scrubbed.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= MAX_SNIPPET_CHARS {
         return collapsed;

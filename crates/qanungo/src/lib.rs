@@ -217,3 +217,4 @@ pub mod standup;
 pub mod standup_report;
 pub mod sync;
 pub mod timeline;
+pub mod verbatim;

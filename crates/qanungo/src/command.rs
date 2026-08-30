@@ -53,10 +53,17 @@
 //!
 //! Every other string `report` and `cost` put on a page is this build's own — an aggregate, a tool
 //! name the rule pack knows, a `source_hash`. The exception is the harness label on a Gaps line,
-//! which is whatever a snapshot manifest said its `source_agent` was. It therefore goes through
-//! [`evidence::identifier_field`] — clamp *then* scrub, in that order and for the reason that
-//! helper's own rustdoc argues — rather than through the clamp alone, so a credential-shaped label
-//! in a corrupted or adversarial listing leaves as a marker instead of as itself.
+//! which is whatever a snapshot manifest said its `source_agent` was. It is therefore clamped
+//! *then* scrubbed — in that order and for the reason [`crate::evidence::identifier_field`]'s own
+//! rustdoc argues — rather than passed through the clamp alone, so a credential-shaped label in a
+//! corrupted or adversarial listing leaves as a marker instead of as itself.
+//!
+//! One helper does that for every surface stating a skipped session: [`skip_line`], which both Gaps
+//! sections and the ask lane's `--verbatim` "this transcript could not be searched" note go
+//! through. It spells the two passes out rather than calling `identifier_field`, so that the scrub
+//! can be *counted* for the one caller whose footer reports what fired; the two documents here have
+//! no such footer and discard the count. The sentence is shared so the same gap cannot come to read
+//! two ways in one binary.
 //!
 //! That is the whole reason [`fold_coaching`] and [`fold_cost`] take a [`Redactor`] at all: neither
 //! computes anything else a redactor touches. The dashboard hands them its launch-time one. The CLI
@@ -79,16 +86,16 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::ask::{Ask, Query};
-use crate::ask_report::{AskInstrumentation, AskReport};
+use crate::ask::{Ask, Escalation, Query};
+use crate::ask_report::{AskInstrumentation, AskReport, VerbatimStats};
 use crate::cache::BlobCache;
 use crate::cli::{ArchiveArgs, AskArgs, CostArgs, ReportArgs, StandupArgs, Window};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
-use crate::evidence;
+use crate::format;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
-use crate::redaction::Redactor;
+use crate::redaction::{RedactionReport, Redactor};
 use crate::report::{Instrumentation, Report, SkippedNote};
 use crate::rules::{self, Finding};
 use crate::scoring::RulePack;
@@ -442,16 +449,26 @@ pub struct FoldedAsk {
 /// scoring is [`Ask::fold`]'s, and the scrub happens there, so [`FoldedAsk`] — like [`FoldedStandup`]
 /// — carries no pre-scrub string for any surface to leak.
 ///
+/// # The `verbatim` escalation
+///
+/// With `verbatim` set, the ranking is followed by [`escalate`]: the transcripts of the hits this
+/// run is going to *show* are fetched and searched for the same terms. It runs after the fold and
+/// outside its timer, because it is network work and the footer's fold figure claims to be the
+/// local one. Everything it costs is reported separately, and the hits it could not read say so
+/// rather than reading as hits with nothing in them.
+///
 /// # Errors
 ///
 /// Returns an error when the cache is unusable or the archive cannot be listed. A session with no
-/// readable summary is *unsearchable*, counted on the result and never a failed run.
+/// readable summary is *unsearchable*, counted on the result and never a failed run; a shown hit
+/// whose transcript cannot be read is a stated note under that hit, never a failed run either.
 pub fn fold_ask(
     archive: &ArchiveArgs,
     window: Option<&Window>,
     query: &Query,
     redactor: Redactor,
     limit: usize,
+    verbatim: bool,
 ) -> Result<FoldedAsk, CommandError> {
     let prepared = match window {
         Some(window) => Prepared::mirror(archive, window, Artifact::Summary, Reach::WindowOnly)?,
@@ -468,18 +485,29 @@ pub fn fold_ask(
     // whose cached summary this build then failed to read or parse (the `Err` arm below).
     let mut unsearchable = placed.unplaceable + prepared.mirror.skipped.len();
     let mut read = Vec::with_capacity(placed.reported.len());
+    // Kept in lockstep with `read`, so a ranked hit's `searched_index` names the session its
+    // summary was mirrored for. This is the whole of what the escalation needs to find a
+    // transcript, and it is a borrow rather than a copy of anything.
+    let mut searched: Vec<&MirroredSession> = Vec::with_capacity(placed.reported.len());
     for session in &placed.reported {
         match crate::standup::read_summary(&prepared.cache, session) {
-            Ok(summary) => read.push(summary),
+            Ok(summary) => {
+                read.push(summary);
+                searched.push(session);
+            }
             Err(_) => unsearchable += 1,
         }
     }
-    let ask = Ask::fold(query, &read, &redactor, limit, unsearchable);
+    let mut ask = Ask::fold(query, &read, &redactor, limit, unsearchable);
     let fold_elapsed = fold_started.elapsed();
+    // Outside the fold timer on purpose: this is the archive, and the fold figure beside it in the
+    // footer claims to measure the local read.
+    let verbatim = verbatim.then(|| escalate(&prepared, &mut ask, &searched, query, &redactor));
 
     let instrumentation = AskInstrumentation {
         sync: prepared.mirror.stats.clone(),
         fold_elapsed,
+        verbatim,
         redactor,
         patwari_url: prepared.patwari_url.clone(),
         cache_root: prepared.cache.root().to_path_buf(),
@@ -514,6 +542,7 @@ pub fn ask(args: &AskArgs, out: &mut impl Write) -> Result<(), CommandError> {
         &query,
         args.redaction.redactor(),
         args.limit,
+        args.verbatim,
     )?;
     let markdown = AskReport {
         raw_query: &args.query,
@@ -528,6 +557,126 @@ pub fn ask(args: &AskArgs, out: &mut impl Write) -> Result<(), CommandError> {
 
     out.write_all(markdown.as_bytes())
         .map_err(CommandError::Output)
+}
+
+/// Reads the transcripts behind the hits a ranking is about to show, and searches each one for the
+/// query's own terms (qanungo #10's `--verbatim`).
+///
+/// # The bound is the design
+///
+/// This escalates into `ask.hits` — the sessions the summary ranking selected and `--limit` kept —
+/// and nothing else. Decision 12 chose the summary substrate precisely so the lane would not have
+/// to mirror every transcript in the archive, and an unbounded `--verbatim` would put that cost
+/// back on every run: an archive-scale download to answer a question that might match nothing. So
+/// the archive traffic here is at most one session per shown hit, most of them cache hits, and the
+/// coverage boundary that comes with it is inherited rather than hidden — a fact no summary
+/// mentions belongs to a session `ask` never ranked, so it is a transcript this never opens. The
+/// document says exactly that above the blocks.
+///
+/// Every shown hit gets an answer: what its transcript said, or why it could not be read. A hit the
+/// escalation could not look at is never left looking like one with nothing to show.
+///
+/// One session at a time, deliberately: the mirror runs a worker pool because it moves hundreds of
+/// artifacts, and this moves at most `--limit` of them. A second pool for ten sessions would be
+/// concurrency against a LAN archive to save a second the reader would not notice — measured
+/// against production, a warm escalation over three hits is ~30 ms and a cold one ~760 ms.
+fn escalate(
+    prepared: &Prepared,
+    ask: &mut Ask,
+    searched: &[&MirroredSession],
+    query: &Query,
+    redactor: &Redactor,
+) -> VerbatimStats {
+    let started = Instant::now();
+    let mut stats = VerbatimStats::default();
+    // Collected separately and absorbed once, because it belongs to the same footer total the
+    // ranking's own scrub reports: a marker in an excerpt under "redaction none" would be the
+    // document contradicting itself.
+    let mut redaction = RedactionReport::default();
+    for hit in &mut ask.hits {
+        // In range by construction: `searched_index` is the position `Ask::fold` read this hit
+        // from, in the very slice `fold_ask` built alongside `searched`.
+        let session = searched
+            .get(hit.searched_index)
+            .expect("a hit indexes the slice it was folded from");
+        hit.verbatim = Some(match dig(prepared, session, query, redactor, &mut stats) {
+            Ok(found) => {
+                stats.transcripts_searched += 1;
+                stats.matches += found.total_matches;
+                stats.shown += found.matches.len();
+                stats.unreadable_records += found.unreadable_records;
+                redaction.absorb(&found.redaction);
+                Escalation::Searched(found)
+            }
+            Err(skip) => {
+                stats.transcripts_unavailable += 1;
+                Escalation::Unavailable(skip_line(&skip, redactor, &mut redaction))
+            }
+        });
+    }
+    ask.redaction.absorb(&redaction);
+    stats.elapsed = started.elapsed();
+    stats
+}
+
+/// Fetches one hit's transcript and searches it, counting what the archive was asked for.
+///
+/// The fetch is [`sync::fetch`] — the mirror's own resolution walk for a single session, so a
+/// transcript is found, verified, and cached here exactly as `report` would have found it — and the
+/// search is [`verbatim::search`] over the typed records, never the file's bytes.
+///
+/// # Errors
+///
+/// Returns the [`Skip`] a mirror run for this session's transcript would have recorded: no snapshot
+/// carries one, no interpreter reads it, the archive could not be reached, or the cached blob could
+/// not be opened or interpreted. The caller states it under the hit.
+fn dig(
+    prepared: &Prepared,
+    session: &MirroredSession,
+    query: &Query,
+    redactor: &Redactor,
+    stats: &mut VerbatimStats,
+) -> Result<crate::verbatim::SessionVerbatim, Skip> {
+    let fetched = sync::fetch(
+        &prepared.client,
+        &prepared.cache,
+        Artifact::Transcript,
+        session,
+    )?;
+    // Counted whether or not the search below succeeds: the traffic happened either way, and a
+    // footer that only counted successful digs would under-report what the run cost the archive.
+    if fetched.lookup == crate::cache::Lookup::Miss {
+        stats.transcripts_fetched += 1;
+    }
+    stats.bytes_transferred += fetched.transferred_bytes;
+    stats.snapshots_fetched += fetched.snapshots_fetched;
+
+    let unreadable = |detail: String| Skip {
+        source_agent: fetched.source_agent.clone(),
+        reason: SkipReason::Unreadable(detail),
+    };
+    // Unreachable through `sync::fetch`, which refuses a snapshot whose transcript this build has
+    // no interpreter for — stated rather than asserted, so the two never disagree silently.
+    let source = metrics::source_for_agent(&fetched.source_agent).ok_or_else(|| Skip {
+        source_agent: fetched.source_agent.clone(),
+        reason: SkipReason::UnknownAgent(fetched.source_agent.clone()),
+    })?;
+    let blob = prepared
+        .cache
+        .open_blob(&fetched.source_hash)
+        .map_err(|error| unreadable(format!("cache read failed: {error}")))?;
+    let found = crate::verbatim::search(
+        source,
+        fetched.artifact_set_version,
+        BufReader::new(blob),
+        query,
+        redactor,
+    )
+    .map_err(|error| unreadable(error.to_string()))?;
+    // The archive's declared original size, already verified against the transferred bytes, so the
+    // footer needs no second pass over the file to say how much transcript was read.
+    stats.bytes_searched += fetched.size_bytes;
+    Ok(found)
 }
 
 /// How much history a lane asks the mirror for.
@@ -549,6 +698,11 @@ enum Reach {
 /// from the one the coaching report scored would be worse than either on its own.
 struct Prepared {
     cache: BlobCache,
+    /// The connected read client, kept rather than dropped with the mirror that used it: a lane
+    /// that decides *after* the fold that it wants one more artifact — `ask --verbatim` — asks the
+    /// same client for it, on the same connection settings, rather than opening a second one that
+    /// could be pointed somewhere else.
+    client: ReadClient,
     mirror: Mirror,
     generated_at: DateTime<Utc>,
     opens_at: DateTime<Utc>,
@@ -637,6 +791,7 @@ impl Prepared {
 
         Ok(Self {
             cache,
+            client,
             mirror,
             generated_at,
             opens_at,
@@ -766,7 +921,7 @@ impl<'a> Placement<'a> {
 ///
 /// The harness label is the archive's string, not this build's — a snapshot manifest states
 /// whatever `session.source_agent` it likes, and an unrecognized one is precisely the case that
-/// reaches [`SkipReason::UnknownAgent`] — so it goes through [`evidence::identifier_field`], which
+/// reaches [`SkipReason::UnknownAgent`] — so it goes through [`crate::evidence::identifier_field`], which
 /// clamps it and *then* scrubs it, before it is interpolated. Both lanes print these lines verbatim
 /// in their Gaps section, so treating the label here rather than at either rendering site is what
 /// keeps the two from drifting apart, and is why the coaching report's own claim to render
@@ -777,7 +932,7 @@ impl<'a> Placement<'a> {
 /// like an ordinary identifier, so a `source_agent` holding one would have rendered raw in all
 /// three documents and in the dashboard's `provenance.gaps`. Clamping first is still what keeps an
 /// over-length token from laundering itself into a renderable marker; see
-/// [`evidence::identifier_field`] for the ordering argument in full.
+/// [`crate::evidence::identifier_field`] for the ordering argument in full.
 ///
 /// The rest of the sentence is this build's own text: a logical path from [`Artifact`], a fixed
 /// clause, or the locally generated error prose a [`SkipReason::Unreadable`] carries — paths, URLs,
@@ -787,20 +942,10 @@ impl<'a> Placement<'a> {
 fn summarize(skipped: &[Skip], unplaceable: usize, redactor: &Redactor) -> Vec<SkippedNote> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for skip in skipped {
-        let agent = evidence::identifier_field(&skip.source_agent, redactor);
-        let reason = match &skip.reason {
-            SkipReason::MissingArtifact(artifact) => {
-                format!(
-                    "{agent}: snapshot has no `{}` artifact",
-                    artifact.logical_path()
-                )
-            }
-            SkipReason::UnknownAgent(named) => format!(
-                "{}: no interpreter for this harness in this build",
-                evidence::identifier_field(named, redactor),
-            ),
-            SkipReason::Unreadable(detail) => format!("{agent}: {detail}"),
-        };
+        // Neither of these two documents has a footer that says what the scrub fired, so what a
+        // label cost is discarded here rather than carried — see [`skip_line`], whose other caller
+        // does have one and does count it.
+        let reason = skip_line(skip, redactor, &mut RedactionReport::default());
         *counts.entry(reason).or_default() += 1;
     }
     let mut notes: Vec<_> = counts
@@ -816,11 +961,41 @@ fn summarize(skipped: &[Skip], unplaceable: usize, redactor: &Redactor) -> Vec<S
     notes
 }
 
+/// One skipped session as a sentence, with the archive's harness label clamped and then scrubbed.
+///
+/// The body of what [`summarize`] used to do inline, lifted out because a second surface now states
+/// exactly the same fact about exactly one session: a hit whose transcript the `--verbatim`
+/// escalation could not read ([`escalate`]). Two spellings of "no snapshot has a transcript" in one
+/// binary would be two ways for the same gap to read differently, so there is one.
+///
+/// It spells [`crate::evidence::identifier_field`] out rather than calling it — the clamp first, then the
+/// scrub, for the ordering reason that helper argues — so that the scrub can be *counted*. The ask
+/// lane's footer says what fired, and a marker where a harness name belongs with `redaction none`
+/// beneath it would be the document contradicting itself. [`summarize`]'s own callers have no such
+/// footer and throw the count away.
+fn skip_line(skip: &Skip, redactor: &Redactor, redaction: &mut RedactionReport) -> String {
+    let mut label = |value: &str| {
+        let scrubbed = redactor.scrub(&format::identifier(value));
+        redaction.absorb(&scrubbed.report);
+        scrubbed.text
+    };
+    let agent = label(&skip.source_agent);
+    match &skip.reason {
+        SkipReason::MissingArtifact(artifact) => format!(
+            "{agent}: snapshot has no `{}` artifact",
+            artifact.logical_path()
+        ),
+        SkipReason::UnknownAgent(named) => format!(
+            "{}: no interpreter for this harness in this build",
+            label(named),
+        ),
+        SkipReason::Unreadable(detail) => format!("{agent}: {detail}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::format;
 
     /// A GitHub token's shape — `ghp_` and exactly 36 base62 characters — and not a real one.
     /// Well inside [`format::MAX_IDENTIFIER_CHARS`] and carrying nothing the clamp refuses, which
@@ -916,7 +1091,7 @@ mod tests {
     /// and a listing whose `source_agent` holds one would print it, verbatim, in the Gaps section
     /// of all three documents and in the dashboard's `provenance.gaps`.
     ///
-    /// This test is the mutation guard for that: swap [`evidence::identifier_field`] back to
+    /// This test is the mutation guard for that: swap [`crate::evidence::identifier_field`] back to
     /// [`format::identifier`] and the token appears where the marker is asserted, so the assertion
     /// below fails rather than the property quietly regressing.
     #[test]
@@ -1003,6 +1178,8 @@ mod tests {
 
     fn mirrored(archived_at: Option<&str>) -> MirroredSession {
         MirroredSession {
+            session_id: "1".repeat(32),
+            snapshot_id: "2".repeat(32),
             source_hash: "0".repeat(64),
             source_agent: "claude-code".to_owned(),
             artifact_set_version: 2,

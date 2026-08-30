@@ -1589,6 +1589,124 @@ fn a_session_with_no_summary_anywhere_is_a_recorded_gap() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The `ask --verbatim` escalation (qanungo #10)
+// ---------------------------------------------------------------------------
+
+/// The escalation's whole shape: mirror the summaries, then ask for *one* session's transcript.
+///
+/// The window listing is paid once, for the summaries; fetching the transcript afterwards costs no
+/// listing at all and touches exactly the session asked about. That is what bounds `--verbatim` to
+/// the hits it shows.
+#[test]
+fn one_sessions_transcript_is_fetched_without_relisting_the_window() {
+    let wanted = ArchivedSession::claude(80, TRANSCRIPT, "zstd").with_summary(SUMMARY);
+    let other =
+        ArchivedSession::claude(81, OTHER_TRANSCRIPT, "identity").with_summary(OTHER_SUMMARY);
+    let (base, requests) = spawn_archive(vec![wanted, other]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert_eq!(mirror.sessions.len(), 2);
+    let before = requests.lock().unwrap().content_requests();
+
+    let fetched = sync::fetch(&client, &cache, Artifact::Transcript, &mirror.sessions[0])
+        .expect("the session's snapshot carries a transcript");
+    assert_eq!(fetched.source_hash, sha256_hex(TRANSCRIPT.as_bytes()));
+    assert_eq!(fetched.size_bytes, TRANSCRIPT.len() as u64);
+    assert_eq!(fetched.source_agent, "claude-code");
+    assert!(cache.contains(&fetched.source_hash), "and it is cached");
+    assert_eq!(
+        requests.lock().unwrap().content_requests() - before,
+        1,
+        "exactly one artifact was pulled: the one asked for",
+    );
+    assert_eq!(
+        requests.lock().unwrap().snapshot_listing_requests(),
+        0,
+        "escalating costs no listing of any kind",
+    );
+
+    // A second escalation for the same session is served from the cache, so a re-run of the same
+    // query is free.
+    let again = sync::fetch(&client, &cache, Artifact::Transcript, &mirror.sessions[0])
+        .expect("the transcript is still there");
+    assert_eq!(again.lookup, qanungo::cache::Lookup::Hit);
+    assert_eq!(again.transferred_bytes, 0);
+}
+
+/// The escalation makes the munshi #78 walk for itself, and it has to: the sibling that carried
+/// the `summary.md` this run ranked is not necessarily the one carrying the transcript, so
+/// starting from the *projection* rather than from whichever snapshot the summary came out of is
+/// what finds it.
+#[test]
+fn the_escalation_walks_to_the_sibling_that_carries_the_transcript() {
+    let mut projected = ArchivedSession::claude(82, TRANSCRIPT, "identity").with_summary(SUMMARY);
+    projected.has_transcript = false;
+    let complete = ArchivedSession::claude(83, TRANSCRIPT, "identity")
+        .older_snapshot_of(&projected, "2026-08-09T10:00:00.000Z");
+    let (base, _requests) = spawn_archive(vec![projected, complete]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        mirror.sessions[0].source_hash,
+        sha256_hex(SUMMARY.as_bytes())
+    );
+
+    let fetched = sync::fetch(&client, &cache, Artifact::Transcript, &mirror.sessions[0])
+        .expect("a sibling carries the transcript");
+    assert_eq!(fetched.source_hash, sha256_hex(TRANSCRIPT.as_bytes()));
+    assert!(
+        fetched.snapshots_fetched >= 1,
+        "the walk cost real requests"
+    );
+}
+
+/// A session whose summary ranked but whose transcript no snapshot holds comes back as the gap the
+/// mirror would have recorded, so the hit above it can say why rather than showing an empty block.
+#[test]
+fn a_hit_with_no_transcript_anywhere_escalates_to_a_stated_skip() {
+    let mut summary_only =
+        ArchivedSession::claude(84, TRANSCRIPT, "identity").with_summary(SUMMARY);
+    summary_only.has_transcript = false;
+    let (base, _requests) = spawn_archive(vec![summary_only]);
+    let (_directory, cache) = cache();
+    let client = ReadClient::connect(&base).unwrap();
+
+    let mirror = sync::sync(
+        &client,
+        &cache,
+        Artifact::Summary,
+        "2026-07-18T00:00:00.000Z",
+        2,
+    )
+    .unwrap();
+    let skip = sync::fetch(&client, &cache, Artifact::Transcript, &mirror.sessions[0])
+        .expect_err("there is no transcript to escalate into");
+    assert_eq!(
+        skip.reason,
+        SkipReason::MissingArtifact(Artifact::Transcript)
+    );
+    assert_eq!(skip.source_agent, "claude-code");
+}
+
 /// The summary lane's ceiling is three orders of magnitude below the transcript lane's, and it has
 /// to be the one that applies: a `summary.md` declaring more than a megabyte is refused before a
 /// byte moves, where the very same declaration on a transcript would be fetched without comment.
@@ -1761,6 +1879,84 @@ fn the_standup_command_runs_end_to_end_against_the_archive() {
     assert!(again.contains("cache 1 hits / 0 misses"));
     assert!(again.contains("snapshots 1 indexed / 0 fetched"));
     assert!(again.contains("**not scrubbed for secrets** (`--no-redact`)"));
+}
+
+/// A transcript that talks about what its `summary.md` says it was about, so a query can rank the
+/// summary *and* land in the session's own words — which is the whole shape `--verbatim` exists to
+/// serve.
+const RANKED_TRANSCRIPT: &str = concat!(
+    r#"{"type":"user","uuid":"u1","timestamp":"2026-08-10T09:00:00.000Z","message":{"role":"user","content":"rework the scoring lane so the rule pack stamps itself"}}"#,
+    "\n",
+    r#"{"type":"assistant","uuid":"a1","timestamp":"2026-08-10T09:01:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test scoring"}}]}}"#,
+    "\n",
+);
+
+/// The ask lane through the binary, with and without the escalation: the same ranking either way,
+/// and with `--verbatim` the session's own lines beneath it.
+#[test]
+fn the_ask_command_escalates_into_the_shown_hits_transcripts() {
+    let session = ArchivedSession::claude(12, RANKED_TRANSCRIPT, "zstd").with_summary(SUMMARY);
+    let (base, _requests) = spawn_archive(vec![session]);
+    let directory = tempfile::tempdir().unwrap();
+
+    let run = |flags: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_qanungo"))
+            .args(["ask", "scoring", "--patwari-url", &base])
+            .args(flags)
+            .arg("--cache-dir")
+            .arg(directory.path().join("qanungo"))
+            .env_remove("PATWARI_URL")
+            .output()
+            .expect("the binary runs");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // Without the flag the document is the ranking and nothing else — no block, no second footer
+    // line, and no transcript fetched at all.
+    let plain = run(&[]);
+    assert!(plain.starts_with("# History search — “scoring”"));
+    assert!(plain.contains("### 1. Ship the scoring lane behind a rule pack stamp"));
+    assert!(!plain.contains("Verbatim"), "{plain}");
+    assert!(!plain.contains("--verbatim"), "{plain}");
+
+    let dug = run(&["--verbatim"]);
+    assert!(dug.contains("### 1. Ship the scoring lane behind a rule pack stamp"));
+    assert!(
+        dug.contains("`--verbatim` searched the transcripts of the 1 match below and nothing else"),
+        "{dug}",
+    );
+    // Both surfaces the query lands on: the request that opened the session, and the command it
+    // ran. Neither is a summary field — these are the transcript's own lines.
+    assert!(
+        dug.contains("2 matching lines in the transcript, showing 2"),
+        "{dug}"
+    );
+    assert!(
+        dug.contains("· user · 2026-08-10T09:00:00Z (UTC) — rework the scoring lane"),
+        "{dug}",
+    );
+    assert!(
+        dug.contains("· command · 2026-08-10T09:01:00Z (UTC) — cargo test scoring"),
+        "{dug}",
+    );
+    assert!(
+        dug.contains("_Verbatim — 1 transcripts searched / 0 unavailable · 2 matches, 2 shown")
+    );
+
+    // The ranking above the block is the ranking without it: same hit, same score, same citation.
+    let ranking = |document: &str| {
+        document
+            .lines()
+            .find(|line| line.contains("score "))
+            .map(ToOwned::to_owned)
+            .expect("every hit prints a metadata line")
+    };
+    assert_eq!(ranking(&plain), ranking(&dug));
 }
 
 /// The context Patwari projects onto a session row is the only place the cost lane can learn

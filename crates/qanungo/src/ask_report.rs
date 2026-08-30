@@ -19,13 +19,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::ask::{Ask, AskHit, Query};
+use crate::ask::{Ask, AskHit, Escalation, Query};
 use crate::cli::Window;
 use crate::format;
 use crate::redaction::{PATTERN_REVISION, Redactor};
 use crate::report::stamp;
 use crate::standup_report::{redaction_counts, redaction_line};
 use crate::sync::SyncStats;
+use crate::verbatim::MAX_MATCHES_PER_SESSION;
 
 /// What an ask run cost, folded into the footer.
 #[derive(Debug, Clone)]
@@ -33,10 +34,45 @@ pub struct AskInstrumentation {
     pub sync: SyncStats,
     /// Wall-time of reading, scoring, and ranking the summaries alone, network excluded.
     pub fold_elapsed: Duration,
+    /// What the `--verbatim` escalation cost, or `None` when none was asked for — in which case
+    /// this document is byte-for-byte the one this lane rendered before the escalation existed.
+    pub verbatim: Option<VerbatimStats>,
     /// The redactor the flags asked for, so the footer can say which passes ran.
     pub redactor: Redactor,
     pub patwari_url: String,
     pub cache_root: PathBuf,
+}
+
+/// What the `--verbatim` escalation cost and found, in aggregate.
+///
+/// Its own clause in the footer rather than absorbed into [`SyncStats`], because these requests are
+/// not the window mirror's: the mirror moved one `summary.md` per listed session, and this moved
+/// one transcript per *shown hit*. A reader deciding whether a `--verbatim` run is worth repeating
+/// needs to see the second number on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerbatimStats {
+    /// Transcripts fetched, interpreted, and searched.
+    pub transcripts_searched: usize,
+    /// Shown hits with no transcript this build could search. Each one says why under its own hit;
+    /// this is the total, so the two always reconcile against the hits shown.
+    pub transcripts_unavailable: usize,
+    /// Transcripts that were not already in the cache and had to be downloaded.
+    pub transcripts_fetched: u64,
+    /// Snapshot documents requested to resolve those transcripts.
+    pub snapshots_fetched: u64,
+    /// Matching lines found across every searched transcript, before any cap.
+    pub matches: usize,
+    /// Matching lines actually quoted, after [`crate::verbatim::MAX_MATCHES_PER_SESSION`].
+    pub shown: usize,
+    /// Decompressed transcript bytes searched.
+    pub bytes_searched: u64,
+    /// Stored bytes pulled over the wire for them.
+    pub bytes_transferred: u64,
+    /// Records `munshi-transcript` could not read, across every searched transcript. They carry no
+    /// typed text and so were not searched — counted here rather than passed over in silence.
+    pub unreadable_records: u64,
+    /// Wall-time of the escalation: fetching and searching both, network included.
+    pub elapsed: Duration,
 }
 
 /// Everything one ask document is rendered from.
@@ -99,6 +135,27 @@ impl AskReport<'_> {
         );
     }
 
+    /// The one line that states what `--verbatim` did and, just as importantly, what it did not.
+    ///
+    /// A reader who sees transcript quotations under a ranking will reasonably assume the whole
+    /// archive was grepped. It was not: only the shown hits' transcripts were opened, so a session
+    /// no summary matched contributed nothing here *and could not have*. Saying it once, above the
+    /// blocks, is what keeps the escalation from over-claiming.
+    fn render_verbatim_scope(&self, out: &mut String, stats: &VerbatimStats) {
+        let shown = self.ask.hits.len();
+        let _ = writeln!(
+            out,
+            "\n`--verbatim` searched the transcripts of the {shown} {} below and nothing else — a \
+             session no summary matched was never opened, so it could not contribute a line. {} \
+             matching {} found across {} of them; at most {} are quoted per session.",
+            plural(shown, "match", "matches"),
+            stats.matches,
+            plural(stats.matches, "line", "lines"),
+            stats.transcripts_searched,
+            MAX_MATCHES_PER_SESSION,
+        );
+    }
+
     fn render_hits(&self, out: &mut String) {
         if self.ask.hits.is_empty() {
             let _ = writeln!(
@@ -127,6 +184,9 @@ impl AskReport<'_> {
                 self.ask.total_matches,
                 plural(self.ask.total_matches, "session", "sessions"),
             );
+        }
+        if let Some(stats) = &self.instrumentation.verbatim {
+            self.render_verbatim_scope(out, stats);
         }
         for (rank, hit) in self.ask.hits.iter().enumerate() {
             render_hit(out, rank + 1, hit);
@@ -169,6 +229,26 @@ impl AskReport<'_> {
             instrumentation.patwari_url,
             display_path(&instrumentation.cache_root),
         );
+        // A second line rather than a longer first one, and only when the escalation ran: without
+        // `--verbatim` this footer is byte-for-byte the one this lane has always printed.
+        if let Some(verbatim) = &instrumentation.verbatim {
+            let _ = writeln!(
+                out,
+                "\n_Verbatim — {} transcripts searched / {} unavailable · {} matches, {} shown · \
+                 {} read · {} fetched ({} transferred) · snapshots {} fetched · {} unreadable \
+                 records · {}_",
+                verbatim.transcripts_searched,
+                verbatim.transcripts_unavailable,
+                verbatim.matches,
+                verbatim.shown,
+                format::bytes(verbatim.bytes_searched),
+                verbatim.transcripts_fetched,
+                format::bytes(verbatim.bytes_transferred),
+                verbatim.snapshots_fetched,
+                verbatim.unreadable_records,
+                format::elapsed(verbatim.elapsed),
+            );
+        }
     }
 }
 
@@ -213,6 +293,53 @@ fn render_hit(out: &mut String, rank: usize, hit: &AskHit) {
     );
     let _ = writeln!(out, "> {}\n", hit.snippet);
     let _ = writeln!(out, "Matched in {}.", hit.matched.join(", "));
+    if let Some(escalation) = &hit.verbatim {
+        render_escalation(out, escalation);
+    }
+}
+
+/// What the transcript behind one hit said — or, honestly, that there was none to read.
+///
+/// The count line is the point of the block: a cap that hid the total would let a reader take five
+/// quoted lines for the whole of what a session said about the thing they asked about. And an
+/// unavailable transcript gets a sentence rather than an empty block, because "I could not look"
+/// and "there is nothing there" are different answers to the same question.
+fn render_escalation(out: &mut String, escalation: &Escalation) {
+    match escalation {
+        Escalation::Searched(found) if found.total_matches == 0 => {
+            let _ = writeln!(
+                out,
+                "\n_Verbatim: the transcript carries no line with these words — this session \
+                 matched on its summary alone._",
+            );
+        }
+        Escalation::Searched(found) => {
+            let _ = writeln!(
+                out,
+                "\n_Verbatim — {} matching {} in the transcript, showing {}:_\n",
+                found.total_matches,
+                plural(found.total_matches, "line", "lines"),
+                found.matches.len(),
+            );
+            for hit in &found.matches {
+                let at = match hit.at {
+                    Some(at) => stamp(at),
+                    None => "an unreadable time".to_owned(),
+                };
+                let _ = writeln!(
+                    out,
+                    "- `event {}` · {} · {at} (UTC) — {}",
+                    hit.locator, hit.surface, hit.excerpt,
+                );
+            }
+        }
+        Escalation::Unavailable(reason) => {
+            let _ = writeln!(
+                out,
+                "\n_Verbatim: this session's transcript could not be searched — {reason}._",
+            );
+        }
+    }
 }
 
 /// The searched terms as a readable list — `"payments", "api"` — or a plain phrase when there is
@@ -254,6 +381,8 @@ mod tests {
             matched: vec!["title", "repository"],
             snippet: "the payments API refactor".to_owned(),
             score,
+            searched_index: 0,
+            verbatim: None,
         }
     }
 
@@ -279,6 +408,7 @@ mod tests {
         AskInstrumentation {
             sync: SyncStats::default(),
             fold_elapsed: Duration::from_millis(5),
+            verbatim: None,
             redactor: Redactor::new(),
             patwari_url: "https://patwari.example".to_owned(),
             cache_root: PathBuf::from("/cache"),
@@ -319,6 +449,130 @@ mod tests {
         assert!(rendered.contains("### 1. Payments work"));
         assert!(rendered.contains("Matched in title, repository."));
         assert!(rendered.contains("score 9"));
+    }
+
+    fn found(total_matches: usize, shown: usize) -> crate::verbatim::SessionVerbatim {
+        crate::verbatim::SessionVerbatim {
+            matches: (0..shown)
+                .map(|index| crate::verbatim::VerbatimMatch {
+                    locator: index as u64 + 1,
+                    record: index as u64 + 1,
+                    line: index as u64 + 1,
+                    at: Some(
+                        DateTime::parse_from_rfc3339("2026-08-20T10:00:00Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    ),
+                    surface: "user",
+                    excerpt: format!("line {index} about payments"),
+                })
+                .collect(),
+            total_matches,
+            events_searched: 40,
+            unreadable_records: 0,
+            redaction: Default::default(),
+        }
+    }
+
+    fn escalated(ask: &mut Ask, escalation: Escalation) -> VerbatimStats {
+        ask.hits[0].verbatim = Some(escalation);
+        VerbatimStats {
+            transcripts_searched: 1,
+            matches: 12,
+            shown: 5,
+            ..VerbatimStats::default()
+        }
+    }
+
+    /// The block says what it found *and* how much it is not showing, so five quoted lines are
+    /// never mistaken for the whole of what a session said.
+    #[test]
+    fn a_verbatim_block_quotes_its_matches_and_states_the_total() {
+        let query = Query::parse("payments api");
+        let mut ask = Ask {
+            hits: vec![hit("Payments work", 9)],
+            total_matches: 1,
+            searched: 100,
+            ..Ask::default()
+        };
+        let mut instrumentation = instrumentation();
+        instrumentation.verbatim = Some(escalated(&mut ask, Escalation::Searched(found(12, 2))));
+        let rendered = report(&ask, &query, &instrumentation).render();
+        assert!(rendered.contains("_Verbatim — 12 matching lines in the transcript, showing 2:_"));
+        assert!(
+            rendered.contains(
+                "- `event 1` · user · 2026-08-20T10:00:00Z (UTC) — line 0 about payments"
+            )
+        );
+        // The bound is stated once, above the blocks, in the document's own voice.
+        assert!(rendered.contains(
+            "`--verbatim` searched the transcripts of the 1 match below and nothing else"
+        ));
+        assert!(rendered.contains("_Verbatim — 1 transcripts searched / 0 unavailable"));
+    }
+
+    /// A transcript with nothing in it and a transcript that could not be read are different
+    /// answers, and the block says which — "I could not look" must never render as "there is
+    /// nothing there".
+    #[test]
+    fn an_unavailable_transcript_says_so_rather_than_reading_as_an_empty_one() {
+        let query = Query::parse("payments api");
+        let mut empty = Ask {
+            hits: vec![hit("Payments work", 9)],
+            total_matches: 1,
+            searched: 100,
+            ..Ask::default()
+        };
+        let mut empty_run = instrumentation();
+        empty_run.verbatim = Some(escalated(&mut empty, Escalation::Searched(found(0, 0))));
+        let rendered = report(&empty, &query, &empty_run).render();
+        assert!(rendered.contains("the transcript carries no line with these words"));
+        assert!(rendered.contains("matched on its summary alone"));
+
+        let mut missing = Ask {
+            hits: vec![hit("Payments work", 9)],
+            total_matches: 1,
+            searched: 100,
+            ..Ask::default()
+        };
+        let mut missing_run = instrumentation();
+        missing_run.verbatim = Some(escalated(
+            &mut missing,
+            Escalation::Unavailable(
+                "claude-code: snapshot has no `transcript.jsonl` artifact".to_owned(),
+            ),
+        ));
+        let rendered = report(&missing, &query, &missing_run).render();
+        assert!(rendered.contains(
+            "this session's transcript could not be searched — claude-code: snapshot has no \
+             `transcript.jsonl` artifact"
+        ));
+        assert!(!rendered.contains("no line with these words"));
+    }
+
+    /// The control that keeps the escalation additive: with no `--verbatim`, the document is the
+    /// one this lane rendered before any of this existed — same hits, same footer, not a word more.
+    #[test]
+    fn without_the_escalation_the_document_is_untouched() {
+        let query = Query::parse("payments api");
+        let ask = Ask {
+            hits: vec![hit("Payments work", 9)],
+            total_matches: 1,
+            searched: 100,
+            ..Ask::default()
+        };
+        let instrumentation = instrumentation();
+        assert!(instrumentation.verbatim.is_none());
+        let rendered = report(&ask, &query, &instrumentation).render();
+        assert!(!rendered.contains("Verbatim"), "{rendered}");
+        assert!(!rendered.contains("--verbatim"), "{rendered}");
+        assert_eq!(
+            rendered.matches("_Instrumentation —").count(),
+            1,
+            "one footer line, as before",
+        );
+        // And the same fold rendered twice is byte-identical, escalation or not.
+        assert_eq!(rendered, report(&ask, &query, &instrumentation).render());
     }
 
     /// A query that parsed to nothing is answered without touching the archive, and names why.
