@@ -2525,12 +2525,12 @@ function paintAsk() {
         askAnswer.hits.length +
         " best of " +
         askAnswer.total_matches +
-        " matches, ranked by how much of the query each summary carries — title, repository and " +
-        "tags weigh most. This is a search, not a judgement of the work."
+        " matches, ranked by how much of the query each summary carries — title weighs most, " +
+        "then repository and tags. This is a search, not a judgement of the work."
       : askAnswer.total_matches +
         (askAnswer.total_matches === 1 ? " session matched" : " sessions matched") +
-        ", ranked by how much of the query each summary carries — title, repository and tags weigh " +
-        "most. This is a search, not a judgement of the work.";
+        ", ranked by how much of the query each summary carries — title weighs most, then " +
+        "repository and tags. This is a search, not a judgement of the work.";
   results.replaceChildren(el("p", "note", shown), ...nodes);
 }
 

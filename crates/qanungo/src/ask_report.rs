@@ -170,8 +170,8 @@ impl AskReport<'_> {
             let _ = writeln!(
                 out,
                 "\n**Showing the {} best of {} matches** (raise `--limit` past {} to see more), \
-                 ranked by how much of the query each summary carries — title and repository weigh \
-                 most. This is a search, not a judgement of the work.",
+                 ranked by how much of the query each summary carries — title weighs most, then \
+                 repository and tags. This is a search, not a judgement of the work.",
                 self.ask.hits.len(),
                 self.ask.total_matches,
                 self.limit,
@@ -180,7 +180,8 @@ impl AskReport<'_> {
             let _ = writeln!(
                 out,
                 "\n**{} {} matched**, ranked by how much of the query each summary carries — title \
-                 and repository weigh most. This is a search, not a judgement of the work.",
+                 weighs most, then repository and tags. This is a search, not a judgement of the \
+                 work.",
                 self.ask.total_matches,
                 plural(self.ask.total_matches, "session", "sessions"),
             );

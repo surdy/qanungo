@@ -38,7 +38,7 @@ A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mir
 
 ## Skills & agents
 
-Thin read-only clients that call qanungo's API or the recall funnel ship in `contrib/` (as munshi ships `session-recall`): skills `/standup`, `/ask`, `/coach`, `/instructions-doctor`, `/skill-finder`, `/cost-review`; agents `coach`, `historian`, `instructions-editor`, `standup-writer`. None write derived data back into the archive — they render or propose; you decide.
+Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, and `/coach`. Beside them sit two write-posture scaffolds — `instructions-editor` and `skill-finder` — waiting on the commands behind them (#11, #13); what else the directory grows is those issues' business, not this README's. None of them write derived data back into the archive: they render or propose; you decide.
 
 ## Design rules (inherited, non-negotiable)
 
