@@ -46,6 +46,29 @@
 //! (`the token: a short string`). A *quoted* value skips both guards, because the quotes are
 //! themselves the structure: `"password": "letmein"` is data, not a sentence.
 //!
+//! # Two patterns whose evidence is not a separator (qanungo #15)
+//!
+//! [`PatternId::ProseCredential`] and [`PatternId::PairedUsername`] were added at revision
+//! `2026-08-31` from one real archived instruction, in which a credential pair was pasted twice —
+//! once as prose and once as a query string — and only the query string was scrubbed:
+//!
+//! ```text
+//! use http://…  username : feedface00 and password c0ffeec0ffee for … and
+//! http://…/get.php?username=feedface00&password=[REDACTED:secret-assignment]&type=…
+//! ```
+//!
+//! Both are anchored on structure like everything else here, but the structure is not a separator:
+//!
+//! - **Prose** anchors on a credential *noun* standing alone as a word, and then on the **shape of
+//!   the value after it**. That shape is the whole guard, because `password manager`,
+//!   `token stream`, and `the password is stored in the keychain` are the same grammar as
+//!   `password c0ffeec0ffee`. Either side may sit in a code span — this archive writes that same
+//!   pair as a table row too, ``user `feedface00` · pass `c0ffeec0ffee` `` — and a wrapper is taken
+//!   as a boundary, never as evidence. See [`prose_credential`].
+//! - **The paired username** anchors on a `username=` query parameter *in the same URL as a
+//!   `password=` that fired on its own*. A username is not a secret; half of a live pair is, and
+//!   only for as long as the other half is beside it. See [`paired_username`].
+//!
 //! # The report never carries what it matched
 //!
 //! [`RedactionReport`] holds counts per [`PatternId`] and nothing else — no offsets, no excerpts,
@@ -74,11 +97,15 @@
 
 /// The revision of this pattern set, stamped by any document that renders scrubbed content.
 ///
-/// The retrieval date of `docs/redaction-patterns-2026-08-24.md`, which is where every token shape
-/// below came from — the same contract [`crate::pricing::PRICE_TABLE_REVISION`] carries for
-/// dollars. Two documents claim the same scrub only when this matches: adding a pattern, widening
-/// one, or retiring one moves the date and amends that file.
-pub const PATTERN_REVISION: &str = "2026-08-24";
+/// The date of `docs/redaction-patterns-<revision>.md`, which is where every token shape below came
+/// from — the same contract [`crate::pricing::PRICE_TABLE_REVISION`] carries for dollars. Two
+/// documents claim the same scrub only when this matches: adding a pattern, widening one, or
+/// retiring one moves the date and amends that file.
+///
+/// `2026-08-31` adds [`PatternId::ProseCredential`] and [`PatternId::PairedUsername`] for qanungo
+/// #15; `docs/redaction-patterns-2026-08-31.md` is the amendment, and the `2026-08-24` file it
+/// names remains the provenance of everything it does not restate.
+pub const PATTERN_REVISION: &str = "2026-08-31";
 
 /// Secrets are scrubbed unless a person says otherwise. Not a tunable.
 pub const REDACT_SECRETS_BY_DEFAULT: bool = true;
@@ -135,12 +162,18 @@ pub enum PatternId {
     UrlCredentials,
     /// A `KEY=VALUE` or `"key": "value"` whose key names a credential.
     SecretAssignment,
+    /// A credential noun standing alone in prose, followed by a credential-shaped value and no
+    /// separator at all: `password c0ffeec0ffee`.
+    ProseCredential,
+    /// The `username=` of a URL whose `password=` fired — half of a pair, sensitive only because
+    /// the other half is beside it.
+    PairedUsername,
     /// A masked word from the profanity list. Not a secret pattern; never appears in a marker.
     Profanity,
 }
 
 /// Every id, secrets and profanity alike, in report order.
-pub const PATTERNS: [PatternId; 15] = [
+pub const PATTERNS: [PatternId; 17] = [
     PatternId::GithubToken,
     PatternId::AnthropicKey,
     PatternId::OpenAiKey,
@@ -155,12 +188,14 @@ pub const PATTERNS: [PatternId; 15] = [
     PatternId::AuthorizationHeader,
     PatternId::UrlCredentials,
     PatternId::SecretAssignment,
+    PatternId::ProseCredential,
+    PatternId::PairedUsername,
     PatternId::Profanity,
 ];
 
 /// The ids the secrets pass can produce — [`PATTERNS`] without [`PatternId::Profanity`].
-pub const SECRET_PATTERNS: [PatternId; 14] = {
-    let mut secrets = [PatternId::GithubToken; 14];
+pub const SECRET_PATTERNS: [PatternId; 16] = {
+    let mut secrets = [PatternId::GithubToken; 16];
     let mut index = 0;
     while index < secrets.len() {
         secrets[index] = PATTERNS[index];
@@ -187,6 +222,8 @@ impl PatternId {
             Self::AuthorizationHeader => "authorization-header",
             Self::UrlCredentials => "url-credentials",
             Self::SecretAssignment => "secret-assignment",
+            Self::ProseCredential => "prose-credential",
+            Self::PairedUsername => "paired-username",
             Self::Profanity => "profanity",
         }
     }
@@ -353,7 +390,7 @@ type Matcher = fn(&[u8], usize) -> Option<Hit>;
 
 /// Every matcher, most specific first. Order is the tie-break when two matchers accept ranges
 /// ending at the same byte; length wins first.
-const MATCHERS: [Matcher; 13] = [
+const MATCHERS: [Matcher; 15] = [
     github_token,
     anthropic_key,
     openai_key,
@@ -367,6 +404,29 @@ const MATCHERS: [Matcher; 13] = [
     authorization_header,
     url_credentials,
     secret_assignment,
+    prose_credential,
+    paired_username,
+];
+
+/// The matchers that recognize a credential by its *own* shape, with no surrounding evidence.
+///
+/// [`prose_credential`] consults these before claiming the value after a credential noun, and
+/// stands down if one of them owns it. Two reasons, and the second is the load-bearing one:
+/// `token ghp_…` should be reported as a `github-token` rather than as prose, and — because these
+/// shapes run through dots and punctuation that the prose value charset stops at — a prose match
+/// over `token eyJhbGci….eyJzdWIi….SIGNATURE` would replace the header and leave the payload and
+/// the signature on the screen beside a marker. That partial redaction is the worst outcome this
+/// module has, and deferring is how the least specific pattern in the set avoids causing it.
+const VENDOR_MATCHERS: [Matcher; 9] = [
+    github_token,
+    anthropic_key,
+    openai_key,
+    aws_access_key_id,
+    slack_token,
+    gitlab_token,
+    npm_token,
+    google_api_key,
+    jwt,
 ];
 
 /// Bytes that can begin a match. A cheap reject so the scanner does not run thirteen matchers at
@@ -1072,6 +1132,321 @@ fn normalized_key(key: &[u8]) -> Option<([u8; MAX_KEY_CHARS], usize)> {
     Some((buffer, length))
 }
 
+// --- prose, and the pair a URL splits across two parameters -----------------------------------
+
+/// The nouns that, standing alone as a word, say outright that what follows is a credential.
+///
+/// Whole words, case-insensitively, and **single** words: `api key` and `secret key` are not
+/// matched as phrases, which is a named recall cost rather than an oversight. A second word is a
+/// second place for prose to get in, and `secret` and `token` alone already carry most of the
+/// traffic.
+///
+/// `username` is deliberately absent, here as in [`SECRET_KEY_WORDS`]: a username is not a secret,
+/// and the one case where it travels as half of a live pair is [`paired_username`]'s, which has the
+/// password beside it as evidence. `key` is absent because it is an ordinary English word — *the
+/// key insight*, *the key is idempotence* — and this pattern's only guard is what comes next.
+///
+/// **`pass` is here because the archive spells it that way.** Review's eyeball pass found the same
+/// production credential written a second way — ``user `feedface00` · pass `c0ffeec0ffee` `` — where
+/// neither the noun nor the wrapper was one this pattern knew. It is the riskiest entry in the list
+/// (*a boarding pass*, *pass the build*, *pass-through*), and it is carried on the same evidence as
+/// the rest: it fires on this archive only where a credential is, and nowhere else in 933,292
+/// records.
+const PROSE_SECRET_WORDS: [&[u8]; 9] = [
+    b"password",
+    b"passwords",
+    b"passwd",
+    b"passphrase",
+    b"pass",
+    b"pwd",
+    b"token",
+    b"secret",
+    b"apikey",
+];
+
+/// What a prose value may be wrapped in: a markdown code span or a pair of straight quotes.
+///
+/// The archive writes credentials in running text and in tables, and a table writes them
+/// ``pass `c0ffeec0ffee` ``. The wrapper is *not* treated as extra evidence — the value inside still
+/// has to pass every test a bare one does — it is only accepted as a boundary, because otherwise the
+/// backtick fails the single-space adjacency and is not in the value charset either, and the whole
+/// spelling is invisible.
+///
+/// **Whole value or nothing.** A wrapped value that does not close in the value charset is refused
+/// outright rather than matched up to the first stray byte; the escaped-quote review finding on
+/// [`quoted_value_end`] is the same invariant, and a marker beside half a credential is the worst
+/// outcome this module has.
+const PROSE_WRAPPERS: [u8; 3] = *b"`\"'";
+
+/// Longest entry in [`PROSE_SECRET_WORDS`]; a word longer than this cannot be one.
+const MAX_PROSE_WORD_CHARS: usize = 10;
+
+/// The bytes any [`PROSE_SECRET_WORDS`] entry can begin with, in either case.
+///
+/// The same kind of cheap reject as [`MAYBE_START`]. This is the only matcher that has to *measure
+/// a word* before it can rule itself out, so without a first-byte test it measures one at every
+/// letter of a two-megabyte transcript; with it, only at four letters in either case.
+/// `prose_first_bytes_cover_every_noun` pins the list to the nouns rather than to memory, because a
+/// noun this misses is a pattern that silently never fires.
+const PROSE_FIRST_BYTES: [u8; 8] = *b"pPtTsSaA";
+
+/// The words allowed to stand between the noun and the value. *The password is c0ffeec0ffee* is the
+/// form a person actually types, and a copula carries no meaning a redactor should trip over.
+///
+/// Exactly one of them, and nothing else: every additional word between the anchor and the value is
+/// another sentence this pattern could wander into.
+const PROSE_FILLER_WORDS: [&[u8]; 2] = [b"is", b"was"];
+
+/// Shortest value [`prose_credential`] will believe. Twelve is the length of the production
+/// sighting that opened qanungo #15 (`c0ffeec0ffee`, twelve hex characters), and it is long enough
+/// that the English words carrying a digit which could otherwise follow a credential noun —
+/// `sha256`, `base64url`, `argon2id`, `oauth2`, `utf8` — are all too short to reach it.
+const MIN_PROSE_SECRET_CHARS: usize = 12;
+
+/// A credential noun, a space, and a value shaped like a credential — with **no separator at all**,
+/// which is the whole gap this pattern closes.
+///
+/// [`secret_assignment`] requires a `:` or `=` binding the key to the value, and the real archived
+/// instruction behind qanungo #15 wrote the same pair twice: `password=c0ffeec0ffee` in a query
+/// string, which fired, and `password c0ffeec0ffee` in the sentence above it, which did not.
+///
+/// # The value shape is the entire guard
+///
+/// There is no structure on the left to lean on — a noun and a space is also how *password
+/// manager*, *token stream*, *token count*, and *the password is stored in the keychain* are
+/// written. So the value has to look like a credential and nothing else:
+///
+/// - **The credential charset**, base62 plus `-` and `_`. Narrower than a bare assignment's on
+///   purpose: `.` and `/` are what turn a value into a file path, a version, or the next sentence.
+/// - **At least [`MIN_PROSE_SECRET_CHARS`]**, which is what keeps every ordinary next word out.
+/// - **A digit and a letter.** All-letters is an English word however long it is, and all-digits is
+///   a measurement — this archive writes `"input_tokens": 61184` tens of thousands of times, and
+///   `token 61184` is the same number with the punctuation dropped.
+///
+/// And one guard on the gap rather than on the value, which the archive scan asked for: **exactly
+/// one space**, never a tab and never a run of them. A sentence puts one space between two words;
+/// several spaces or a tab is a *column*, and the first scan of this pattern found it reading one —
+/// `ok  mosquitto-passwd     deadbeef0badf00d  -> /run/…/passwd`, a deploy log's aligned digest
+/// column under a resource whose name happens to end in `passwd`. A digest is the thing this
+/// module refuses hardest to redact.
+///
+/// # Wrappers are boundaries, never evidence
+///
+/// The noun, the value, or both may sit in a markdown code span or a pair of straight quotes —
+/// ``pass `c0ffeec0ffee` ``, `` the `password` c0ffeec0ffee ``. Both spellings are in this archive
+/// and both were invisible to the first cut, because a backtick is neither a space nor a value byte.
+/// A wrapper is accepted as a *boundary* only: it buys the value nothing, unlike
+/// [`secret_assignment`]'s quoted form, where the quotes are structure a separator has already
+/// vouched for. A wrapped noun must close in the delimiter it opened with, and a wrapped value must
+/// close in the value charset or the match is refused whole.
+///
+/// **Recall cost, named:** an all-letter prose passphrase (`password correcthorsebatterystaple`) is
+/// not matched, though the assignment form of it still is. Bare prose has no quotes to fall back
+/// on, and a twenty-letter run is a word this pattern is not willing to eat.
+///
+/// Two further stand-downs, both about *partial* redaction rather than about prose: a value with a
+/// dotted word tail is left whole for whoever owns it, and a value one of the [`VENDOR_MATCHERS`]
+/// recognizes is left to that matcher, which knows how far it runs.
+fn prose_credential(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !PROSE_FIRST_BYTES.contains(&bytes[at]) || !boundary_before(bytes, at) {
+        return None;
+    }
+    let word = run(bytes, at, |byte| byte.is_ascii_alphabetic());
+    if word > MAX_PROSE_WORD_CHARS || !word_is(bytes, at, word, &PROSE_SECRET_WORDS) {
+        return None;
+    }
+    let mut cursor = at + word;
+    // A noun in a code span closes it before the gap begins. The *matching* delimiter, so that a
+    // stray quote on one side alone cannot manufacture a boundary.
+    if at > 0
+        && PROSE_WRAPPERS.contains(&bytes[at - 1])
+        && bytes.get(cursor) == Some(&bytes[at - 1])
+    {
+        cursor += 1;
+    }
+    // One space, not a separator and not a column: `password: x` and `password=x` are the
+    // assignment's, a noun running straight into a word byte (`password_reset`) is an identifier
+    // rather than a sentence, and `passwd\t<hex>` is a table.
+    if !single_space(bytes, cursor) {
+        return None;
+    }
+    cursor += 1;
+    // At most one copula, and only when it too is followed by a single space.
+    let filler = run(bytes, cursor, |byte| byte.is_ascii_alphabetic());
+    if word_is(bytes, cursor, filler, &PROSE_FILLER_WORDS) && single_space(bytes, cursor + filler) {
+        cursor += filler + 1;
+    }
+    let wrapper = bytes
+        .get(cursor)
+        .copied()
+        .filter(|byte| PROSE_WRAPPERS.contains(byte));
+    let value_at = cursor + usize::from(wrapper.is_some());
+    let value_end = value_at + run(bytes, value_at, is_prose_value_byte);
+    let value = &bytes[value_at..value_end];
+    if value.len() < MIN_PROSE_SECRET_CHARS
+        || !value.iter().any(u8::is_ascii_digit)
+        || !value.iter().any(u8::is_ascii_alphabetic)
+    {
+        return None;
+    }
+    // A value carrying an `_` and no lowercase letter at all is SHOUTING_SNAKE_CASE: the naming
+    // convention of an environment variable or a CI secret, which is to say a **name** rather than
+    // a value. The wrapped form found this on the archive — *Paste into GitHub secret
+    // `DEVELOPER_ID_CERTIFICATE_BASE64`* — and redacting it does not merely cost precision, it
+    // destroys the runbook step the name is the subject of. Credentials are base62 or hex and carry
+    // lowercase; this is the argument `aws_access_key_id` already makes when it refuses a longer
+    // SHOUTING_IDENTIFIER run.
+    if value.contains(&b'_') && !value.iter().any(u8::is_ascii_lowercase) {
+        return None;
+    }
+    match wrapper {
+        // Whole value or nothing: a wrapper that does not close where the value charset ends was
+        // wrapping something this pattern cannot see the end of.
+        Some(wrapper) if bytes.get(value_end) != Some(&wrapper) => return None,
+        // A dotted tail — a JWT, a routable GitLab token, a hostname — is longer than this charset
+        // can see. Matching its first segment would be a partial redaction, so stand down. Only the
+        // bare form can have one; a wrapped value has just been proved to end at its wrapper.
+        None if bytes.get(value_end) == Some(&b'.')
+            && bytes.get(value_end + 1).is_some_and(|b| is_word_byte(*b)) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    if VENDOR_MATCHERS
+        .into_iter()
+        .any(|matcher| matcher(bytes, value_at).is_some())
+    {
+        return None;
+    }
+    Some(Hit {
+        id: PatternId::ProseCredential,
+        start: value_at,
+        end: value_end,
+    })
+}
+
+/// Whether `at` holds exactly one space — one, so that a run of them or a tab, which is a table's
+/// column rule rather than a sentence's word break, is refused.
+fn single_space(bytes: &[u8], at: usize) -> bool {
+    bytes.get(at) == Some(&b' ') && !bytes.get(at + 1).is_some_and(|byte| is_blank(*byte))
+}
+
+/// Whether the `length` bytes at `at` are one of `words`, ignoring case, as a whole word.
+fn word_is(bytes: &[u8], at: usize, length: usize, words: &[&[u8]]) -> bool {
+    if length == 0
+        || bytes
+            .get(at + length)
+            .is_some_and(|byte| is_word_byte(*byte))
+    {
+        return false;
+    }
+    words
+        .iter()
+        .any(|word| word.len() == length && starts_with_ignore_case(bytes, at, word))
+}
+
+/// The query-parameter names [`paired_username`] will scrub beside a password.
+const PAIRED_USER_KEYS: [&[u8]; 2] = [b"username", b"user"];
+
+/// The password-class parameter names that make one of those sensitive. Narrower than
+/// [`SECRET_KEY_WORDS`] on purpose: `session=` and `token=` beside a `user=` are a session and a
+/// user id, which is what half the URLs in any archive look like. It is the *password* that turns
+/// the username into the other half of a live login.
+const PAIRED_PASSWORD_WORDS: [&[u8]; 3] = [b"password", b"passwd", b"passphrase"];
+
+/// How far either side of the username this will look for its password. Two kilobytes is longer
+/// than any real URL and short enough that the search is a constant rather than a walk over a
+/// pasted document.
+const MAX_URL_SCAN_BYTES: usize = 2048;
+
+/// The `username=` of a URL whose `password=` fired on its own.
+///
+/// A username is not a secret — [`SECRET_KEY_WORDS`] leaves it out deliberately, and prose
+/// usernames stay readable, because a report that redacts the person's own login name everywhere it
+/// appears has become noise. What is sensitive is a **live pair**, and the archived instruction
+/// behind qanungo #15 is exactly that: `?username=feedface00&password=…` in one URL, where scrubbing
+/// the password alone leaves the reader holding one usable half.
+///
+/// So the evidence for this pattern is entirely *adjacency*, and it is spelled structurally:
+///
+/// - The name is a query parameter — the byte before it is `?` or `&` — and not a word in a
+///   sentence.
+/// - It sits inside a URL: the run of URL bytes reaching back from it contains a `://`.
+/// - Somewhere in that same run, before or after, a password-class parameter is present **and
+///   [`secret_assignment`] accepts it**. Reusing the assignment matcher rather than re-testing the
+///   value is what keeps the two in step: `?username=x&password=` with an empty or prose value
+///   scrubs nothing, so there is no pair, so the username stays.
+///
+/// The scrub stops at the query value's charset, so `&` and the parameters after it survive and the
+/// URL still reads as a URL.
+fn paired_username(bytes: &[u8], at: usize) -> Option<Hit> {
+    if at == 0 || !matches!(bytes[at - 1], b'?' | b'&') {
+        return None;
+    }
+    let key = PAIRED_USER_KEYS
+        .into_iter()
+        .find(|key| starts_with_ignore_case(bytes, at, key))?;
+    if bytes.get(at + key.len()) != Some(&b'=') {
+        return None;
+    }
+    let value_at = at + key.len() + 1;
+    let value_end = value_at + run(bytes, value_at, is_query_value_byte);
+    if value_end == value_at || !url_password_fires(bytes, at) {
+        return None;
+    }
+    Some(Hit {
+        id: PatternId::PairedUsername,
+        start: value_at,
+        end: value_end,
+    })
+}
+
+/// Whether the URL surrounding `at` carries a password-class parameter that would itself be
+/// redacted.
+fn url_password_fires(bytes: &[u8], at: usize) -> bool {
+    let from = at - back_run(bytes, at, MAX_URL_SCAN_BYTES, is_url_byte);
+    // Without a scheme this is not a URL, and a bare `?a=b&password=c` in a shell line or a piece
+    // of source is not the pair this pattern is about.
+    if find(&bytes[from..at], b"://").is_none() {
+        return false;
+    }
+    // Bounded on this side too, and by slicing rather than by trusting the run to stop: the
+    // constant says "either side", and a document with no whitespace in it would otherwise walk
+    // forward to the end of a two-megabyte record.
+    let ceiling = (at + MAX_URL_SCAN_BYTES).min(bytes.len());
+    let to = at + run(&bytes[..ceiling], at, is_url_byte);
+    (from..to).any(|index| {
+        index > 0
+            && matches!(bytes[index - 1], b'?' | b'&')
+            && is_password_parameter(bytes, index)
+            && secret_assignment(bytes, index).is_some()
+    })
+}
+
+/// Whether the parameter name at `index` normalizes to a password-class word.
+fn is_password_parameter(bytes: &[u8], index: usize) -> bool {
+    let key = run(bytes, index, is_key_name_byte);
+    if !(MIN_KEY_CHARS..=MAX_KEY_CHARS).contains(&key) || bytes.get(index + key) != Some(&b'=') {
+        return false;
+    }
+    normalized_key(&bytes[index..index + key]).is_some_and(|(buffer, length)| {
+        PAIRED_PASSWORD_WORDS
+            .iter()
+            .any(|word| buffer[..length].ends_with(word))
+    })
+}
+
+/// How many consecutive bytes *before* `at`, up to `limit`, satisfy `allowed`.
+fn back_run(bytes: &[u8], at: usize, limit: usize, allowed: impl Fn(u8) -> bool) -> usize {
+    let floor = at.saturating_sub(limit);
+    bytes[floor..at]
+        .iter()
+        .rev()
+        .take_while(|byte| allowed(**byte))
+        .count()
+}
+
 // --- byte classes ----------------------------------------------------------------------------
 
 fn is_word_byte(byte: u8) -> bool {
@@ -1117,6 +1492,32 @@ fn is_credential_byte(byte: u8) -> bool {
         && !matches!(
             byte,
             b',' | b';' | b'"' | b'\'' | b'`' | b'[' | b']' | b'{' | b'}' | b'<' | b'>'
+        )
+}
+
+/// What a value found in *prose* may be made of: base62 plus `-` and `_`, and nothing else.
+///
+/// Narrower than [`is_bare_value_byte`], because a bare assignment has its separator as evidence
+/// and prose has none. `.` and `/` are the two that matter: they are how a value becomes a file
+/// path, a version number, a hostname, or the first word of the next sentence, and every one of
+/// those would be a false positive with a credential noun sitting in front of it.
+fn is_prose_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+/// What a URL query value may be made of. Stops at `&`, `#`, `=`, and anything non-graphic, so a
+/// scrubbed parameter never swallows the parameters after it.
+fn is_query_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'%' | b'+')
+}
+
+/// What a URL may be made of, for the purpose of deciding that two parameters are in the *same*
+/// one. Whitespace and quoting end it, as does anything a URL is conventionally wrapped in.
+fn is_url_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic()
+        && !matches!(
+            byte,
+            b'"' | b'\'' | b'`' | b'<' | b'>' | b'\\' | b'|' | b'^' | b'{' | b'}' | b'[' | b']'
         )
 }
 
@@ -1268,7 +1669,12 @@ mod tests {
     /// One planted canary per secret pattern. Every value is obviously fake — the bodies are
     /// keyboard filler of the right shape — and every one is a *complete* example, because a
     /// pattern set tested only on the prefix would pass while redacting nothing real.
-    const CANARIES: [(PatternId, &str); 19] = [
+    ///
+    /// [`PatternId::PairedUsername`] is the one id with no row here, and the reason is the pattern
+    /// itself: its evidence is a password beside it, so any string that fires it fires twice and
+    /// cannot be a single-fire canary. It is held to
+    /// `a_username_is_scrubbed_only_beside_a_password_in_the_same_url` instead.
+    const CANARIES: [(PatternId, &str); 20] = [
         (
             PatternId::GithubToken,
             "the classic one is ghp_FAKEfake0123456789ABCDEFabcdef012345 in the log",
@@ -1350,10 +1756,15 @@ mod tests {
             PatternId::SecretAssignment,
             "PATWARI_API_KEY=FAKEfake0123456789ABCDEF was exported",
         ),
+        (
+            // The qanungo #15 shape: a credential noun, a space, and no separator at all.
+            PatternId::ProseCredential,
+            "use the portal and password fakefake0123 to sign in",
+        ),
     ];
 
     /// The fake bodies above, so a test can assert none of them survives anywhere.
-    const CANARY_BODIES: [&str; 12] = [
+    const CANARY_BODIES: [&str; 13] = [
         "ghp_FAKEfake0123456789ABCDEFabcdef012345",
         "sk-ant-api03-FAKEfake0123456789-ABCDEFabcdefFAKE",
         "AKIAFAKEFAKEFAKE1234",
@@ -1366,6 +1777,7 @@ mod tests {
         "FAKEfake0123456789ABCDEFabcdef",
         "FAKEfakePASSWORD",
         "FAKEfake0123456789ABCDEF",
+        "fakefake0123",
     ];
 
     fn secrets() -> Redactor {
@@ -1798,6 +2210,33 @@ mod tests {
         assert!(!SECRET_PATTERNS.contains(&PatternId::Profanity));
     }
 
+    /// The prose matcher rules itself out on the first byte before it measures a word, so that
+    /// byte list has to cover every noun — a noun it does not cover would be a pattern that
+    /// silently never fires.
+    #[test]
+    fn prose_first_bytes_cover_every_noun() {
+        for word in PROSE_SECRET_WORDS {
+            assert!(
+                PROSE_FIRST_BYTES.contains(&word[0]),
+                "{} can never be reached",
+                String::from_utf8_lossy(word)
+            );
+            assert!(word.len() <= MAX_PROSE_WORD_CHARS);
+            assert!(word.iter().all(u8::is_ascii_lowercase));
+        }
+        // Upper case is the same word: the archive writes `Password` and `Token` in prose too.
+        for text in ["the Password FAKEfake0123", "a TOKEN FAKEfake0123"] {
+            assert_eq!(
+                secrets()
+                    .scrub(text)
+                    .report
+                    .count(PatternId::ProseCredential),
+                1,
+                "missed {text:?}"
+            );
+        }
+    }
+
     /// The revision is a date because two documents are comparable only when the pattern set that
     /// produced them was the same, and a date is what names the research file beside it.
     #[test]
@@ -1834,6 +2273,310 @@ mod tests {
             "[REDACTED:github-token] then [REDACTED:aws-access-key-id] then [REDACTED:gitlab-token]"
         );
         assert_eq!(scrubbed.report.total(), 3);
+    }
+
+    /// The instruction that opened qanungo #15, in shape: the same pair written twice, once as
+    /// prose and once as a query string, with only the query string's password scrubbed.
+    ///
+    /// **The values are fake and the host is `example.com`, deliberately.** The production string
+    /// is quoted in issue #15; a test file is not somewhere to keep a live credential, and §5 of
+    /// the provenance file already refuses "a denylist of the operator's own known secrets" on
+    /// exactly that ground. Every length and charset class is the original's: a ten-character
+    /// username, a twelve-character hex password, both spelled twice.
+    const ISSUE_15: &str = "use http://line.example.com username : fake64f1ab and password fakefake0123 for xtream. and http://line.example.com/get.php?username=fake64f1ab&password=fakefake0123&type=m3u_plus";
+
+    /// The gap itself. Before this revision the prose password and the URL username were both
+    /// readable beside a marker claiming the string had been scrubbed.
+    #[test]
+    fn the_issue_15_instruction_loses_both_halves_of_the_pair() {
+        let scrubbed = secrets().scrub(ISSUE_15);
+        assert_eq!(
+            scrubbed.text,
+            "use http://line.example.com username : fake64f1ab and password [REDACTED:prose-credential] for xtream. and http://line.example.com/get.php?username=[REDACTED:paired-username]&password=[REDACTED:secret-assignment]&type=m3u_plus"
+        );
+        assert_eq!(scrubbed.report.count(PatternId::ProseCredential), 1);
+        assert_eq!(scrubbed.report.count(PatternId::PairedUsername), 1);
+        assert_eq!(scrubbed.report.count(PatternId::SecretAssignment), 1);
+        assert!(
+            !scrubbed.text.contains("fakefake0123"),
+            "a password survived: {:?}",
+            scrubbed.text
+        );
+        // The prose username survives, and that is the design: a username is not a secret, and a
+        // report that redacts the reader's own login everywhere it appears is noise. Only the half
+        // of a *live pair* goes.
+        assert!(scrubbed.text.contains("username : fake64f1ab"));
+        // Twice through two surfaces changes nothing.
+        let twice = secrets().scrub(&scrubbed.text);
+        assert_eq!(twice.text, scrubbed.text);
+        assert!(twice.report.is_empty());
+    }
+
+    /// The over-match minefield, and the only thing standing in it is the value shape. Every line
+    /// here is a credential noun followed by an ordinary word, which is the same grammar as the
+    /// production string.
+    #[test]
+    fn a_credential_noun_followed_by_ordinary_words_is_prose() {
+        const PROSE: [&str; 16] = [
+            "password manager",
+            "password field",
+            "password reset flow",
+            "the password is stored in the keychain",
+            "token stream",
+            "token count",
+            "the token was truncated",
+            "secret sauce",
+            "password hashing with argon2id",
+            "token base64url encoding",
+            "the token is 4096",
+            "output token 61184 of 200000",
+            "password 1234567890123456",
+            "passphrase correcthorsebatterystaple",
+            "token abc123def",
+            "secret 2026-08",
+        ];
+        for text in PROSE {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.text,
+                text,
+                "redacted prose: {:?}",
+                scrubbed.report.fired().collect::<Vec<_>>()
+            );
+        }
+        // And the shapes that are credentials, with and without the copula.
+        for text in [
+            "password fakefake0123",
+            "the password is fakefake0123",
+            "the token was FAKEfake01234567",
+            "X-Auth-Token fakeFAKE01234567",
+            "apikey fake_fake_0123",
+            "pwd fakefake0123-01",
+        ] {
+            assert_eq!(
+                secrets()
+                    .scrub(text)
+                    .report
+                    .count(PatternId::ProseCredential),
+                1,
+                "missed {text:?}"
+            );
+        }
+    }
+
+    /// The gate spelled out as a grid: every noun crossed with every value shape, so a widening of
+    /// either list cannot pass without a fire count moving.
+    #[test]
+    fn the_prose_gate_is_the_noun_list_crossed_with_the_value_shape() {
+        const NOUNS: [(&str, bool); 11] = [
+            ("password", true),
+            ("passwd", true),
+            ("passphrase", true),
+            ("pass", true),
+            ("pwd", true),
+            ("token", true),
+            ("secret", true),
+            ("apikey", true),
+            // Not nouns: a username is not a secret, `key` is an English word, and `api` is only
+            // half of one.
+            ("username", false),
+            ("key", false),
+            ("api", false),
+        ];
+        const VALUES: [(&str, bool); 9] = [
+            ("fakefake0123", true),       // twelve, mixed: the production shape
+            ("fakefake012", false),       // eleven: under the floor
+            ("fakefakefake", false),      // no digit: a word, however long
+            ("123456789012", false),      // no letter: a measurement
+            ("fake_fake_0123", true),     // the credential charset's own separators
+            ("fake/fake/0123", false),    // a path — the run stops at `/`, leaving four characters
+            ("fake.fake.0123", false),    // dotted: somebody else's token, left whole
+            ("../../etc/passwd0", false), // not even a value
+            // SHOUTING_SNAKE_CASE is a CI secret's *name*, and the archive writes it in a code span
+            // right after the noun: `Paste into GitHub secret `DEVELOPER_ID_CERTIFICATE_BASE64``.
+            ("DEVELOPER_ID_CERTIFICATE_BASE64", false),
+        ];
+        // A wrapper is a boundary and never evidence, so it may not move a single expectation: the
+        // noun and the value shape decide, wrapped or bare. A value the wrapper cannot close on —
+        // a path, a dotted token — stays refused, now because the wrapper is not where the value
+        // charset ran out.
+        for (noun, is_noun) in NOUNS {
+            for (value, is_value) in VALUES {
+                for gap in [" ", " is ", " was "] {
+                    for wrapper in ["", "`", "\"", "'"] {
+                        let text = format!("and the {noun}{gap}{wrapper}{value}{wrapper} follows");
+                        let fired = secrets()
+                            .scrub(&text)
+                            .report
+                            .count(PatternId::ProseCredential);
+                        assert_eq!(
+                            fired,
+                            usize::from(is_noun && is_value),
+                            "{text:?} fired {fired} times"
+                        );
+                    }
+                }
+            }
+        }
+        // A column is not a sentence. The archive scan caught this pattern reading a deploy log's
+        // aligned digest column under a resource name ending in `passwd`, and one space is the
+        // difference between a sentence and a table.
+        for text in [
+            "ok       mosquitto-passwd     deadbeef0badf00d  -> /run/mosquitto/passwd",
+            "ok\tmosquitto-passwd\tdeadbeef0badf00d",
+            "the password  fakefake0123 is two spaces from its noun",
+            "the password is  fakefake0123",
+        ] {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, text, "redacted a column: {text:?}");
+        }
+        // A separator is the assignment's evidence, not this pattern's: the same noun and value
+        // bound by `:` or `=` must still be reported as an assignment.
+        for text in ["password: fakefake0123", "password=fakefake0123"] {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.report.count(PatternId::SecretAssignment), 1);
+            assert_eq!(scrubbed.report.count(PatternId::ProseCredential), 0);
+        }
+        // The noun may be in a code span too, and it must close in the delimiter it opened with: a
+        // stray one on a single side is not a boundary.
+        for (text, expected) in [
+            ("the `password` fakefake0123 is live", 1),
+            ("the \"password\" fakefake0123 is live", 1),
+            ("the `password\" fakefake0123 is live", 0),
+            ("the password` fakefake0123 is live", 0),
+        ] {
+            let fired = secrets()
+                .scrub(text)
+                .report
+                .count(PatternId::ProseCredential);
+            assert_eq!(fired, expected, "{text:?} fired {fired} times");
+        }
+        // Half a wrapped value is never rendered: a wrapper that does not close where the value
+        // charset ends refuses the whole match rather than matching up to the stray byte.
+        for text in [
+            "pass `fakefake0123 and then some",
+            "pass \"fakefake0123\n",
+            "pass `fakefake0123.more`",
+        ] {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, text, "matched inside an unclosed wrapper");
+        }
+    }
+
+    /// The second spelling of the same production credential, which review's eyeball pass found
+    /// still readable after the first cut shipped: a table row where the noun is `pass` and the
+    /// value is a code span, so neither the noun list nor the single-space adjacency reached it.
+    ///
+    /// Values fake and shape-identical, as in [`ISSUE_15`].
+    #[test]
+    fn the_table_spelling_of_the_same_pair_is_scrubbed_too() {
+        let scrubbed = secrets().scrub("- user `fake64f1ab` · pass `fakefake0123`");
+        assert_eq!(
+            scrubbed.text,
+            "- user `fake64f1ab` · pass `[REDACTED:prose-credential]`"
+        );
+        assert_eq!(scrubbed.report.count(PatternId::ProseCredential), 1);
+        // The wrapper survives on both sides, which is what makes the row still read as a row —
+        // and what makes a second scrub a no-op rather than a nested marker.
+        let twice = secrets().scrub(&scrubbed.text);
+        assert_eq!(twice.text, scrubbed.text);
+        assert!(twice.report.is_empty());
+        // `pass` is the riskiest noun in the list, so its ordinary senses are pinned here.
+        for text in [
+            "pass the build and move on",
+            "a boarding pass 12345678 for tomorrow",
+            "pass-through is the default",
+            "the tests pass consistently on main",
+            "pass 12345678901234567890",
+            "compass fakefake0123 is not a noun",
+        ] {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, text, "redacted prose: {text:?}");
+        }
+    }
+
+    /// The least specific pattern in the set must never claim a value one of the vendor shapes
+    /// owns — not for the id, but because those shapes run through dots the prose charset stops at,
+    /// and a match over the first segment of a JWT is a *partial* redaction.
+    #[test]
+    fn a_vendor_token_after_a_noun_keeps_its_own_pattern_and_its_whole_length() {
+        let cases = [
+            (
+                "token ghp_FAKEfake0123456789ABCDEFabcdef012345",
+                PatternId::GithubToken,
+                "token [REDACTED:github-token]",
+            ),
+            (
+                "the token is eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJGQUtFIn0.FAKEfakeSIG",
+                PatternId::Jwt,
+                "the token is [REDACTED:jwt]",
+            ),
+            (
+                "secret AIzaFAKEfake0123456789ABCDEFabcdef01234",
+                PatternId::GoogleApiKey,
+                "secret [REDACTED:google-api-key]",
+            ),
+        ];
+        for (text, expected, rendered) in cases {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, rendered, "partial or misattributed match");
+            assert_eq!(scrubbed.report.count(expected), 1);
+            assert_eq!(scrubbed.report.count(PatternId::ProseCredential), 0);
+            assert_eq!(scrubbed.report.total(), 1);
+        }
+    }
+
+    /// A username is scrubbed for exactly one reason — the live password beside it in the same
+    /// URL — and every way of removing that reason must bring the username back.
+    #[test]
+    fn a_username_is_scrubbed_only_beside_a_password_in_the_same_url() {
+        let paired =
+            "https://example.com/get.php?username=fake64f1ab&password=fakefake0123&type=m3u";
+        let scrubbed = secrets().scrub(paired);
+        assert_eq!(
+            scrubbed.text,
+            "https://example.com/get.php?username=[REDACTED:paired-username]&password=[REDACTED:secret-assignment]&type=m3u"
+        );
+        assert_eq!(scrubbed.report.count(PatternId::PairedUsername), 1);
+        // Order is not evidence: the password may come first.
+        let reversed = "https://example.com/get.php?password=fakefake0123&user=fake64f1ab";
+        let scrubbed = secrets().scrub(reversed);
+        assert_eq!(
+            scrubbed.text,
+            "https://example.com/get.php?password=[REDACTED:secret-assignment]&user=[REDACTED:paired-username]"
+        );
+        // A second scrub finds no pair, because there is no longer a password to pair with.
+        let twice = secrets().scrub(&scrubbed.text);
+        assert_eq!(twice.text, scrubbed.text);
+        assert!(twice.report.is_empty());
+
+        const UNPAIRED: [&str; 6] = [
+            // No password parameter at all.
+            "https://example.com/api?username=fake64f1ab&type=m3u",
+            // A password parameter whose value the assignment pattern refuses — an empty value, a
+            // bare number, and an expression. No live half, so no pair.
+            "https://example.com/api?username=fake64f1ab&password=",
+            "https://example.com/api?username=fake64f1ab&password=12345678",
+            // A different URL: whitespace ends the one the username is in.
+            "https://example.com/a?username=fake64f1ab and https://example.com/b?password=fakefake0123",
+            // Not a URL at all — no scheme, so this is a shell line or a struct literal.
+            "?username=fake64f1ab&password=fakefake0123",
+            // Not a query parameter: a sentence about the field.
+            "the username fake64f1ab goes with password=fakefake0123 in https://example.com/x",
+        ];
+        for text in UNPAIRED {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.report.count(PatternId::PairedUsername),
+                0,
+                "scrubbed an unpaired username: {text:?}"
+            );
+            assert!(
+                scrubbed.text.contains("fake64f1ab"),
+                "the username went anyway: {:?}",
+                scrubbed.text
+            );
+        }
     }
 
     #[test]

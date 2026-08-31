@@ -3,6 +3,11 @@
 Input for qanungo#8 (the redaction layer). Every token shape sourced; every deliberate gap listed.
 Do not widen a pattern without a source.
 
+> **Amended 2026-08-31** by [`redaction-patterns-2026-08-31.md`](redaction-patterns-2026-08-31.md),
+> which adds `prose-credential` and `paired-username` for qanungo#15 and moves `PATTERN_REVISION` to
+> that date. Nothing below changed — no pattern here matches differently — and this file remains the
+> provenance of every id it describes. Read both.
+
 **This file is the provenance of `crates/qanungo/src/redaction.rs`.** Every prefix, length, and
 charset in that module came from here and from nowhere else, and each pattern's doc comment names
 the row below it came from. It is committed as it was researched so that a `[REDACTED:…]` marker in

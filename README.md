@@ -90,7 +90,10 @@ carries `repository` and no hostname.
 surface that needed it: a scrub with two independently switched passes — secrets **on** by default,
 profanity off — anchored on structure (a vendor prefix, a length class, a charset, a key name)
 rather than on entropy, with every pattern's provenance dated and committed beside it
-([`docs/redaction-patterns-2026-08-24.md`](docs/redaction-patterns-2026-08-24.md)). Its report
+([`docs/redaction-patterns-2026-08-24.md`](docs/redaction-patterns-2026-08-24.md), amended by
+[`docs/redaction-patterns-2026-08-31.md`](docs/redaction-patterns-2026-08-31.md) for the two
+patterns [#15](https://github.com/surdy/qanungo/issues/15) added, whose evidence is a credential noun
+standing in prose and a `username=` beside a live `password=` rather than a separator). Its report
 carries counts per pattern id and *nothing about what it matched* — no offset, no excerpt, not even
 in `Debug` — because the thing that ends up in a footer or a panic message must not be the leak.
 `report` and `cost` are deliberately not wired to it: a filter over a document that carries no
