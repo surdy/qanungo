@@ -89,9 +89,11 @@ use thiserror::Error;
 use crate::ask::{Ask, Escalation, Query};
 use crate::ask_report::{AskInstrumentation, AskReport, VerbatimStats};
 use crate::cache::BlobCache;
-use crate::cli::{ArchiveArgs, AskArgs, CostArgs, ReportArgs, StandupArgs, Window};
+use crate::cli::{ArchiveArgs, AskArgs, CostArgs, DoctorArgs, ReportArgs, StandupArgs, Window};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
+use crate::doctor::{Doctor, DoctorSession};
+use crate::doctor_report::{DoctorInstrumentation, DoctorReport};
 use crate::format;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
@@ -198,7 +200,12 @@ pub fn fold_coaching(
     Ok(Folded {
         generated_at: prepared.generated_at,
         compared: prepared.comparison_opens_at.is_some(),
-        skipped: summarize(&skipped, placed.unplaceable, redactor),
+        skipped: summarize(
+            &skipped,
+            placed.unplaceable,
+            redactor,
+            &mut RedactionReport::default(),
+        ),
         sessions,
         previous,
         findings,
@@ -317,7 +324,12 @@ pub fn fold_cost(
         generated_at: prepared.generated_at,
         totals,
         previous: earlier,
-        skipped: summarize(&skipped, placed.unplaceable, redactor),
+        skipped: summarize(
+            &skipped,
+            placed.unplaceable,
+            redactor,
+            &mut RedactionReport::default(),
+        ),
         instrumentation,
     })
 }
@@ -697,6 +709,113 @@ pub fn ask(args: &AskArgs, out: &mut impl Write) -> Result<(), CommandError> {
         limit: args.limit,
         generated_at: folded.generated_at,
         ask: &folded.ask,
+        instrumentation: &folded.instrumentation,
+    }
+    .render();
+
+    out.write_all(markdown.as_bytes())
+        .map_err(CommandError::Output)
+}
+
+/// What `fold_doctor` returns: the clustering plus what it cost.
+pub struct FoldedDoctor {
+    pub generated_at: DateTime<Utc>,
+    pub doctor: Doctor,
+    pub instrumentation: DoctorInstrumentation,
+}
+
+/// Runs the doctor lane's `sync → read → cluster` over one reach (qanungo #11).
+///
+/// `window` is `None` for the whole archive and `Some` to narrow to a window on the same clock the
+/// other lanes cut on — the [`fold_ask`] shape, for the reason [`crate::cli::DoctorArgs`] argues.
+///
+/// The artifact is the **transcript**, not the summary: what this lane compares is what a person
+/// typed, and a `summary.md` is munshi's curated prose about a session rather than the session's own
+/// words. So this is a transcript-folding lane like `report` and `cost` — a cold run with no window
+/// mirrors the archive, and the footer says what that cost.
+///
+/// Everything the fold renders is scrubbed inside [`Doctor::fold`], so [`FoldedDoctor`] — like
+/// [`FoldedStandup`] and [`FoldedAsk`] — carries no pre-scrub string for any surface to leak. The
+/// gap lines are summarized here, where the mirror's own vocabulary lives, and their scrub is handed
+/// to the fold so that this document's footer counts it: a marker where a harness name belongs, with
+/// "redaction none" beneath it, would be the document contradicting itself.
+///
+/// # Errors
+///
+/// Returns an error when the cache is unusable or the archive cannot be listed. A session whose
+/// transcript this build cannot read is a stated gap, never a failed run.
+pub fn fold_doctor(
+    archive: &ArchiveArgs,
+    window: Option<&Window>,
+    redactor: Redactor,
+) -> Result<FoldedDoctor, CommandError> {
+    let prepared = match window {
+        Some(window) => Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowOnly)?,
+        None => Prepared::mirror_all(archive, Artifact::Transcript)?,
+    };
+
+    let fold_started = Instant::now();
+    let placed = prepared.placement();
+    let mut skipped = prepared.mirror.skipped.clone();
+    let mut sessions = Vec::with_capacity(placed.reported.len());
+    for session in &placed.reported {
+        match read_one_doctor(&prepared.cache, session) {
+            Ok(messages) => sessions.push(DoctorSession {
+                source_hash: session.source_hash.clone(),
+                archived_at: session.archived_at,
+                repository: session.repository.clone(),
+                // The archive's declared original size, already verified against the transferred
+                // bytes, so the footer needs no second pass over the file to count what it read.
+                bytes_folded: session.size_bytes,
+                messages,
+            }),
+            Err(reason) => skipped.push(Skip {
+                source_agent: session.source_agent.clone(),
+                reason,
+            }),
+        }
+    }
+    let mut gap_redaction = RedactionReport::default();
+    let gaps = summarize(&skipped, placed.unplaceable, &redactor, &mut gap_redaction);
+    let doctor = Doctor::fold(&sessions, gaps, &gap_redaction, &redactor);
+    let fold_elapsed = fold_started.elapsed();
+
+    let instrumentation = DoctorInstrumentation {
+        sync: prepared.mirror.stats.clone(),
+        fold_elapsed,
+        redactor,
+        patwari_url: prepared.patwari_url.clone(),
+        cache_root: prepared.cache.root().to_path_buf(),
+    };
+    Ok(FoldedDoctor {
+        generated_at: prepared.generated_at,
+        doctor,
+        instrumentation,
+    })
+}
+
+/// Reads one cached transcript's user messages, streaming it off disk rather than reading it whole.
+fn read_one_doctor(
+    cache: &BlobCache,
+    mirrored: &MirroredSession,
+) -> Result<crate::doctor::SessionMessages, SkipReason> {
+    let (source, blob) = open_for_fold(cache, mirrored)?;
+    crate::doctor::read_messages(source, mirrored.artifact_set_version, BufReader::new(blob))
+        .map_err(|error| SkipReason::Unreadable(error.to_string()))
+}
+
+/// Runs `qanungo doctor`, writing Markdown to `out`.
+///
+/// # Errors
+///
+/// Returns an error on the same conditions the other lanes do. A session whose transcript cannot be
+/// read is a stated gap, never a failed run.
+pub fn doctor(args: &DoctorArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let folded = fold_doctor(&args.archive, args.last.as_ref(), args.redaction.redactor())?;
+    let markdown = DoctorReport {
+        window: args.last.as_ref(),
+        generated_at: folded.generated_at,
+        doctor: &folded.doctor,
         instrumentation: &folded.instrumentation,
     }
     .render();
@@ -1085,13 +1204,18 @@ impl<'a> Placement<'a> {
 /// and transport failures, never transcript content, and with every archive-stated value inside it
 /// (Patwari's `error.code`, a compression header, a content digest) already clamped where it was
 /// parsed.
-fn summarize(skipped: &[Skip], unplaceable: usize, redactor: &Redactor) -> Vec<SkippedNote> {
+fn summarize(
+    skipped: &[Skip],
+    unplaceable: usize,
+    redactor: &Redactor,
+    redaction: &mut RedactionReport,
+) -> Vec<SkippedNote> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for skip in skipped {
-        // Neither of these two documents has a footer that says what the scrub fired, so what a
-        // label cost is discarded here rather than carried — see [`skip_line`], whose other caller
-        // does have one and does count it.
-        let reason = skip_line(skip, redactor, &mut RedactionReport::default());
+        // The coaching and cost documents have no footer that says what the scrub fired and pass a
+        // throwaway report; the doctor lane does have one, and carries what a label cost into it —
+        // see [`skip_line`] for why the two passes are spelled out rather than delegated.
+        let reason = skip_line(skip, redactor, redaction);
         *counts.entry(reason).or_default() += 1;
     }
     let mut notes: Vec<_> = counts
@@ -1164,7 +1288,7 @@ mod tests {
                 reason: SkipReason::UnknownAgent("future".to_owned()),
             },
         ];
-        let notes = summarize(&skips, 0, &Redactor::new());
+        let notes = summarize(&skips, 0, &Redactor::new(), &mut RedactionReport::default());
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].count, 2);
         assert!(notes[0].reason.contains("no `transcript.jsonl` artifact"));
@@ -1198,6 +1322,7 @@ mod tests {
             ],
             0,
             &Redactor::new(),
+            &mut RedactionReport::default(),
         );
         let rendered = notes
             .iter()
@@ -1223,6 +1348,7 @@ mod tests {
             )],
             0,
             &Redactor::new(),
+            &mut RedactionReport::default(),
         );
         assert_eq!(
             ordinary[0].reason,
@@ -1262,6 +1388,7 @@ mod tests {
             ],
             0,
             &Redactor::new(),
+            &mut RedactionReport::default(),
         );
         assert_eq!(notes.len(), 3, "one line per reason");
         for note in &notes {
@@ -1296,6 +1423,7 @@ mod tests {
             }],
             0,
             &Redactor::new(),
+            &mut RedactionReport::default(),
         );
         assert_eq!(
             notes[0].reason,
@@ -1377,7 +1505,7 @@ mod tests {
     /// A session the archive dated unreadably is named in the report's Gaps rather than dropped.
     #[test]
     fn unplaceable_sessions_become_a_gap_line() {
-        let notes = summarize(&[], 3, &Redactor::new());
+        let notes = summarize(&[], 3, &Redactor::new(), &mut RedactionReport::default());
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].count, 3);
         assert!(notes[0].reason.contains("could not place in either window"));

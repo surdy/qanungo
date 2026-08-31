@@ -191,6 +191,33 @@
 //!   numbers and grid indices and no string at all. See [`heatmap`].
 //!
 //! What remains: per-device scope, waiting on a hostname to accrue in the archive.
+//!
+//! # The instructions doctor (qanungo #11)
+//!
+//! ```text
+//! qanungo doctor
+//! ```
+//!
+//! is the fifth lane and the read-only half of the instructions doctor: it clusters near-duplicate
+//! user messages across the sessions of one repository and reports the instructions you have had to
+//! give more than once ([`doctor`], [`doctor_report`]). Four properties are what make it honest:
+//!
+//! - **Repetition, never causation.** It reads transcripts and never a checkout, so it cannot know
+//!   what a `CLAUDE.md` says, whether one exists, or whether anything would have gone differently.
+//!   The document says that in its own preamble, and there is no sentence anywhere in it claiming a
+//!   missing instruction caused anything. Deciding what belongs in an instruction file is the
+//!   `contrib/skills/instructions-editor` half, in the harness, under the user's permission prompts.
+//! - **Deterministic and exact where it counts.** Normalize, cut into four-word phrases, compare
+//!   through an inverted index, and single-link the pairs that clear a percentage threshold on
+//!   integer arithmetic. The one bound — a phrase carried by hundreds of a repository's messages is
+//!   skipped when candidates are gathered — can only *lower* a measured overlap, so it can hide a
+//!   repetition and can never invent one.
+//! - **Clusters cross sessions, and never repositories.** Two sessions minimum, because restating
+//!   something inside one session is a conversation; and the index is built per repository, because
+//!   an instruction missing from one repository's files is that repository's business.
+//! - **The CLI's second verbatim surface.** Clustering reads the transcript's own bytes — a secret
+//!   must not change what clusters — and the one excerpt a cluster renders is scrubbed on the way
+//!   in, through the same scrub-collapse-clip pipeline `ask --verbatim` quotes with.
 
 pub mod ask;
 pub mod ask_report;
@@ -201,6 +228,8 @@ pub mod cost;
 pub mod cost_report;
 pub mod dashboard;
 pub mod dashboard_server;
+pub mod doctor;
+pub mod doctor_report;
 pub mod evidence;
 pub mod format;
 pub mod heatmap;

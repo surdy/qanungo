@@ -3620,6 +3620,7 @@ fn document(lane: &str, base: &str, cache: &std::path::Path) -> String {
         Command::Report(args) => command::report(args, &mut out).expect("the report renders"),
         Command::Cost(args) => command::cost(args, &mut out).expect("the cost report renders"),
         Command::Standup(args) => command::standup(args, &mut out).expect("the standup renders"),
+        Command::Doctor(args) => command::doctor(args, &mut out).expect("the doctor renders"),
         // Ask is a document lane too, but this helper drives the three windowed lanes by name and
         // never supplies the query ask requires, so a run reaching here is a test wiring mistake.
         Command::Ask(_) => panic!("`{lane}` is not driven by this helper"),
@@ -3644,7 +3645,7 @@ fn a_credential_shaped_harness_label_is_scrubbed_in_every_gaps_section() {
     let directory = tempfile::tempdir().expect("a scratch directory");
     let cache = directory.path().join("qanungo");
 
-    for lane in ["report", "cost", "standup"] {
+    for lane in ["report", "cost", "standup", "doctor"] {
         let rendered = document(lane, &base, &cache);
         assert!(
             !rendered.contains(TOKEN_SHAPED_AGENT),

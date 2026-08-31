@@ -131,6 +131,9 @@ pub enum Command {
     Standup(StandupArgs),
     /// Search the archived summaries for a plain-language query, ranked, as Markdown on stdout.
     Ask(AskArgs),
+    /// Find instructions you have had to repeat across sessions of one repository, as Markdown on
+    /// stdout.
+    Doctor(DoctorArgs),
     /// Serve the coaching report's own numbers as a read-only web page, refreshed in the
     /// background.
     Dashboard(DashboardArgs),
@@ -277,6 +280,43 @@ pub struct AskArgs {
     /// are scrubbed like every other line this lane quotes.
     #[arg(long = "verbatim")]
     pub verbatim: bool,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
+
+    #[command(flatten)]
+    pub redaction: RedactionArgs,
+}
+
+/// The doctor lane (qanungo #11): instructions the archive shows you giving more than once.
+///
+/// The read-only half of the instructions doctor. It clusters near-duplicate user messages across
+/// the sessions of one repository and quotes each cluster once, scrubbed, with a citation per
+/// occurrence. It flattens [`RedactionArgs`] because that quotation is transcript text somebody
+/// typed — this is the CLI's second verbatim surface, after `ask --verbatim`.
+///
+/// # No default window, like `ask`
+///
+/// "Have I been repeating myself?" is a question about all of history, not about the last month, so
+/// `--last` is optional here and its absence means the whole archive. That is the [`AskArgs`]
+/// precedent and it is chosen for the same reason: a lane that quietly searched only a recent window
+/// would answer a narrower question than the one that was typed.
+///
+/// # It folds transcripts, so a cold run downloads the archive
+///
+/// Unlike `ask`, this lane reads `transcript.jsonl` rather than `summary.md`, because a summary is
+/// munshi's curated prose and the thing being compared here is what a *person* typed. A transcript
+/// is roughly two hundred times the bytes of the summary beside it, so a first run with no `--last`
+/// mirrors the whole archive — several gigabytes — before it clusters anything. Warm runs ride the
+/// shared blob cache and the snapshot index like `report` does, and the instrumentation footer
+/// reports what either one actually cost rather than leaving the reader to guess.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Narrow the reading to `<count><unit>` of history, with unit `h`, `d`, or `w`. Omitted, it
+    /// covers the whole archive: "have I been repeating myself" is a question about all of history,
+    /// so this lane has no default window.
+    #[arg(long = "last", value_parser = parse_window)]
+    pub last: Option<Window>,
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
@@ -545,7 +585,7 @@ mod tests {
         for bad in ["0", "9", "64", "-1", "many"] {
             assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
         }
-        for command in ["report", "cost", "standup", "dashboard"] {
+        for command in ["report", "cost", "standup", "doctor", "dashboard"] {
             assert!(Cli::try_parse_from(["qanungo", command, "--concurrency", "64"]).is_err());
         }
     }
@@ -615,17 +655,24 @@ mod tests {
             Command::Report(report),
             Command::Cost(cost),
             Command::Standup(standup),
+            Command::Doctor(doctor),
             Command::Dashboard(dashboard),
         ) = (
             parse("report"),
             parse("cost"),
             parse("standup"),
+            parse("doctor"),
             parse("dashboard"),
         )
         else {
             panic!("each subcommand parses as itself");
         };
-        for archive in [&cost.archive, &standup.archive, &dashboard.archive] {
+        for archive in [
+            &cost.archive,
+            &standup.archive,
+            &doctor.archive,
+            &dashboard.archive,
+        ] {
             assert_eq!(report.archive.patwari_url, archive.patwari_url);
             assert_eq!(report.archive.concurrency, archive.concurrency);
         }
@@ -644,8 +691,64 @@ mod tests {
         // lanes — with a query, since the query is required.
         assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--no-redact"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--filter-profanity"]).is_ok());
+        // Doctor quotes the repeated instruction itself, so it takes them too.
+        assert!(Cli::try_parse_from(["qanungo", "doctor", "--no-redact"]).is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "doctor", "--filter-profanity"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
         assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
+    }
+
+    /// Doctor is the second lane with no default window, for `ask`'s reason: "have I been repeating
+    /// myself" is a lifetime question. It takes no positional argument at all — there is nothing to
+    /// search *for*, only history to read.
+    #[test]
+    fn doctor_reads_all_history_until_a_window_narrows_it() {
+        let Command::Doctor(args) = Cli::parse_from(["qanungo", "doctor"]).command else {
+            panic!("`doctor` parses as the doctor command");
+        };
+        assert!(args.last.is_none(), "no window means all of history");
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
+        assert!(args.archive.cache_dir.is_none());
+        assert!(!args.redaction.no_redact, "the scrub is the default");
+
+        let Command::Doctor(scoped) =
+            Cli::parse_from(["qanungo", "doctor", "--last", "4w"]).command
+        else {
+            panic!("`doctor` parses as the doctor command");
+        };
+        assert_eq!(
+            scoped.last.map(|window| window.delta()),
+            Some(TimeDelta::weeks(4)),
+        );
+
+        // The window shares the one grammar, and there is no query to give it.
+        assert!(Cli::try_parse_from(["qanungo", "doctor", "--last", "5m"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "doctor", "payments"]).is_err());
+    }
+
+    /// What `doctor` builds out of the flags is what every other rendering lane builds: typing
+    /// nothing scrubs secrets and leaves swearing alone.
+    #[test]
+    fn the_doctor_lane_redacts_by_default_and_stops_only_when_told_to() {
+        let redactor = |flags: &[&str]| {
+            let Command::Doctor(args) = Cli::parse_from(
+                ["qanungo", "doctor"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+            .command
+            else {
+                panic!("`doctor` parses as the doctor command");
+            };
+            args.redaction.redactor()
+        };
+        assert_eq!(redactor(&[]), crate::redaction::Redactor::new());
+        assert!(redactor(&[]).redacts_secrets());
+        assert!(!redactor(&[]).filters_profanity());
+        assert!(!redactor(&["--no-redact"]).redacts_secrets());
+        assert!(redactor(&["--filter-profanity"]).filters_profanity());
     }
 
     /// Ask is the one lane with no default window: a run with just a query searches the whole

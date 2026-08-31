@@ -26,7 +26,7 @@ ADR 0012 anticipated qanungo carrying "application commands such as a prompt-cor
 - **coach** — deterministic anti-pattern detection + five practice scores (Prompt Quality, Session Hygiene, Code Review, Tool Mastery, Context Management), with WoW/MoM trends. Rules are Markdown files with a small `scan → match → aggregate → check` DSL (learned from Microsoft's AI-Engineering-Coach, ported to Rust). Every finding carries the Patwari `source_hash` as evidence, not a snippet.
 - **chronicle / standup** — a time-boxed narrative of what you shipped, aggregated from munshi's per-session summaries across machines and repos. (GitHub Copilot CLI's `/chronicle standup`, generalized cross-harness and grounded in curated summaries.)
 - **ask** — plain-language questions over your history ("have I touched the payments API?"), backed by the `session-recall` funnel: Notesmith search → hash → verbatim grep in Patwari.
-- **instructions-doctor** — mines sessions for repeated corrections and rework, then proposes concrete `CLAUDE.md` / `AGENTS.md` edits, pointing at the exact transcript moment a missing instruction caused the rework.
+- **instructions-doctor** — mines sessions for instructions you have had to give more than once in one repository, quotes each repetition and cites the transcript moments it happened at, and leaves the `CLAUDE.md` / `AGENTS.md` edit to a harness skill. It reports repetition; it never claims a missing instruction *caused* anything, because nothing it reads could support that.
 - **cost** — token/cost breakdown by model/repo/machine, and premium-waste flags.
 - **skill & agent finder** — detects repeated multi-step prompt patterns and drafts a reusable skill or custom subagent from them.
 
@@ -38,7 +38,7 @@ A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mir
 
 ## Skills & agents
 
-Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, and `/coach`. Beside them sit two write-posture scaffolds — `instructions-editor` and `skill-finder` — waiting on the commands behind them (#11, #13); what else the directory grows is those issues' business, not this README's. None of them write derived data back into the archive: they render or propose; you decide.
+Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, `/coach`, and — the one that proposes a write — `instructions-editor`, over `qanungo doctor`. Beside them sits one remaining scaffold, `skill-finder`, waiting on the command behind it (#13); what else the directory grows is that issue's business, not this README's. None of them write derived data back into the archive: they render or propose; you decide.
 
 ## Design rules (inherited, non-negotiable)
 
@@ -152,6 +152,8 @@ cargo run -- standup --last 7d                       # a week you can read to th
 cargo run -- standup --last 30d --no-redact          # secrets unscrubbed, and the footer says so
 cargo run -- dashboard --last 30d                    # http://127.0.0.1:8878, refolded every 5m
 cargo run -- dashboard --cost-last 4w --standup-last 3d   # narrow the bill and the narrative
+cargo run -- doctor                                  # all of history, because that is the question
+cargo run -- doctor --last 4w                        # or narrow it, on the same grammar
 cargo run -- dashboard --bind 100.64.0.7:8878        # the tailnet, unauthenticated, and it says so
 ```
 
@@ -171,7 +173,8 @@ back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
 flags work on every lane. The coaching report renders **aggregates, tool names, and content hashes
 only**, and the cost report adds exactly the model, billing-modifier, and repository identifiers the
 archive itself recorded, each clamped on the way out — never transcript content, in either. The
-standup is the one document that does render archived prose, and it is the one that takes
+three documents that do render archived text — the standup's summary prose, `ask`'s matched
+snippets and `--verbatim` excerpts, and `doctor`'s repeated instructions — are the three that take
 `--no-redact` and `--filter-profanity`; there is no `--redact`, because losing the scrub should be
 something a reader of the command line, and of the document's own footer, can see happened. Rule
 thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
@@ -202,6 +205,22 @@ That is also why there is still **no hour-of-day or day-of-week heatmap**: a per
 a missing local offset — a day is a day wherever you stand — while "worked at 1 a.m." and "worked on
 a Sunday" are exactly the claims UTC misplaces, and they are the only claims that view exists to
 make.
+
+And it carries an **instructions doctor** ([#11](https://github.com/surdy/qanungo/issues/11)):
+`qanungo doctor` reads the text a *person* typed across the archive and reports the instructions
+given more than once in the sessions of one repository — each cluster quoted once, scrubbed, with a
+citation per occurrence. Four things make it something other than a grep. It reports **repetition,
+never causation**: it reads transcripts and never a checkout, so it cannot know what a `CLAUDE.md`
+says, and the document refuses that sentence in its own preamble — deciding what belongs in an
+instruction file is `contrib/skills/instructions-editor`'s half, in the repo, under permission
+prompts. It compares **only what a person typed**, because `Event::User` is a surface the harness
+also writes to (pasted-image placeholders, slash commands, whole skill bodies, task notifications),
+and all of that is byte-identical between sessions and would otherwise be most of the finding. It
+counts **conversations, not session ids** — a resumed session replays the one before it, and merging
+those is what keeps one long conversation from reporting as a page of repetitions. And it is the
+CLI's second verbatim surface after `ask --verbatim`:
+the clustering reads the transcript's own bytes, so a credential cannot change what clusters, and
+the one excerpt each cluster renders is scrubbed before it is cut.
 
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
 dashboard's own remaining slices — per-*device* scope once a hostname has accrued in the archive,

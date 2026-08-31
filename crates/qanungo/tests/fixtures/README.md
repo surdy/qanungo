@@ -208,3 +208,32 @@ each is a shape with `CANARY` spelled through its body.
 `munshi-tombstone.md` is `copilot-cli` on purpose. A `summary.md` is munshi's own format whatever
 harness produced the session, so the standup lane asks nothing about interpreters — and a fixture
 under a second harness is what keeps that from silently becoming untrue.
+
+## `doctor/`
+
+Synthesized here for the instructions doctor (qanungo#11), because the lane compares a surface
+nothing above exercises: the text a *person* typed, across two sessions of one repository. They are
+Claude Code 2.1.205 transcripts and are stored into a real `BlobCache` under their own content hash
+by `tests/doctor.rs`, so the cache read, the interpretation, and the event walk all run.
+
+| File | Shape | Pins |
+| --- | --- | --- |
+| `repeated-rule.jsonl` | one long instruction, a bare `yes`, a failing `cargo clippy` and the reply to it | the cluster's first half, the minimum-length floor, the friction proxy |
+| `repeated-rule-restated.jsonl` | the same instruction reworded in its last three words, plus one unrelated message | the near-duplicate match, and that the unrelated message clusters with nothing |
+| `no-repetition.jsonl` | two long messages sharing no phrase with anything | the empty-result run |
+
+The repository each session belongs to is **not** in these files. It comes from the archive's
+listing row in production (`MirroredSession::repository`) and is supplied by the test, which is what
+lets the same two transcripts be folded under one repository and under two — a cluster in the first
+case and none in the second, from identical bytes.
+
+The repeated instruction carries **two** planted credentials, at two positions, and the positions
+are the whole point. An Anthropic key sits at character 20, early enough that its marker renders
+whole inside the 200-character excerpt. A GitHub classic token starts at character **180**, so it
+straddles the excerpt's own cut: 20 of its 40 characters fall inside the window, which is four short
+of what the `github-token` pattern needs to recognize it. A clip-then-scrub order would therefore
+render that fragment as itself, and `a_repeated_instruction_carrying_a_credential_renders_it_scrubbed`
+asserts the wrong order *would* have leaked before asserting that the real one does not — so a change
+to the clip ceiling that stopped the token straddling the edge fails the test rather than quietly
+turning it into one that cannot fail. Neither credential has ever been real; each is a shape with
+`CANARY` spelled through its body.
