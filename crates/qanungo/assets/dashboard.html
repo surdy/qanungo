@@ -141,6 +141,70 @@ p { margin: 0 0 0.5rem; }
 }
 .scope-note { margin: 0 0 1.5rem; font-size: 0.82rem; color: var(--ink-muted); max-width: 100ch; }
 
+/* The ask box. A search over the summaries this refresh already read — so it is a
+   control like the scope selects above it and not a section of the page, and it is
+   styled to match them rather than to compete with the score tiles below. */
+.ask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+}
+.ask input {
+  flex: 1 1 24rem;
+  min-width: 10rem;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+}
+.ask button {
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 1.1rem;
+  cursor: pointer;
+}
+.hit {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: clamp(0.8rem, 1.1vw, 1.2rem);
+  margin-bottom: 0.6rem;
+}
+.hit h4 { font-size: 1rem; font-weight: 650; margin: 0 0 0.2rem; max-width: 78ch; }
+.hit-meta {
+  font-size: 0.75rem;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 0.4rem;
+}
+.hit-snippet {
+  margin: 0.35rem 0 0.5rem;
+  padding: 0.35rem 0.7rem;
+  border-left: 3px solid var(--rule);
+  color: var(--ink-2);
+  max-width: 78ch;
+}
+.hit-why { font-size: 0.78rem; color: var(--ink-muted); margin: 0 0 0.3rem; }
+/* The citation. Selectable in one gesture and deliberately not a link: it is a hash
+   you take to your own shell, because the archive behind it serves unredacted blobs. */
+.hit-cite {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
 /* Five tiles. auto-fit rather than a fixed count: one column on a phone, five
    across a TV, and nothing reflows into a half-empty row in between. */
 .tiles {
@@ -481,6 +545,28 @@ footer .archive { overflow-wrap: anywhere; }
     <button type="button" class="scope-reset" id="scope-reset">Whole window</button>
   </div>
   <p class="scope-note" id="scope-note"></p>
+
+  <!--
+    The ask box. A <form> so Enter submits it the way a search box should, with the
+    submit prevented in script: there is nothing to navigate to, and this page has no
+    links at all. It asks this server's own /api/ask, which ranks the summaries the
+    refresh already read — a request never reaches the archive.
+  -->
+  <section aria-labelledby="ask-heading">
+    <h2 id="ask-heading">Ask your history</h2>
+    <form class="ask" id="ask-form">
+      <label for="ask-query" class="tile-label">Search the summaries</label>
+      <input
+        id="ask-query"
+        type="search"
+        autocomplete="off"
+        placeholder="a repository, an API, a feature — “redaction”, “price table”"
+      >
+      <button type="submit" id="ask-submit">Search</button>
+    </form>
+    <p class="note" id="ask-note"></p>
+    <div id="ask-results"></div>
+  </section>
 
   <section aria-labelledby="lanes-heading">
     <h2 id="lanes-heading">Five lanes</h2>
@@ -2257,6 +2343,206 @@ function paintHeatmap(data, entry, column) {
     .replaceChildren(...(cells.some((cell) => cell.sessions > 0) ? [heatmapTable(cells, series)] : []));
 }
 
+/* ------------------------------------------------------------------------
+ * The ask box: a ranked search over the summaries this refresh already read.
+ *
+ * The one control on this page whose answer is not already in the payload — and it
+ * is still not a fetch into the archive. /api/ask ranks an in-memory corpus the
+ * refresh mirrored, with the same rubric, the same order and the same scrub
+ * `qanungo ask` uses, so a hit here and a hit in the terminal are the same hit.
+ *
+ * Three things this file does not do. It does not rank, score, or re-order: the
+ * server sends the hits in their final order and this writes them out. It does not
+ * scope: the search covers all of history and is deliberately independent of the
+ * repository, device and harness controls above, which the note under the box says
+ * out loud rather than leaving a reader to assume either way. And it makes no link
+ * — the citation is a hash rendered as selectable text, because the archive behind
+ * it serves unredacted blobs.
+ * ------------------------------------------------------------------------ */
+
+/* How many hits to ask for. The server clamps whatever it is handed and echoes back
+   what it used, so this is a preference and never a trusted number. */
+const ASK_LIMIT = 10;
+
+/* The last answer, and the state around it. Module state rather than storage: a
+   search is a question asked once, not a preference, and it survives an SSE refresh
+   because `paint` re-renders it rather than clearing it — with the note saying which
+   refresh answered, so a stale answer is dated instead of quietly re-labelled. */
+let askAnswer = null;
+let askError = null;
+let asking = false;
+
+async function runAsk() {
+  const field = document.getElementById("ask-query");
+  const typed = field.value;
+  asking = true;
+  askError = null;
+  paintAsk();
+  try {
+    const response = await fetch(
+      "/api/ask?q=" + encodeURIComponent(typed) + "&limit=" + ASK_LIMIT,
+      { cache: "no-store" }
+    );
+    const body = await response.json();
+    if (!response.ok) {
+      askAnswer = null;
+      askError = body.error || "the search came back " + response.status;
+    } else {
+      askAnswer = body;
+    }
+  } catch (error) {
+    askAnswer = null;
+    askError = "could not reach the search: " + error.message;
+  }
+  asking = false;
+  paintAsk();
+}
+
+/* One hit. Every string was scrubbed server-side on its way into the ranking and is
+   written here as text, markers and all — a reader has to be able to see the scrub
+   fired, exactly as in the standup section. */
+function askHitNode(hit) {
+  const card = el("div", "hit");
+  card.appendChild(el("h4", null, hit.rank + ". " + hit.title));
+  const meta = [
+    hit.harness,
+    hit.repository || "no repository recorded",
+    hit.branch ? "branch " + hit.branch : null,
+    "archived " + (hit.archived_at || "at an unreadable time") + " (UTC)",
+    "score " + hit.score,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  card.appendChild(el("div", "hit-meta", meta));
+  card.appendChild(el("div", "hit-snippet", hit.snippet));
+  card.appendChild(el("p", "hit-why", "Matched in " + hit.matched.join(", ") + "."));
+  card.appendChild(el("div", "hit-cite", "sha256:" + hit.source_hash));
+  return card;
+}
+
+/* What the box says about itself: what it searched, what it could not, which refresh
+   answered, and — when the page has moved on since — that the answer is older than
+   the numbers around it. */
+function askSentence(answer) {
+  const scrub = answer.redaction.secrets
+    ? answer.redaction.total
+      ? "Scrubbed for secrets (pattern set " +
+        answer.redaction.pattern_revision +
+        "); " +
+        answer.redaction.total +
+        " replacements were made."
+      : /* Not "nothing matched": that is the sentence the *search* uses for its own
+           answer, and one line carrying both would be two claims wearing one word. */
+        "Scrubbed for secrets (pattern set " +
+        answer.redaction.pattern_revision +
+        "); no pattern fired."
+    : "SERVED RAW: this dashboard was started with --no-redact, so nothing below was scrubbed.";
+  const unsearchable = answer.unsearchable
+    ? " " +
+      answer.unsearchable +
+      (answer.unsearchable === 1 ? " session carries" : " sessions carry") +
+      " no summary this build could read and could not be searched — counted, not dropped."
+    : "";
+  const aged =
+    current && current.provenance.generation !== answer.corpus.generation
+      ? " These results are from refresh " +
+        answer.corpus.generation +
+        "; the page is now on " +
+        current.provenance.generation +
+        " — search again to rank the current corpus."
+      : "";
+  const stale = answer.corpus.stale_since
+    ? " The corpus itself is from " +
+      answer.corpus.read_at +
+      "; every refresh since " +
+      answer.corpus.stale_since +
+      " has failed."
+    : "";
+  const terms = answer.query.terms.length
+    ? "Searched " +
+      answer.searched +
+      " sessions across all of the archive's history for " +
+      answer.query.terms.map((term) => "“" + term + "”").join(", ") +
+      ". Words shorter than " +
+      answer.query.min_term_chars +
+      " characters and very common ones are dropped before ranking."
+    : "";
+  return [terms, unsearchable, aged, stale, " " + scrub].filter(Boolean).join("");
+}
+
+function paintAsk() {
+  const note = document.getElementById("ask-note");
+  const results = document.getElementById("ask-results");
+  document.getElementById("ask-submit").disabled = asking;
+
+  if (asking) {
+    note.textContent = "Searching the summaries this refresh read…";
+    return;
+  }
+  if (askError) {
+    note.textContent = askError;
+    results.replaceChildren();
+    return;
+  }
+  if (!askAnswer) {
+    note.textContent =
+      "A deterministic search over every session's own summary — all of the archive's history, " +
+      "ranked by a fixed rubric and not by a model. It is not narrowed by the scope controls " +
+      "above, and it never reaches into the archive: it ranks the summaries this refresh already " +
+      "read. Each hit cites the summary's content hash; take that to your own shell to read the " +
+      "session in full.";
+    results.replaceChildren();
+    return;
+  }
+
+  if (askAnswer.state === "no-searchable-terms") {
+    note.textContent =
+      "That query has no word to search on: everything in it is either shorter than " +
+      askAnswer.query.min_term_chars +
+      " characters or a very common word the search drops. Try a more specific term — a " +
+      "repository name, an API, a file, a feature.";
+    results.replaceChildren();
+    return;
+  }
+
+  note.textContent = askSentence(askAnswer);
+  if (askAnswer.state === "no-matches") {
+    results.replaceChildren(
+      el(
+        "p",
+        "empty",
+        "No session's summary matched. That is the archive's answer, not a truncation — nothing " +
+          "was ranked and hidden."
+      )
+    );
+    return;
+  }
+
+  const nodes = askAnswer.hits.map(askHitNode);
+  const shown =
+    askAnswer.total_matches > askAnswer.hits.length
+      ? "Showing the " +
+        askAnswer.hits.length +
+        " best of " +
+        askAnswer.total_matches +
+        " matches, ranked by how much of the query each summary carries — title, repository and " +
+        "tags weigh most. This is a search, not a judgement of the work."
+      : askAnswer.total_matches +
+        (askAnswer.total_matches === 1 ? " session matched" : " sessions matched") +
+        ", ranked by how much of the query each summary carries — title, repository and tags weigh " +
+        "most. This is a search, not a judgement of the work.";
+  results.replaceChildren(el("p", "note", shown), ...nodes);
+}
+
+function wireAskControls() {
+  document.getElementById("ask-form").addEventListener("submit", (event) => {
+    /* Nothing to navigate to: this page has no links and makes no requests but its
+       own. The default submit would reload the page and lose the payload in hand. */
+    event.preventDefault();
+    runAsk();
+  });
+}
+
 /* The pre-folded scope the reader chose, or null for the whole window. Looked up by
    label rather than by position, so a refresh that reorders the list (it is ordered
    busiest-first) cannot silently move a selection onto a different repository or device.
@@ -2443,6 +2729,10 @@ function paint() {
     data.standup.window.last +
     "; each section says which.";
   document.getElementById("scope-note").textContent = scopeSentence(data, entry, column);
+  /* Re-rendered with the rest of the page so an answer taken over an older refresh is
+     dated rather than left looking current. The scope has no say in it — the search is
+     all of history, and the note under the box says so. */
+  paintAsk();
 
   if (provenance.stale_since) {
     banner(
@@ -2565,6 +2855,22 @@ function paint() {
       provenance.lanes.standup.sync +
       " · fold " +
       provenance.lanes.standup.fold,
+    /* The search lane names a scope rather than a window: it covers all of history, so
+       there is no duration to print and printing one would be printing a wrong one. */
+    "Ask " +
+      provenance.ask_scope +
+      " · " +
+      provenance.lanes.ask.sessions_searchable +
+      " of " +
+      provenance.lanes.ask.sessions_listed +
+      " listed sessions searchable (" +
+      provenance.lanes.ask.sessions_unsearchable +
+      " not) · " +
+      provenance.lanes.ask.bytes_read +
+      " held · sync " +
+      provenance.lanes.ask.sync +
+      " · fold " +
+      provenance.lanes.ask.fold,
     "Rule pack " +
       provenance.rule_pack +
       " · price table " +
@@ -2701,6 +3007,10 @@ function subscribe() {
 
 scope = readRememberedScope();
 wireScopeControls();
+wireAskControls();
+/* The ask box says what it is before the payload lands: it is answered by its own
+   route and does not wait on the document above it. */
+paintAsk();
 reload().then(subscribe);
 </script>
 </body>

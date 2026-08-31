@@ -81,7 +81,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -101,7 +101,7 @@ use crate::rules::{self, Finding};
 use crate::scoring::RulePack;
 use crate::standup::{Gap, ReadSummary, Standup};
 use crate::standup_report::{StandupInstrumentation, StandupReport};
-use crate::sync::{self, Artifact, Mirror, MirroredSession, Skip, SkipReason};
+use crate::sync::{self, Artifact, Mirror, MirroredSession, Skip, SkipReason, SyncStats};
 
 #[derive(Debug, Error)]
 pub enum CommandError {
@@ -476,33 +476,13 @@ pub fn fold_ask(
     };
 
     let fold_started = Instant::now();
-    let placed = prepared.placement();
-    // Every session the window listed that never reaches a score is counted, never dropped — the
-    // same honesty the other three lanes keep. There are three such populations, disjoint: the
-    // mirror's own skips (a snapshot with no `summary.md` at all, or one unreadable at fetch time —
-    // these are in `mirror.skipped`, not in `mirror.sessions`, so `placement` never sees them), the
-    // sessions the archive dated outside the searched window (`placed.unplaceable`), and the ones
-    // whose cached summary this build then failed to read or parse (the `Err` arm below).
-    let mut unsearchable = placed.unplaceable + prepared.mirror.skipped.len();
-    let mut read = Vec::with_capacity(placed.reported.len());
-    // Kept in lockstep with `read`, so a ranked hit's `searched_index` names the session its
-    // summary was mirrored for. This is the whole of what the escalation needs to find a
-    // transcript, and it is a borrow rather than a copy of anything.
-    let mut searched: Vec<&MirroredSession> = Vec::with_capacity(placed.reported.len());
-    for session in &placed.reported {
-        match crate::standup::read_summary(&prepared.cache, session) {
-            Ok(summary) => {
-                read.push(summary);
-                searched.push(session);
-            }
-            Err(_) => unsearchable += 1,
-        }
-    }
-    let mut ask = Ask::fold(query, &read, &redactor, limit, unsearchable);
+    let corpus = read_corpus(&prepared);
+    let mut ask = Ask::fold(query, &corpus.read, &redactor, limit, corpus.unsearchable);
     let fold_elapsed = fold_started.elapsed();
     // Outside the fold timer on purpose: this is the archive, and the fold figure beside it in the
     // footer claims to measure the local read.
-    let verbatim = verbatim.then(|| escalate(&prepared, &mut ask, &searched, query, &redactor));
+    let verbatim =
+        verbatim.then(|| escalate(&prepared, &mut ask, &corpus.searched, query, &redactor));
 
     let instrumentation = AskInstrumentation {
         sync: prepared.mirror.stats.clone(),
@@ -516,6 +496,172 @@ pub fn fold_ask(
         generated_at: prepared.generated_at,
         ask,
         instrumentation,
+    })
+}
+
+/// Every summary one mirror run put in the cache, parsed, alongside the count of what could not be.
+///
+/// The `searched` borrows run in lockstep with `read`, which is the whole of what an escalation
+/// needs to get from a ranked hit back to *its* session ([`Ask::fold`] records the index it scored a
+/// summary at). A lane that never escalates simply drops them.
+struct ReadCorpus<'a> {
+    read: Vec<ReadSummary>,
+    searched: Vec<&'a MirroredSession>,
+    unsearchable: usize,
+}
+
+/// Reads every mirrored session's cached `summary.md`, counting the ones that never reach a score.
+///
+/// Every session the listing produced that never reaches a score is counted, never dropped — the
+/// same honesty the other three lanes keep. There are three such populations, disjoint: the mirror's
+/// own skips (a snapshot with no `summary.md` at all, or one unreadable at fetch time — these are in
+/// `mirror.skipped`, not in `mirror.sessions`, so `placement` never sees them), the sessions the
+/// archive dated outside the searched window (`placed.unplaceable`), and the ones whose cached
+/// summary this build then failed to read or parse (the `Err` arm below).
+///
+/// Shared by the CLI's [`fold_ask`] and the dashboard's [`fold_ask_corpus`] rather than written
+/// twice, so the served endpoint and `qanungo ask` cannot come to disagree about which sessions were
+/// searchable — the same reason [`Prepared`] is shared by the document lanes.
+fn read_corpus<'a>(prepared: &'a Prepared) -> ReadCorpus<'a> {
+    let placed = prepared.placement();
+    let mut unsearchable = placed.unplaceable + prepared.mirror.skipped.len();
+    let mut read = Vec::with_capacity(placed.reported.len());
+    let mut searched: Vec<&MirroredSession> = Vec::with_capacity(placed.reported.len());
+    for session in &placed.reported {
+        match crate::standup::read_summary(&prepared.cache, session) {
+            Ok(summary) => {
+                read.push(summary);
+                searched.push(session);
+            }
+            Err(_) => unsearchable += 1,
+        }
+    }
+    ReadCorpus {
+        read,
+        searched,
+        unsearchable,
+    }
+}
+
+/// The whole archive's summaries, parsed and held in memory, so a *request* can be ranked against
+/// them without the archive being touched (qanungo #10's dashboard ask-box).
+///
+/// # Why a corpus rather than a fold per request
+///
+/// [`fold_ask`] is a run: it mirrors, reads, ranks one query, and returns. The dashboard cannot do
+/// that on a request path, and not because it would be slow. The evidence route's iron rule is that
+/// **a browser must never induce archive traffic** ([`crate::dashboard_server`]) — an unauthenticated
+/// peer that could make this process talk to Patwari would be a remote control for somebody else's
+/// bandwidth and for what lands on this disk. So the mirroring and the reading happen on the
+/// service's own refresh timer, exactly as the three document lanes do, and what a request does is
+/// score an in-memory `Vec` it did not fetch.
+///
+/// # Why all of history
+///
+/// No window, matching `qanungo ask`'s own no-default-window semantics (decision 12: a lifetime
+/// question). It is affordable because a `summary.md` is a rounding error beside a transcript —
+/// measured at **~0.4% of transcript bytes** across the production archive — so holding every one of
+/// them parsed costs a few megabytes against the 3 GiB of transcripts the other lanes stream past.
+///
+/// # Nothing here is scrubbed, and nothing here is served
+///
+/// A [`ReadSummary`] is the archive's own record, pre-scrub — the same value [`fold_ask`] holds as a
+/// local. It is *fold input*, never response: every string a reader sees is produced by
+/// [`Ask::fold`], which scrubs on the way into the hit it builds. See [`AskCorpus::search`].
+pub struct AskCorpus {
+    /// When this corpus was read — the instant its provenance is stamped with.
+    pub generated_at: DateTime<Utc>,
+    /// The summaries a search scores, in the archive's own newest-first listing order.
+    read: Vec<ReadSummary>,
+    /// Sessions the archive listed that carry no summary this build could read. Counted here so
+    /// every answer taken over this corpus can say what it could not look at.
+    pub unsearchable: usize,
+    /// Decompressed summary bytes held in memory — what the corpus costs, measured rather than
+    /// estimated.
+    pub bytes_read: u64,
+    pub instrumentation: AskCorpusInstrumentation,
+}
+
+/// What building one ask corpus cost, for the provenance block that reports the refresh.
+#[derive(Debug, Clone)]
+pub struct AskCorpusInstrumentation {
+    pub sync: SyncStats,
+    /// Wall-time of reading and parsing the summaries alone, network excluded — the same split
+    /// every other lane's footer makes.
+    pub fold_elapsed: Duration,
+}
+
+impl AskCorpus {
+    /// How many sessions a search over this corpus scores.
+    pub fn searchable(&self) -> usize {
+        self.read.len()
+    }
+
+    /// Every session the listing produced, searchable or not. The denominator an answer's counts
+    /// reconcile against.
+    pub fn listed(&self) -> usize {
+        self.read.len() + self.unsearchable
+    }
+
+    /// Ranks one query against the corpus, with the process's launch-time redactor.
+    ///
+    /// [`Ask::fold`] and nothing else: the rubric, the total order, the snippet rule, and the scrub
+    /// are the CLI's, so the same query over the same corpus ranks the same way in both places. No
+    /// escalation is possible from here and none is offered — see [`crate::dashboard_server`] for
+    /// why `--verbatim` stays a CLI affordance.
+    pub fn search(&self, query: &Query, redactor: &Redactor, limit: usize) -> Ask {
+        Ask::fold(query, &self.read, redactor, limit, self.unsearchable)
+    }
+
+    /// A corpus over summaries a caller already holds, with no mirror behind it.
+    ///
+    /// The real one comes from [`fold_ask_corpus`], which needs an archive. This exists so the two
+    /// surfaces *over* a corpus — the served answer's shape and the provenance line that reports it
+    /// — can be pinned without standing one up, the way [`crate::rules::RuleId::eligible`] exists
+    /// for the eligibility boundary. Everything the archive would have said about the run is zero
+    /// here, which is the honest reading of a corpus nothing was synced for.
+    #[cfg(test)]
+    pub fn over(generated_at: DateTime<Utc>, read: Vec<ReadSummary>, unsearchable: usize) -> Self {
+        Self {
+            generated_at,
+            bytes_read: read.iter().map(|summary| summary.bytes_read).sum(),
+            read,
+            unsearchable,
+            instrumentation: AskCorpusInstrumentation {
+                sync: SyncStats::default(),
+                fold_elapsed: Duration::ZERO,
+            },
+        }
+    }
+}
+
+/// Mirrors and reads every `summary.md` in the archive, for a service that will rank requests
+/// against them.
+///
+/// The mirroring is [`Prepared::mirror_all`] — the same entry point `qanungo ask` takes with no
+/// `--last`, so the served corpus is the CLI's corpus and not a second selection of it.
+///
+/// # Errors
+///
+/// Returns an error when the cache is unusable or the archive cannot be listed, which is what makes
+/// the whole refresh fail and the served document go stale: a corpus half-read is a search that
+/// would answer "no" for a session it simply did not look at.
+pub fn fold_ask_corpus(archive: &ArchiveArgs) -> Result<AskCorpus, CommandError> {
+    let prepared = Prepared::mirror_all(archive, Artifact::Summary)?;
+
+    let fold_started = Instant::now();
+    let corpus = read_corpus(&prepared);
+    let fold_elapsed = fold_started.elapsed();
+
+    Ok(AskCorpus {
+        generated_at: prepared.generated_at,
+        bytes_read: corpus.read.iter().map(|summary| summary.bytes_read).sum(),
+        unsearchable: corpus.unsearchable,
+        read: corpus.read,
+        instrumentation: AskCorpusInstrumentation {
+            sync: prepared.mirror.stats.clone(),
+            fold_elapsed,
+        },
     })
 }
 

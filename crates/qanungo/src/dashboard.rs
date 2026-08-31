@@ -204,6 +204,26 @@
 //! session with no recorded offset is on no cell and counted, the same refusal the timeline makes
 //! for a missing archive time. See [`crate::heatmap`].
 //!
+//! # The ask answer, which is not a section
+//!
+//! [`AskAnswer`] is the one document in this module a *request* decides, and it is deliberately not
+//! part of the payload above. `GET /api/ask?q=…` ranks the refresh's own in-memory corpus of
+//! `summary.md` records ([`crate::command::AskCorpus`]) with [`crate::ask`]'s rubric — the same
+//! function, the same total order, the same scrub `qanungo ask` runs — and answers with the hits.
+//!
+//! Serving it per request rather than pre-folding it is not a hole in the "no fold behind a request"
+//! rule; it is that rule's two objections not applying. There is no archive traffic on the path (the
+//! corpus was mirrored on the refresh timer, so a browser cannot make this process talk to Patwari —
+//! the evidence route's iron rule, applied rather than excepted), and a ranking is a selection of the
+//! corpus rather than a claim about it, so two readers asking different questions at one generation
+//! are not being told different things. Pre-folding was never the alternative: the space of queries
+//! is not enumerable, and shipping the corpus to the browser would be shipping every summary in the
+//! archive to every tab.
+//!
+//! The provenance block gains the lane's own numbers ([`ask_lane_value`]) and nothing else changes
+//! above. **No verbatim on this surface**: `--verbatim` stays a CLI affordance (decision 11), and
+//! the corpus this route reads holds no transcript to escalate into.
+//!
 //! # What this slice leaves out
 //!
 //! Both views this section used to defer are now here: the heatmap above, and the per-**device**
@@ -220,8 +240,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use crate::ask::{Ask, Query};
 use crate::cli::{Refresh, Window};
-use crate::command::{Folded, FoldedCost, FoldedStandup};
+use crate::command::{AskCorpus, Folded, FoldedCost, FoldedStandup};
 use crate::cost::{CopilotTokens, CostTotals, Flagged, PricedTokens, TokenTally};
 use crate::evidence::{self, EventAnchor, EvidenceIndex};
 use crate::format;
@@ -319,6 +340,13 @@ pub struct Payload<'a> {
     pub coaching: &'a Folded,
     pub cost: &'a FoldedCost,
     pub standup: &'a FoldedStandup,
+    /// The searchable corpus this refresh read. **No section of this document is built from it** —
+    /// it answers `/api/ask` on request ([`AskAnswer`]) and appears here only in the provenance
+    /// block, so a reader of the footer can see what the fourth lane cost. It rides on the
+    /// [`Payload`] rather than beside it because it is part of the same generation: a footer
+    /// reporting a corpus from a different refresh than the numbers above it would be the torn view
+    /// this whole design is arranged against.
+    pub ask: &'a AskCorpus,
     /// Wall-time of the three folds together — the number that answers "what does a refresh of this
     /// page actually cost".
     ///
@@ -1578,6 +1606,191 @@ fn structural_value(session: &SessionMetrics) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The ask answer
+// ---------------------------------------------------------------------------
+
+/// One answer to one `GET /api/ask` — the only document on this surface a *request* decides.
+///
+/// # It is still not a fold behind a request
+///
+/// Everything above is served from a payload built once per refresh, and the reason is stated in
+/// this module's own docs: a served document that varied by who asked could show two readers
+/// different numbers under one generation stamp, and a fold behind a request an unauthenticated peer
+/// controls is a remote control for somebody else's compute. Neither objection reaches this route,
+/// and it is worth saying exactly why rather than treating the rule as bent.
+///
+/// - **It induces no archive traffic.** The corpus is [`crate::command::AskCorpus`], mirrored and
+///   parsed on the service's own refresh timer. A request scores an in-memory `Vec`; there is no
+///   path from here to Patwari, which is the evidence route's iron rule applied to a second route
+///   rather than an exception carved out of it.
+/// - **It states nothing about the archive that the page does not.** A ranking is a *selection* of
+///   the summaries, not a number; two readers asking different questions of the same corpus at the
+///   same generation are not being told different things about it. The answer carries the
+///   generation it was taken at, so a reader can see which corpus answered.
+/// - **It is bounded before it is work.** The raw query is capped and the limit clamped by the
+///   router before anything is parsed or scored — see [`crate::dashboard_server`].
+///
+/// # No verbatim on this surface
+///
+/// `qanungo ask --verbatim` escalates a ranking into the shown hits' *transcripts*. That is a CLI
+/// affordance and stays one (decision 11: the recall funnel is where the user's own shell already
+/// has raw access). This route serves what the summaries say and the `source_hash` to redeem for the
+/// rest, and it cannot be made to fetch a transcript — not because a check refuses it, but because
+/// the corpus it reads holds no transcript at all.
+///
+/// # The scrub is [`Ask::fold`]'s
+///
+/// Every string below came out of the ranking already scrubbed by the launch-time redactor, exactly
+/// as the CLI's document does: the snippet through the shared scrub-collapse-clip pipeline, the
+/// title scrubbed, the repository and branch scrubbed and clamped. This module holds no pre-scrub
+/// string to serialize by mistake, which is the same guarantee the standup section rests on.
+///
+/// The one string that is not the archive's is the query, and it is not echoed raw: what comes back
+/// is [`Query::terms`] — the words the search actually used, which [`Query::parse`] has already
+/// lower-cased and broken on everything that is not a letter or a digit. So a caller's own bytes
+/// never make the round trip, and what does has no punctuation, no whitespace, and no control
+/// character in it by construction rather than by filtering.
+///
+/// Length is the one dimension `parse` does not bound: inside the router's 1 KiB cap a single
+/// alphanumeric run is one very long "word". So the echo passes through
+/// [`format::identifier`] — the clamp every other label on this surface takes — which is a no-op on
+/// every real term and replaces an absurd one wholesale rather than putting a kilobyte of a peer's
+/// choosing on a rendering surface. The clamp is deliberately *not* pushed into `Query::parse`: that
+/// would change what `qanungo ask` searches for, and this is a rendering bound, not a search rule.
+pub struct AskAnswer<'a> {
+    /// The parsed query. Its terms are what the answer echoes; the raw `q` is not on the wire.
+    pub query: &'a Query,
+    /// The limit actually applied, after the router clamped it — served so a truncated ranking says
+    /// what truncated it.
+    pub limit: usize,
+    /// The ranking, or `None` when the query had no searchable word in it and nothing was scored.
+    pub ask: Option<&'a Ask>,
+    pub corpus: &'a AskCorpus,
+    /// Which refresh published the corpus, and whether refreshing it is currently failing — the
+    /// same two facts the page's own staleness banner is drawn from.
+    pub refreshed: Refreshed,
+    pub redactor: &'a Redactor,
+}
+
+impl AskAnswer<'_> {
+    /// Builds the served JSON answer.
+    pub fn build(&self) -> Value {
+        let (searched, unsearchable) = match self.ask {
+            // Equal to the corpus's own two counts by construction — `Ask::fold` is handed exactly
+            // this corpus — and read off the ranking so that what the answer states is what the
+            // ranking was taken over rather than a second count of the same thing.
+            Some(ask) => (ask.searched, ask.unsearchable),
+            None => (self.corpus.searchable(), self.corpus.unsearchable),
+        };
+        json!({
+            "state": self.state(),
+            "query": {
+                "terms": self
+                    .query
+                    .terms()
+                    .iter()
+                    .map(|term| format::identifier(term))
+                    .collect::<Vec<_>>(),
+                // Why a word a reader typed may be missing above, in the answer rather than only in
+                // the page's copy: the two rules that drop one are this crate's and a reader cannot
+                // check a ranking against a rubric they were not told.
+                "min_term_chars": crate::ask::MIN_TERM_CHARS,
+            },
+            "limit": self.limit,
+            "searched": searched,
+            "unsearchable": unsearchable,
+            "total_matches": self.ask.map_or(0, |ask| ask.total_matches),
+            "hits": self
+                .ask
+                .map(|ask| {
+                    ask.hits
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, hit)| ask_hit_value(rank + 1, hit))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            "corpus": {
+                "generation": self.refreshed.generation,
+                "read_at": stamp(self.corpus.generated_at),
+                "stale_since": self.refreshed.stale_since.map(stamp),
+                "sessions_listed": self.corpus.listed(),
+                "bytes_read": format::bytes(self.corpus.bytes_read),
+                // What the search covers, said in the answer rather than assumed by the page. All
+                // of history and no scope: `ask` asks a lifetime question (decision 12), and this
+                // route is deliberately independent of the page's repository, device, and harness
+                // controls — none of them is a parameter here and none narrows this list.
+                "scope": ASK_SCOPE,
+            },
+            // The posture behind the snippets, on the same terms every other verbatim surface in
+            // this crate states it: launch-time, identical for every reader, never a query string.
+            "redaction": {
+                "secrets": self.redactor.redacts_secrets(),
+                "profanity": self.redactor.filters_profanity(),
+                "pattern_revision": PATTERN_REVISION,
+                "total": self.ask.map_or(0, |ask| ask.redaction.total()),
+                "fired": self
+                    .ask
+                    .map(|ask| {
+                        ask.redaction
+                            .fired()
+                            .map(|(pattern, count)| {
+                                json!({ "pattern": pattern.as_str(), "count": count })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+            },
+        })
+    }
+
+    /// Which of the three answers this is.
+    ///
+    /// Three states rather than an empty list, because they are three different sentences and a
+    /// page that collapsed them would answer a question nobody asked. `no-searchable-terms` is "you
+    /// gave me no word to search on"; `no-matches` is the archive's own "no", which is the answer a
+    /// person asking *have I ever done this* came for; `ranked` is a list. The CLI's document makes
+    /// exactly the same three-way split in prose ([`crate::ask_report`]).
+    fn state(&self) -> &'static str {
+        match self.ask {
+            None => "no-searchable-terms",
+            Some(ask) if ask.total_matches == 0 => "no-matches",
+            Some(_) => "ranked",
+        }
+    }
+}
+
+/// What this route searches, stated in one word wherever it is stated. All of history, and cut by no
+/// scope: see [`AskAnswer`].
+const ASK_SCOPE: &str = "all-history";
+
+/// One ranked hit: where the session is, why it ranked, and the one line that shows it.
+///
+/// Everything here was scrubbed on the way into the hit by [`Ask::fold`] and is serialized exactly as
+/// that fold produced it — the standup section's discipline, for the same reason: re-scrubbing would
+/// be a second posture to keep in step with the first and would double-count what fired.
+///
+/// `source_hash` is a citation and **not a link**. The page renders it as selectable text; there is
+/// no `href` anywhere on that page and there will not be one, because Patwari serves unredacted
+/// blobs (decision 11).
+fn ask_hit_value(rank: usize, hit: &crate::ask::AskHit) -> Value {
+    json!({
+        "rank": rank,
+        "title": hit.title,
+        // A closed enum this build owns, never archive free text — so it is the one label here that
+        // needs no scrub. See `crate::ask::AskHit::harness`.
+        "harness": hit.harness,
+        "repository": hit.repository,
+        "branch": hit.branch,
+        "archived_at": hit.archived_at.map(stamp),
+        "score": hit.score,
+        "source_hash": hit.source_hash,
+        "snippet": hit.snippet,
+        "matched": hit.matched,
+    })
+}
+
 /// What one lane's fold cost, in the footer's own quantities and the footer's own renderings.
 ///
 /// Three lanes now, so the shape is a function rather than three copies of the same six keys —
@@ -1601,6 +1814,36 @@ fn lane_cost_value(
         "sync": format::elapsed(sync.elapsed),
         "sync_millis": u64::try_from(sync.elapsed.as_millis()).unwrap_or(u64::MAX),
         "bytes_folded": format::bytes(bytes),
+        "bytes_transferred": format::bytes(sync.bytes_transferred),
+        "cache_hits": sync.cache_hits,
+        "cache_misses": sync.cache_misses,
+        "snapshots_indexed": sync.snapshots_indexed,
+        "snapshots_fetched": sync.snapshots_fetched,
+    })
+}
+
+/// What the ask corpus cost, in the same quantities and the same renderings as the other lanes —
+/// with the two differences that are the lane's own identity rather than a divergence in style.
+///
+/// It names a **scope** rather than a window, because it has none: a lifetime question has no
+/// `--last` (decision 12), and printing `all history` where a duration goes would invite a reader to
+/// read it as one. And it reports what it holds *searchable* beside what the archive *listed*,
+/// because those two are the whole of the corpus's honesty: every session listed either answers a
+/// search or is counted as one this build could not read, and the answers themselves carry the same
+/// pair so a reader can check a footer against a search.
+fn ask_lane_value(corpus: &AskCorpus) -> Value {
+    let sync = &corpus.instrumentation.sync;
+    let fold_elapsed = corpus.instrumentation.fold_elapsed;
+    json!({
+        "scope": ASK_SCOPE,
+        "sessions_listed": sync.sessions_listed,
+        "sessions_searchable": corpus.searchable(),
+        "sessions_unsearchable": corpus.unsearchable,
+        "fold": format::elapsed(fold_elapsed),
+        "fold_millis": u64::try_from(fold_elapsed.as_millis()).unwrap_or(u64::MAX),
+        "sync": format::elapsed(sync.elapsed),
+        "sync_millis": u64::try_from(sync.elapsed.as_millis()).unwrap_or(u64::MAX),
+        "bytes_read": format::bytes(corpus.bytes_read),
         "bytes_transferred": format::bytes(sync.bytes_transferred),
         "cache_hits": sync.cache_hits,
         "cache_misses": sync.cache_misses,
@@ -1664,6 +1907,10 @@ impl Payload<'_> {
             // one, so `comparison_sessions_folded` appears on the first and not on the second.
             "cost_window": self.windows.cost.to_string(),
             "standup_window": self.windows.standup.to_string(),
+            // The fourth lane names a scope rather than a window: the ask corpus is all of history
+            // by design, so there is no `--ask-last` to echo and a duration here would be a wrong
+            // one. See `ask_lane_value`.
+            "ask_scope": ASK_SCOPE,
             "lanes": {
                 "cost": cost_lane,
                 "standup": lane_cost_value(
@@ -1673,6 +1920,7 @@ impl Payload<'_> {
                     self.standup.standup.sessions,
                     self.standup.standup.bytes_read,
                 ),
+                "ask": ask_lane_value(self.ask),
             },
             // What a refresh of the whole page costs, wall-clock, across all three folds. Measured
             // rather than added — though against production it lands within a tenth of a second of
@@ -1761,7 +2009,7 @@ mod tests {
     use crate::report::Instrumentation;
     use crate::rules;
     use crate::scoring::RulePack;
-    use crate::standup::{RepositoryGroup, Standup};
+    use crate::standup::{ReadSummary, RepositoryGroup, Standup};
     use crate::standup_report::StandupInstrumentation;
     use crate::sync::SyncStats;
 
@@ -2038,7 +2286,8 @@ mod tests {
         }
     }
 
-    /// The payload, from three folds a test chose.
+    /// The payload, from the four lanes a test chose — three folds and the search corpus, which
+    /// feeds no section and appears only in the provenance block.
     fn build(coaching: Folded, cost: FoldedCost, standup: Standup, redactor: Redactor) -> Value {
         Payload {
             windows: &windows(),
@@ -2046,6 +2295,7 @@ mod tests {
             coaching: &coaching,
             cost: &cost,
             standup: &folded_standup(standup),
+            ask: &corpus(Vec::new(), 0),
             folds_elapsed: Duration::from_millis(370),
             refreshed: refreshed(),
             redactor: &redactor,
@@ -2876,6 +3126,326 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The ask answer
+    // -----------------------------------------------------------------------
+
+    /// One archived `summary.md` as the cache read it — the shape [`Ask::fold`] scores.
+    ///
+    /// Built directly rather than through a mirror and a parse, because what is under test in this
+    /// module is the *answer over* a corpus; `tests/ask.rs` covers the reading of one, and
+    /// `tests/dashboard.rs` covers both reached through HTTP.
+    fn read_summary(hash: &str, title: &str, goal: &str, repository: Option<&str>) -> ReadSummary {
+        let summary = munshi_transcript::StructuredSummary {
+            title: title.to_owned(),
+            goal: goal.to_owned(),
+            work_completed: Vec::new(),
+            decisions: Vec::new(),
+            files_changed: Vec::new(),
+            commands_and_validation: Vec::new(),
+            open_items: Vec::new(),
+            tags: Vec::new(),
+        };
+        ReadSummary {
+            source_hash: hash.to_owned(),
+            archived_at: Some(at("2026-08-16T09:00:00Z")),
+            bytes_read: 2048,
+            archived: munshi_transcript::ArchivedMarkdown {
+                schema_version: 1,
+                source: munshi_transcript::SourceKind::ClaudeCode,
+                session_id: "session".to_owned(),
+                project: munshi_transcript::ProjectIdentity {
+                    identity: "id".to_owned(),
+                    component: "component".to_owned(),
+                    project: "project".to_owned(),
+                    repository: repository.map(ToOwned::to_owned),
+                    branch: Some("main".to_owned()),
+                    origin: munshi_transcript::ProjectOrigin::Live,
+                },
+                summary_revision: 1,
+                completion_reason: "complete".to_owned(),
+                cursor_fallback_reason: None,
+                cursor: None,
+                source_cursor: 0,
+                source_hash: hash.to_owned(),
+                started_at: None,
+                updated_at: None,
+                summary_placeholder: false,
+                artifact_set_version: Some(2),
+                transcript_sha256: None,
+                extracted_outputs: Vec::new(),
+                summary,
+            },
+        }
+    }
+
+    fn corpus(read: Vec<ReadSummary>, unsearchable: usize) -> AskCorpus {
+        AskCorpus::over(at("2026-08-17T12:00:00Z"), read, unsearchable)
+    }
+
+    /// Two summaries, one of which is squarely about payments.
+    fn searchable() -> Vec<ReadSummary> {
+        vec![
+            read_summary(
+                &"a".repeat(64),
+                "Price the payments API",
+                "Charge the payments API at list rates.",
+                Some("surdy/qanungo"),
+            ),
+            read_summary(
+                &"b".repeat(64),
+                "Fold the timeline",
+                "Lay the window on a calendar.",
+                None,
+            ),
+        ]
+    }
+
+    /// One answer, built the way the route builds it.
+    fn answer(query: &Query, limit: usize, corpus: &AskCorpus, redactor: &Redactor) -> Value {
+        let ask = (!query.is_empty()).then(|| corpus.search(query, redactor, limit));
+        AskAnswer {
+            query,
+            limit,
+            ask: ask.as_ref(),
+            corpus,
+            refreshed: refreshed(),
+            redactor,
+        }
+        .build()
+    }
+
+    /// A ranked answer carries the ranking, the counts it was taken over, and the provenance of the
+    /// corpus that answered — which is the whole of what a page needs to state the search's bounds.
+    #[test]
+    fn an_ask_answer_carries_the_ranking_and_the_bounds_it_was_taken_over() {
+        let corpus = corpus(searchable(), 3);
+        let query = Query::parse("payments");
+        let answer = answer(&query, 10, &corpus, &Redactor::new());
+
+        assert_eq!(answer["state"], "ranked");
+        assert_eq!(answer["query"]["terms"], json!(["payments"]));
+        assert_eq!(
+            answer["query"]["min_term_chars"],
+            crate::ask::MIN_TERM_CHARS
+        );
+        assert_eq!(answer["limit"], 10);
+        assert_eq!(answer["searched"], 2);
+        assert_eq!(
+            answer["unsearchable"], 3,
+            "counted, never dropped — the corpus's own figure travels with every answer",
+        );
+        assert_eq!(answer["total_matches"], 1);
+
+        let hits = answer["hits"].as_array().expect("hits are an array");
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit["rank"], 1);
+        assert_eq!(hit["title"], "Price the payments API");
+        assert_eq!(hit["harness"], "claude-code");
+        assert_eq!(hit["repository"], "surdy/qanungo");
+        assert_eq!(hit["branch"], "main");
+        assert_eq!(hit["archived_at"], "2026-08-16T09:00:00Z");
+        assert_eq!(hit["source_hash"], "a".repeat(64));
+        assert_eq!(hit["matched"], json!(["title", "goal"]));
+        assert!(hit["score"].as_u64().expect("a score") > 0);
+        assert!(
+            hit["snippet"]
+                .as_str()
+                .expect("a snippet")
+                .contains("Price the payments API"),
+        );
+
+        // The corpus block: which refresh answered, when it was read, how much it holds, and what
+        // it covers. A page that could not say these could not date its own answer.
+        let block = &answer["corpus"];
+        assert_eq!(block["generation"], 3);
+        assert_eq!(block["read_at"], "2026-08-17T12:00:00Z");
+        assert_eq!(block["stale_since"], Value::Null);
+        assert_eq!(block["sessions_listed"], 5, "2 searchable + 3 not");
+        assert_eq!(block["bytes_read"], "4.0 KiB");
+        assert_eq!(
+            block["scope"], "all-history",
+            "no window and no scope: this route is independent of the page's controls",
+        );
+
+        // The scrub behind the snippets, stated as every verbatim surface here states it.
+        assert_eq!(answer["redaction"]["secrets"], true);
+        assert_eq!(answer["redaction"]["profanity"], false);
+        assert_eq!(answer["redaction"]["pattern_revision"], PATTERN_REVISION);
+        assert_eq!(answer["redaction"]["total"], 0);
+
+        // The same query over the same corpus twice is the same answer, byte for byte.
+        assert_eq!(answer, self::answer(&query, 10, &corpus, &Redactor::new()));
+    }
+
+    /// The three answers are three states, because they are three different sentences: no word to
+    /// search on, the archive's own "no", and a list.
+    #[test]
+    fn the_three_answers_are_kept_apart_as_states() {
+        let corpus = corpus(searchable(), 1);
+
+        let empty = Query::parse("the a of");
+        assert!(empty.is_empty());
+        let answered = answer(&empty, 10, &corpus, &Redactor::new());
+        assert_eq!(answered["state"], "no-searchable-terms");
+        assert_eq!(answered["query"]["terms"], json!([]));
+        assert_eq!(answered["total_matches"], 0);
+        assert_eq!(answered["hits"], json!([]));
+        // Even with nothing scored, the answer still says what it could and could not have looked
+        // at — the counts are the corpus's and cost nothing.
+        assert_eq!(answered["searched"], 2);
+        assert_eq!(answered["unsearchable"], 1);
+
+        let missed = Query::parse("kubernetes helm");
+        let answered = answer(&missed, 10, &corpus, &Redactor::new());
+        assert_eq!(answered["state"], "no-matches");
+        assert_eq!(answered["hits"], json!([]));
+        assert_eq!(answered["searched"], 2, "it looked, and the answer is no");
+    }
+
+    /// The limit truncates the list and the answer still counts what it hid, so a page can say
+    /// "showing 1 of 2" rather than implying the last row was the last match.
+    #[test]
+    fn a_truncated_ranking_still_counts_what_it_hid() {
+        let corpus = corpus(searchable(), 0);
+        let query = Query::parse("the payments timeline window");
+        let answer = answer(&query, 1, &corpus, &Redactor::new());
+        assert_eq!(answer["limit"], 1);
+        assert_eq!(answer["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(answer["total_matches"], 2);
+    }
+
+    /// The query is the one string here a *caller* wrote, and it does not make the round trip.
+    ///
+    /// What comes back is what the search actually used: lower-cased, broken on everything that is
+    /// not a letter or a digit by `Query::parse`, and then clamped as an identifier — so an absurd
+    /// run of letters inside the router's byte cap becomes a marker rather than a kilobyte of a
+    /// peer's choosing on a rendering surface.
+    #[test]
+    fn an_answer_echoes_the_searched_terms_and_never_the_callers_bytes() {
+        let corpus = corpus(searchable(), 0);
+        let hostile = format!("PAYMENTS, <b>api</b>! {}", "z".repeat(200));
+        let query = Query::parse(&hostile);
+        let answer = answer(&query, 10, &corpus, &Redactor::new());
+
+        let terms: Vec<&str> = answer["query"]["terms"]
+            .as_array()
+            .expect("terms are an array")
+            .iter()
+            .map(|term| term.as_str().expect("a term"))
+            .collect();
+        assert_eq!(terms, vec!["payments", "api", format::INVALID_IDENTIFIER]);
+        let serialized = serde_json::to_string(&answer).expect("the answer serializes");
+        assert!(!serialized.contains("<b>"), "{serialized}");
+        assert!(!serialized.contains("zzzz"), "{serialized}");
+    }
+
+    /// The canary, at the answer's own level: a summary carrying a live-shaped credential on the
+    /// very line a query lands on cannot render it, and the answer counts the replacement.
+    ///
+    /// The scrub is `Ask::fold`'s, not this module's — what is pinned here is that the answer
+    /// serializes what the fold produced, markers and all, so a reader can see the scrub fired.
+    #[test]
+    fn a_planted_credential_cannot_render_through_an_answer() {
+        let secret = "ghp_0123456789012345678901234567890123456";
+        let leaky = read_summary(
+            &"c".repeat(64),
+            &format!("Rotate {secret} out of CI"),
+            "Rotate the token.",
+            Some("surdy/qanungo"),
+        );
+        let corpus = corpus(vec![leaky], 0);
+        let query = Query::parse("rotate");
+        let answer = answer(&query, 10, &corpus, &Redactor::new());
+
+        let serialized = serde_json::to_string(&answer).expect("the answer serializes");
+        assert!(!serialized.contains(secret), "{serialized}");
+        assert!(
+            serialized.contains("[REDACTED:github-token]"),
+            "{serialized}"
+        );
+        // Twice, and honestly: the title is the highest-weighted field the query landed in, so it
+        // is both the hit's title and its snippet, and the fold scrubbed each on its own way in.
+        // The count is of replacements made, not of distinct secrets found.
+        assert_eq!(answer["redaction"]["total"], 2);
+        assert_eq!(answer["redaction"]["fired"][0]["pattern"], "github-token");
+        assert_eq!(answer["redaction"]["fired"][0]["count"], 2);
+    }
+
+    /// A corpus whose refreshes are failing still answers, and the answer says how old it is —
+    /// the same refusal to blank a page the payload's own `stale_since` makes.
+    #[test]
+    fn a_stale_corpus_dates_its_answer_rather_than_refusing_it() {
+        let corpus = corpus(searchable(), 0);
+        let query = Query::parse("payments");
+        let ask = corpus.search(&query, &Redactor::new(), 10);
+        let answer = AskAnswer {
+            query: &query,
+            limit: 10,
+            ask: Some(&ask),
+            corpus: &corpus,
+            refreshed: Refreshed {
+                generation: 9,
+                at: at("2026-08-17T12:00:00Z"),
+                stale_since: Some(at("2026-08-17T11:30:00Z")),
+            },
+            redactor: &Redactor::new(),
+        }
+        .build();
+        assert_eq!(answer["state"], "ranked");
+        assert_eq!(answer["corpus"]["generation"], 9);
+        assert_eq!(answer["corpus"]["stale_since"], "2026-08-17T11:30:00Z");
+        assert_eq!(
+            answer["corpus"]["read_at"], "2026-08-17T12:00:00Z",
+            "the corpus is still the one it was, read when it was",
+        );
+    }
+
+    /// The fourth lane in the footer: a scope rather than a window, and the two counts that make
+    /// the corpus's honesty checkable against any answer taken over it.
+    #[test]
+    fn the_provenance_block_carries_the_ask_lane() {
+        let corpus = corpus(searchable(), 3);
+        let coaching = folded(hygiene_window("claude-code", 20, 5), Vec::new());
+        let cost = priced_window();
+        let standup = folded_standup(narrated_window());
+        let payload = Payload {
+            windows: &windows(),
+            refresh: &refresh(),
+            coaching: &coaching,
+            cost: &cost,
+            standup: &standup,
+            ask: &corpus,
+            folds_elapsed: Duration::from_millis(370),
+            refreshed: refreshed(),
+            redactor: &Redactor::new(),
+        }
+        .build();
+
+        assert_eq!(payload["provenance"]["ask_scope"], "all-history");
+        let lane = &payload["provenance"]["lanes"]["ask"];
+        assert_eq!(lane["scope"], "all-history");
+        assert_eq!(lane["sessions_searchable"], 2);
+        assert_eq!(lane["sessions_unsearchable"], 3);
+        assert_eq!(lane["bytes_read"], "4.0 KiB");
+        assert_eq!(lane["fold"], "0 ms");
+        assert_eq!(
+            lane["window"],
+            Value::Null,
+            "a lifetime question has no window to name",
+        );
+        // The corpus feeds no *section*: it is in the footer and nowhere else.
+        for section in ["lanes", "cost", "standup", "timeline", "heatmap", "scopes"] {
+            assert!(
+                !serde_json::to_string(&payload[section])
+                    .expect("the section serializes")
+                    .contains("all-history"),
+                "the ask corpus reached the {section} section",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // The whole document
     // -----------------------------------------------------------------------
 
@@ -2932,6 +3502,7 @@ mod tests {
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
+            ask: &corpus(Vec::new(), 0),
             folds_elapsed: Duration::from_millis(370),
             refreshed: Refreshed {
                 generation: 9,

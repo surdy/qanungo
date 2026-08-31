@@ -151,29 +151,37 @@ fn spawn_archive(sessions: Vec<ArchivedSession>) -> String {
     spawn_counted_archive(sessions).0
 }
 
-/// The same, plus a counter of **transcript-content** requests.
+/// The same, plus a counter of **every request the archive is asked for** — listings, snapshot
+/// documents, and artifact content alike.
 ///
-/// It is what pins the invariant the excerpt route rests on: a dashboard that answered a browser
-/// by fetching from the archive would be a remote control for somebody else's bandwidth, so the
-/// test asserts the counter does not move rather than asserting the response looked right.
+/// It is what pins the invariant both request-path routes rest on: a dashboard that answered a
+/// browser by reaching for the archive would be a remote control for somebody else's bandwidth and
+/// for what lands on this disk, so the tests assert the counter does not move rather than asserting
+/// the response looked right.
+///
+/// Counting *all* of them is deliberate, and is the second version of this helper. Counting only
+/// artifact content measured less than the tests claimed: a request path that listed the window —
+/// or walked a session's snapshots, or fetched one snapshot document — would have moved no counter
+/// and passed. The invariant is that a request induces **no archive traffic of any kind**, so that
+/// is what is counted.
 fn spawn_counted_archive(sessions: Vec<ArchivedSession>) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let base = format!("http://{}", listener.local_addr().unwrap());
     let sessions = Arc::new(sessions);
-    let fetches = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&fetches);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let sessions = Arc::clone(&sessions);
-            let fetches = Arc::clone(&counted);
-            std::thread::spawn(move || serve_archive(stream, &sessions, &fetches));
+            let requests = Arc::clone(&counted);
+            std::thread::spawn(move || serve_archive(stream, &sessions, &requests));
         }
     });
-    (base, fetches)
+    (base, requests)
 }
 
-fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], fetches: &AtomicUsize) {
+fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], requests: &AtomicUsize) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -195,6 +203,11 @@ fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], fetches: &
         .to_owned();
     let path = target.split_once('?').map_or(target.as_str(), |(p, _)| p);
 
+    // Counted here, once, before the route is even decided: what the tests assert is that a request
+    // to the *dashboard* produces no traffic here at all, and a counter attached to one branch
+    // would measure one kind of reaching-out rather than the absence of any.
+    requests.fetch_add(1, Ordering::Relaxed);
+
     let response = if path == "/api/v1/sessions" {
         json_response(&session_page(sessions))
     } else if let Some(id) = path
@@ -211,7 +224,6 @@ fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], fetches: &
         .strip_prefix("/api/v1/artifacts/")
         .and_then(|rest| rest.strip_suffix("/content"))
     {
-        fetches.fetch_add(1, Ordering::Relaxed);
         match sessions.iter().find_map(|session| session.artifact(id)) {
             Some((bytes, digest)) => content_response(bytes, digest),
             None => not_found(),
@@ -1295,7 +1307,7 @@ fn the_evidence_route_refuses_everything_the_payload_did_not_name() {
 /// on an unauthenticated tailnet must not be able to make this process talk to the archive.
 #[test]
 fn a_cache_miss_is_a_404_with_provenance_and_never_a_fetch() {
-    let (base, fetches) = spawn_counted_archive(canary_archive());
+    let (base, requests) = spawn_counted_archive(canary_archive());
     let directory = tempfile::tempdir().expect("a scratch directory");
     let cache_root = directory.path().join("qanungo");
     let args = args(&base, &cache_root);
@@ -1305,7 +1317,7 @@ fn a_cache_miss_is_a_404_with_provenance_and_never_a_fetch() {
 
     let payload = payload_of(address);
     let (source_hash, locator) = first_anchor(&payload);
-    let mirrored = fetches.load(Ordering::Relaxed);
+    let mirrored = requests.load(Ordering::Relaxed);
     assert!(mirrored > 0, "the fold mirrored the window");
 
     // Take the blob out from under the served payload, which still names its anchors.
@@ -1328,9 +1340,9 @@ fn a_cache_miss_is_a_404_with_provenance_and_never_a_fetch() {
             .contains("never fetches from the archive to answer a request"),
     );
     assert_eq!(
-        fetches.load(Ordering::Relaxed),
+        requests.load(Ordering::Relaxed),
         mirrored,
-        "the request must not have reached for the archive",
+        "the request must not have reached for the archive — for anything, not only for a blob",
     );
 }
 
@@ -2877,12 +2889,16 @@ fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
     // Changing the scope re-renders what is already in hand: no query string, no second route.
     assert_eq!(
         body.matches("fetch(").count(),
-        2,
-        "the payload and an excerpt, and nothing a scope control adds",
+        3,
+        "the payload, an excerpt and a search, and nothing a scope control adds",
     );
     assert!(
         !body.contains("?repository=") && !body.contains("/api/data?"),
         "a scope is never a query string",
+    );
+    assert!(
+        !body.contains("/api/ask?q=\" + encodeURIComponent(typed) + \"&repository"),
+        "and a scope is never a search parameter either",
     );
 }
 
@@ -3543,8 +3559,8 @@ fn the_page_draws_one_inline_svg_chart_and_computes_nothing() {
     );
     assert_eq!(
         body.matches("fetch(").count(),
-        2,
-        "the payload and an excerpt, and nothing the chart adds",
+        3,
+        "the payload, an excerpt and a search, and nothing the chart adds",
     );
 }
 
@@ -4031,4 +4047,417 @@ fn assert_heatmap_leaves(value: &serde_json::Value, path: &str, leaves: &mut usi
         }
         other => panic!("{path} is {other}, which the heatmap never serves"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The ask box (qanungo #10)
+// ---------------------------------------------------------------------------
+
+/// The credentials planted in `standup/qanungo-cost.md` — the same three `tests/ask.rs` guards the
+/// CLI ranking against. Not one may appear in an answer while the secrets pass is on.
+const PLANTED_IN_A_SUMMARY: [&str; 3] = [
+    "ghp_CANARYCANARYCANARYCANARYCANARYCANARY",
+    "sk-ant-api03-CANARYSECRETCANARYSECRETCANARYSECRET99",
+    "AKIACANARY0EXAMPLE99",
+];
+
+/// One search over the served surface.
+fn ask(address: SocketAddr, query: &str) -> (String, serde_json::Value) {
+    ask_target(address, &format!("/api/ask?q={query}"))
+}
+
+fn ask_target(address: SocketAddr, target: &str) -> (String, serde_json::Value) {
+    let (head, body) = request(address, target);
+    (
+        head,
+        serde_json::from_str(&body).expect("the answer is JSON"),
+    )
+}
+
+/// The property this route rests on, and the same one the coaching section rests on: what a browser
+/// is handed is `qanungo ask`'s own ranking.
+///
+/// The fold below is a second, independent run of exactly what the CLI does — `command::fold_ask`
+/// with no window, which is the entry point `qanungo ask` takes when no `--last` is typed — over the
+/// same archive and the now-warm cache. Every stable field of every hit has to agree, in order: a
+/// served ranking that merely *resembled* the terminal's would be the "the web page and the CLI
+/// disagree" bug this crate splits its folds to make impossible.
+#[test]
+fn the_ask_route_ranks_exactly_as_the_cli_does() {
+    let (address, args, _directory) = spawn_with(three_lane_archive(), &[]);
+    let (head, answer) = ask_target(address, "/api/ask?q=price+snapshot+archive&limit=3");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    assert!(head.contains("Cache-Control: no-store"), "{head}");
+
+    let query = qanungo::ask::Query::parse("price snapshot archive");
+    let folded = command::fold_ask(
+        &args.archive,
+        None,
+        &query,
+        args.redaction.redactor(),
+        3,
+        false,
+    )
+    .expect("the archive searches");
+
+    let hits = answer["hits"].as_array().expect("hits are an array");
+    assert!(
+        hits.len() >= 2,
+        "the fixture matches more than once: {hits:?}"
+    );
+    assert_eq!(hits.len(), folded.ask.hits.len());
+    assert_eq!(answer["total_matches"], folded.ask.total_matches);
+    assert_eq!(answer["searched"], folded.ask.searched);
+    assert_eq!(answer["unsearchable"], folded.ask.unsearchable);
+    assert_eq!(answer["state"], "ranked");
+    assert_eq!(
+        answer["query"]["terms"],
+        serde_json::json!(query.terms()),
+        "the searched words, not the caller's bytes",
+    );
+
+    // Hit for hit, in order: the same sessions, the same scores, the same snippets, the same
+    // reasons. The rank is the served list's own position, so it also pins the order itself.
+    for (index, (served, cli)) in hits.iter().zip(&folded.ask.hits).enumerate() {
+        assert_eq!(served["rank"], index + 1, "{index}");
+        assert_eq!(served["source_hash"], cli.source_hash, "{index}");
+        assert_eq!(served["score"], cli.score, "{index}");
+        assert_eq!(served["title"], cli.title, "{index}");
+        assert_eq!(served["snippet"], cli.snippet, "{index}");
+        assert_eq!(served["harness"], cli.harness, "{index}");
+        assert_eq!(served["matched"], serde_json::json!(cli.matched), "{index}");
+        assert_eq!(
+            served["repository"],
+            serde_json::json!(cli.repository),
+            "{index}",
+        );
+        assert_eq!(served["branch"], serde_json::json!(cli.branch), "{index}");
+    }
+
+    // The limit is the one the request asked for, and it truncated: the answer says so rather than
+    // letting the third row read as the last match there was.
+    assert_eq!(answer["limit"], 3);
+    assert!(
+        answer["total_matches"].as_u64().expect("a count") >= hits.len() as u64,
+        "{answer}",
+    );
+}
+
+/// The invariant this route inherits from the excerpt route, and the reason the corpus exists at
+/// all: **a browser cannot make this process talk to the archive.**
+///
+/// The counter is **every request the archive is asked for** — the window listing, a session's
+/// snapshots, a snapshot document, and artifact content alike. It moves while the refresh mirrors
+/// the archive, and it must not move again however many searches are asked for, including one that
+/// matches everything, one that matches nothing, and one refused for being too long.
+///
+/// Counting only artifact content would measure less than this test claims: a request path that
+/// *listed* would move no such counter and pass. What is under test is the absence of archive
+/// traffic of any kind, so that is what is counted — see [`spawn_counted_archive`].
+#[test]
+fn an_ask_request_never_reaches_the_archive() {
+    let (base, requests) = spawn_counted_archive(three_lane_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args(&base, &directory.path().join("qanungo"));
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let mirrored = requests.load(Ordering::Relaxed);
+    assert!(mirrored > 0, "the refresh mirrored the archive");
+
+    for target in [
+        "/api/ask?q=price",
+        "/api/ask?q=snapshot+archive+price+token&limit=50",
+        "/api/ask?q=kubernetes+helm+chart",
+        "/api/ask?q=the+a+of",
+        "/api/ask",
+        &format!("/api/ask?q={}", "a".repeat(4096)),
+    ] {
+        let (head, _body) = request(address, target);
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK\r\n") || head.starts_with("HTTP/1.1 400 "),
+            "{target}: {head}",
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            mirrored,
+            "{target} reached for the archive",
+        );
+    }
+}
+
+/// The done-bar's canary for this route: a `summary.md` carrying three live-*shaped* credentials is
+/// ranked, quoted, and served over HTTP, and not one character of any of them survives.
+///
+/// The query is the one `tests/ask.rs` uses for the CLI: "pasted" appears only on the work-completed
+/// line that also carries a GitHub token, so that line *is* the snippet this hit renders and the
+/// scrub has to have reached it. The scrub is `Ask::fold`'s; what is pinned here is that the whole
+/// path from the archive's bytes to the wire preserves it, and that the answer counts what fired so
+/// a reader can see a marker was accounted for.
+#[test]
+fn a_planted_credential_in_a_summary_never_reaches_an_ask_answer() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let (head, answer) = ask(address, "pasted");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert_eq!(answer["state"], "ranked");
+
+    let serialized = serde_json::to_string(&answer).expect("the answer serializes");
+    for secret in PLANTED_IN_A_SUMMARY {
+        assert!(!serialized.contains(secret), "the answer leaked {secret}");
+    }
+    // The line the query landed on is the one that carried the token, so the marker is what a
+    // reader sees — proof the hit was rendered rather than the whole session being dropped.
+    let snippet = answer["hits"][0]["snippet"]
+        .as_str()
+        .expect("the hit carries a snippet");
+    assert!(snippet.contains("pasted into the run log"), "{snippet}");
+    assert!(snippet.contains("[REDACTED:github-token]"), "{snippet}");
+    assert!(
+        answer["redaction"]["total"].as_u64().expect("a count") > 0,
+        "the scrub fired and the answer says so",
+    );
+    assert_eq!(answer["redaction"]["secrets"], true);
+    assert_eq!(
+        answer["redaction"]["fired"][0]["pattern"], "github-token",
+        "counts against pattern ids, never the value matched",
+    );
+}
+
+/// `--no-redact` reaches this surface too, or it is a flag that lies about one of the surfaces it
+/// governs — the negative half of the canary above.
+#[test]
+fn no_redact_serves_an_ask_answer_as_the_archive_holds_it() {
+    let (address, _args, _directory) = spawn_with(three_lane_archive(), &["--no-redact"]);
+    let (_head, answer) = ask(address, "pasted");
+    let serialized = serde_json::to_string(&answer).expect("the answer serializes");
+    assert_eq!(answer["redaction"]["secrets"], false);
+    assert_eq!(answer["redaction"]["total"], 0);
+    assert!(
+        serialized.contains("ghp_CANARYCANARYCANARYCANARYCANARYCANARY"),
+        "with the scrub off the summary's own line is what is quoted",
+    );
+}
+
+/// The response's **shape**, pinned — because the page's JavaScript has no test of its own.
+///
+/// The lesson is the heatmap crash's: a device scope stopped carrying a key the page read and the
+/// Rust suite could not see it, so the shape a page depends on is pinned in Rust. Two claims here.
+/// Every field the ask box reads is present with the type it reads it as. And the route is
+/// **scope-independent in V1** — there is no repository, device, harness, or window parameter, and a
+/// request carrying one is byte-for-byte the same answer as one that does not, so a page that
+/// narrows the sections above can never come to believe it narrowed this.
+#[test]
+fn the_ask_answer_shape_is_pinned_and_is_independent_of_every_scope() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let (_head, answer) = ask(address, "price");
+
+    for (path, value) in [
+        ("state", &answer["state"]),
+        ("query.terms", &answer["query"]["terms"]),
+        ("query.min_term_chars", &answer["query"]["min_term_chars"]),
+        ("limit", &answer["limit"]),
+        ("searched", &answer["searched"]),
+        ("unsearchable", &answer["unsearchable"]),
+        ("total_matches", &answer["total_matches"]),
+        ("hits", &answer["hits"]),
+        ("corpus.generation", &answer["corpus"]["generation"]),
+        ("corpus.read_at", &answer["corpus"]["read_at"]),
+        (
+            "corpus.sessions_listed",
+            &answer["corpus"]["sessions_listed"],
+        ),
+        ("corpus.bytes_read", &answer["corpus"]["bytes_read"]),
+        ("corpus.scope", &answer["corpus"]["scope"]),
+        ("redaction.secrets", &answer["redaction"]["secrets"]),
+        ("redaction.profanity", &answer["redaction"]["profanity"]),
+        (
+            "redaction.pattern_revision",
+            &answer["redaction"]["pattern_revision"],
+        ),
+        ("redaction.total", &answer["redaction"]["total"]),
+        ("redaction.fired", &answer["redaction"]["fired"]),
+    ] {
+        assert!(!value.is_null(), "{path} is missing from the answer");
+    }
+    // `stale_since` is present and null on a healthy service — the page tells "fresh" from "the
+    // refreshes are failing" by reading it, so an absent key would read as fresh.
+    assert!(
+        answer["corpus"].get("stale_since").is_some(),
+        "the staleness key is served even when there is no staleness",
+    );
+    assert_eq!(answer["corpus"]["scope"], "all-history");
+    assert!(answer["searched"].is_number());
+    assert!(answer["hits"].is_array());
+
+    let hit = &answer["hits"][0];
+    for field in [
+        "rank",
+        "title",
+        "harness",
+        "repository",
+        "branch",
+        "archived_at",
+        "score",
+        "source_hash",
+        "snippet",
+        "matched",
+    ] {
+        assert!(hit.get(field).is_some(), "a hit carries no {field}: {hit}",);
+    }
+    assert!(hit["matched"].is_array());
+    assert_eq!(
+        hit["source_hash"].as_str().expect("a hash").len(),
+        64,
+        "the citation is a content hash and never a link",
+    );
+
+    // Scope-independent: every parameter the page's own controls are named after is ignored, and
+    // the window is not a parameter at all.
+    for target in [
+        "/api/ask?q=price&repository=surdy/qanungo",
+        "/api/ask?q=price&device=macbookpro",
+        "/api/ask?q=price&harness=claude-code",
+        "/api/ask?q=price&last=7d",
+        "/api/ask?q=price&scope=all",
+    ] {
+        let (_head, scoped) = ask_target(address, target);
+        assert_eq!(scoped, answer, "{target} changed the answer");
+    }
+}
+
+/// The three answers over the wire: a list, the archive's own "no", and "you gave me no word to
+/// search on" — plus the refusal that is not an answer at all.
+#[test]
+fn the_ask_route_states_which_kind_of_answer_it_is() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+
+    let (_head, ranked) = ask(address, "price");
+    assert_eq!(ranked["state"], "ranked");
+    assert!(!ranked["hits"].as_array().expect("hits").is_empty());
+
+    let (_head, missed) = ask(address, "kubernetes+helm+chart");
+    assert_eq!(missed["state"], "no-matches");
+    assert_eq!(missed["total_matches"], 0);
+    assert_eq!(missed["hits"], serde_json::json!([]));
+    assert_eq!(
+        missed["searched"], ranked["searched"],
+        "it looked at the same corpus and the answer is no",
+    );
+
+    let (_head, empty) = ask(address, "the+a+of");
+    assert_eq!(empty["state"], "no-searchable-terms");
+    assert_eq!(empty["query"]["terms"], serde_json::json!([]));
+    assert_eq!(empty["hits"], serde_json::json!([]));
+    assert_eq!(
+        empty["searched"], ranked["searched"],
+        "the counts are the corpus's and cost nothing to state",
+    );
+
+    // Over the cap: a status, and none of the caller's bytes echoed back.
+    let (head, refusal) = ask_target(address, &format!("/api/ask?q={}", "z".repeat(2048)));
+    assert!(head.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{head}");
+    // `error` is the sentence the page puts in front of a reader and `reason` is what code matches
+    // on, so the contract is both halves and not only the machine-readable one.
+    assert_eq!(refusal["error"], "the query is too long to search");
+    assert_eq!(refusal["reason"], "query-too-long");
+    assert_eq!(refusal["bytes"], 2048);
+    assert_eq!(refusal["max_bytes"], 1024);
+    assert!(
+        !serde_json::to_string(&refusal).unwrap().contains("zzzz"),
+        "{refusal}",
+    );
+}
+
+/// The corpus is every session the archive holds, and the answer's counts reconcile against the
+/// footer's — one search and one provenance line describing the same read.
+#[test]
+fn the_ask_corpus_and_its_provenance_line_are_the_same_read() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let payload = payload_of(address);
+    let (_head, answer) = ask(address, "price");
+
+    let lane = &payload["provenance"]["lanes"]["ask"];
+    assert_eq!(payload["provenance"]["ask_scope"], "all-history");
+    assert_eq!(lane["scope"], "all-history");
+    assert_eq!(lane["sessions_searchable"], answer["searched"]);
+    assert_eq!(lane["sessions_unsearchable"], answer["unsearchable"]);
+    assert_eq!(lane["sessions_listed"], answer["corpus"]["sessions_listed"]);
+    assert_eq!(lane["bytes_read"], answer["corpus"]["bytes_read"]);
+    assert_eq!(
+        answer["corpus"]["generation"],
+        payload["provenance"]["generation"]
+    );
+
+    // Counted, never dropped: four of the six fixtures carry a readable `summary.md`, one carries
+    // munshi's placeholder and one carries none at all — so two sessions are unsearchable and every
+    // one of the six is accounted for.
+    assert_eq!(lane["sessions_searchable"], 4);
+    assert_eq!(lane["sessions_unsearchable"], 2);
+    assert_eq!(lane["sessions_listed"], 6);
+}
+
+/// The page's half of the slice: one box, wired to this server's own search route, computing
+/// nothing and linking to nothing.
+///
+/// There is no JavaScript engine in this harness, so what is pinned is the shape — the box exists,
+/// it submits to `/api/ask`, it renders the server's hits in the server's order, and every page
+/// invariant survives the growth. The behaviour itself was checked in a browser against production.
+#[test]
+fn the_page_carries_one_ask_box_that_ranks_nothing_itself() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let (_head, body) = request(address, "/");
+
+    assert!(body.contains("Ask your history"), "the section is there");
+    assert!(body.contains("id=\"ask-query\""), "there is a query field");
+    assert!(body.contains("id=\"ask-form\""), "Enter submits it");
+    assert!(
+        body.contains("/api/ask?q=\" + encodeURIComponent(typed)"),
+        "the box asks this server's own route, with the query encoded",
+    );
+    assert!(
+        body.contains("event.preventDefault()"),
+        "the form navigates nowhere: this page has no links",
+    );
+    // The page reads the answer's own fields and writes them out. It does not rank: no sort, no
+    // score arithmetic, no re-ordering of the hits the server sent.
+    for read in [
+        "askAnswer.state",
+        "askAnswer.hits.map(askHitNode)",
+        "hit.rank",
+        "hit.score",
+        "hit.source_hash",
+        "hit.snippet",
+        "hit.matched.join",
+    ] {
+        assert!(body.contains(read), "the page reads {read}");
+    }
+    assert!(
+        !body.contains("askAnswer.hits.sort"),
+        "the order is the server's total order, never re-derived here",
+    );
+    // The search is not narrowed by the scope controls, and the page says so rather than leaving a
+    // reader to assume either way.
+    assert!(
+        body.contains("It is not narrowed by the scope controls"),
+        "the page states the search's bounds",
+    );
+
+    // Every invariant the page already held, restated over the grown file.
+    assert!(!body.contains("href"), "the page carries no links at all");
+    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert!(
+        !body.contains("innerHTML"),
+        "every value is set as text, never parsed as markup",
+    );
+    assert!(
+        !body.contains("http://") && !body.contains("https://") && !body.contains("//fonts."),
+        "the page loads nothing from anywhere",
+    );
+    assert_eq!(
+        body.matches("fetch(").count(),
+        3,
+        "the payload, an excerpt and a search, and nothing the ask box adds",
+    );
 }

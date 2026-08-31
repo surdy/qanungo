@@ -4,8 +4,8 @@
 //! It is the server counterpart of this crate's minimal HTTP client (munshi ADR 0006) and mirrors
 //! munshi-dashboard's shape deliberately: one request per connection, `Connection: close`, an
 //! explicit `Content-Length`, no keep-alive bookkeeping, an embedded single-file page, and no state
-//! of its own on disk. Four routes exist — the page, the JSON snapshot, the event stream, and one
-//! evidence excerpt — and everything else is 404.
+//! of its own on disk. Five routes exist — the page, the JSON snapshot, the event stream, one
+//! evidence excerpt, and one ranked search — and everything else is 404.
 //!
 //! # The excerpt route, and the three things that bound it
 //!
@@ -24,6 +24,35 @@
 //! 3. **The scrub is the process's, not the request's.** The redactor is built once from the
 //!    command line and every reader gets it. There is no query parameter, and the router discards
 //!    query strings before it decides anything.
+//!
+//! # The ask route, and the one rule it does not bend
+//!
+//! `GET /api/ask?q=<terms>&limit=<n>` ranks the refresh's own corpus of `summary.md` records and
+//! answers with the hits (qanungo #10's dashboard ask-box). It is the **first route on this surface
+//! whose query string is its argument**, which is worth stating plainly against the sentence beside
+//! it in [`route`]: a query string still decides nothing about *what this process will say about
+//! itself*. It cannot select a redaction posture, a window, a scope, or a session — the only two
+//! parameters are words to rank by and how many rows to show, and every other parameter on this
+//! target is ignored rather than interpreted.
+//!
+//! The excerpt route's three refusals hold here unchanged, and the first two are the load-bearing
+//! ones:
+//!
+//! 1. **Never a fetch.** The corpus is [`command::AskCorpus`], mirrored and parsed on the refresh
+//!    timer like the three document lanes. A request scores an in-memory `Vec`. There is no path
+//!    from this route to Patwari — not a guarded one, none — so no browser on the tailnet can spend
+//!    somebody else's bandwidth or decide what lands on this disk.
+//! 2. **The scrub is the process's, not the request's.** Every string in an answer was scrubbed by
+//!    the launch-time redactor on the way into the ranking ([`crate::ask::Ask::fold`]), and the
+//!    answer states which posture stands behind it.
+//! 3. **Bounded before it is work.** The raw `q` is capped at [`MAX_QUERY_BYTES`] and refused with a
+//!    `400` *before* it is decoded or parsed, and `limit` is clamped into
+//!    `1..=`[`MAX_ASK_LIMIT`] rather than trusted. A query of nothing but stop words is answered
+//!    with the "no searchable terms" shape and no ranking at all.
+//!
+//! **No verbatim here.** `qanungo ask --verbatim` escalates into the shown hits' transcripts; that
+//! is a CLI affordance and stays one (decision 11). This route cannot be made to serve a transcript
+//! line, because the corpus it reads holds no transcript.
 //!
 //! # Where it differs from munshi-dashboard, and why
 //!
@@ -76,6 +105,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::ask::Query;
 use crate::cache::{self, BlobCache};
 use crate::cli::{ArchiveArgs, DashboardArgs, Refresh};
 use crate::command::{self, CommandError, Folded};
@@ -110,6 +140,24 @@ const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 /// What a disconnected page waits before reconnecting, in milliseconds. Under the heartbeat, so a
 /// restarted server is picked up on the next beat rather than on the next refresh.
 const SSE_RETRY_MILLIS: u64 = 3_000;
+
+/// Ceiling on the raw `q` of an ask request, in bytes of the target as it arrived.
+///
+/// A tunable, and a refusal rather than a truncation: a query this long is not a search anybody
+/// typed, and answering a clipped version of it would be answering a question nobody asked. It is
+/// measured on the **undecoded** value, before any percent-escape is expanded, because decoding can
+/// only shrink a value — so capping the raw bounds both, and does it before this process has spent
+/// anything on the request. Well under [`MAX_REQUEST_BYTES`], which bounds the whole head anyway.
+const MAX_QUERY_BYTES: usize = 1024;
+
+/// How many ranked hits an ask request may ask for, and how many it gets when it asks for nothing.
+///
+/// Clamped rather than refused, unlike the CLI's `--limit` ([`crate::cli::parse_limit`]): a mistyped
+/// flag is a person who wants to know, and a mistyped query string is a browser that should still
+/// get an answer. The effective limit is echoed in the answer, so a truncated ranking says what
+/// truncated it.
+const DEFAULT_ASK_LIMIT: usize = 10;
+const MAX_ASK_LIMIT: usize = 50;
 
 /// Concurrent event streams the server will hold open.
 ///
@@ -313,8 +361,33 @@ pub fn redaction_posture_line(address: SocketAddr, redactor: &Redactor) -> Optio
 /// The payload every request is answered from.
 struct Served {
     /// Bumped on every swap. An event stream compares it to know a refresh from a reconnect.
+    ///
+    /// A **publication** counter, not a fold counter: a failed refresh republishes the previous
+    /// fold with this bumped, because a page's numbers going stale is a change worth pushing. See
+    /// [`Served::fold_generation`] for the other one, and why one field could not be both.
     generation: u64,
+    /// Which fold the body, the anchors, and the corpus below came from.
+    ///
+    /// Equal to [`Served::generation`] on every successful refresh and deliberately **behind** it
+    /// during a failing run: [`republish_as_stale`] swaps in a new publication of the *same* fold,
+    /// so the document it re-stamps still says `provenance.generation: N` while the publication is
+    /// N+1.
+    ///
+    /// Two fields rather than one because two different questions are asked of them, and answering
+    /// both from `generation` is what put an answer and the page it sits beside a generation apart:
+    /// the event stream asks *has the served payload been replaced* (publication), and an ask answer
+    /// asks *which fold produced the corpus I ranked* (fold). The second has to agree with what the
+    /// page reads out of the payload, or the page's own "these results are older than this document"
+    /// check fires on a corpus that never moved.
+    fold_generation: u64,
     refreshed_at: DateTime<Utc>,
+    /// When the current run of failed refreshes began, if one is under way.
+    ///
+    /// Carried beside the body as well as patched into it: the JSON payload states it for the page,
+    /// and the ask route needs the same fact for an answer that is not built from the payload. One
+    /// field read by both is what keeps a search from claiming to be fresher than the document above
+    /// it. See [`republish_as_stale`].
+    stale_since: Option<DateTime<Utc>>,
     /// Serialized once per refresh rather than once per request, so open tabs cost nothing.
     body: Vec<u8>,
     /// The anchors this body names — the whole servable set while it is the current payload.
@@ -324,6 +397,16 @@ struct Served {
     /// holding an anchor from the previous refresh simply gets a 404 rather than an excerpt from a
     /// finding that is no longer on the page.
     evidence: EvidenceIndex,
+    /// The summaries this generation can rank a search against — the whole searchable set while
+    /// this payload is the current one.
+    ///
+    /// Inside the payload for the same reason the evidence index is: one refresh publishes the
+    /// document, the anchors it will expand, and the corpus it will search in a single move, so an
+    /// answer's stated generation is the generation that actually answered it — which is
+    /// [`Served::fold_generation`], the one the body itself states. Behind an [`Arc`] because a
+    /// stale re-stamp republishes the same corpus rather than re-reading it, and cloning a pointer
+    /// is what makes that free.
+    ask: Arc<command::AskCorpus>,
 }
 
 impl Served {
@@ -393,13 +476,19 @@ impl Service {
     }
 }
 
-/// Folds all three lanes once and serializes the payload, narrating each to stderr.
+/// Folds all four lanes once and serializes the payload, narrating each to stderr.
 ///
-/// **One call, one generation, one document.** The three folds happen back to back and the payload
-/// is built from all three at once, so the atomic swap below carries a whole page rather than a
-/// section of one: a reader can never see a bill from this refresh beside a standup from the last.
-/// A torn view across lanes is not made unlikely here, it is made unrepresentable — there is no
-/// intermediate state in which a [`Served`] holds two lanes.
+/// **One call, one generation, one document.** The four folds happen back to back and what is
+/// published is built from all of them at once, so the atomic swap below carries a whole page rather
+/// than a section of one: a reader can never see a bill from this refresh beside a standup from the
+/// last. A torn view across lanes is not made unlikely here, it is made unrepresentable — there is
+/// no intermediate state in which a [`Served`] holds two lanes.
+///
+/// The fourth lane produces no section. [`command::fold_ask_corpus`] reads every `summary.md` in the
+/// archive and keeps them parsed on the [`Served`], so `/api/ask` can rank a request against them
+/// without a browser ever being able to make this process talk to the archive. It joins the same
+/// generation for the same reason the other three share one: an answer taken over a corpus from a
+/// different refresh than the numbers beside it is the torn view under another name.
 ///
 /// # What three lanes actually cost, measured
 ///
@@ -439,8 +528,8 @@ fn fold_and_publish(
     redactor: &Redactor,
 ) -> Result<Served, CommandError> {
     eprintln!(
-        "qanungo dashboard: folding three lanes from {} — coaching {} (and the window before it), \
-         cost {} (and the window before it), standup {}",
+        "qanungo dashboard: folding four lanes from {} — coaching {} (and the window before it), \
+         cost {} (and the window before it), standup {}, ask all history",
         archive.patwari_url, windows.coaching, windows.cost, windows.standup,
     );
     let started = Instant::now();
@@ -474,6 +563,19 @@ fn fold_and_publish(
         format::bytes(standup.standup.bytes_read),
         standup.standup.redaction.total(),
     );
+    // The fourth lane, and the only one that produces no section: it reads every `summary.md` in
+    // the archive and keeps them parsed, so `/api/ask` can rank a request without reaching for the
+    // archive. It joins the same generation as the other three — a failure here stales the whole
+    // document, because a search over half a corpus would answer "no" for a session it never read.
+    let ask = command::fold_ask_corpus(archive)?;
+    eprintln!(
+        "qanungo dashboard: ask — sync {} · fold {} · {} of {} listed sessions searchable · {} held",
+        format::elapsed(ask.instrumentation.sync.elapsed),
+        format::elapsed(ask.instrumentation.fold_elapsed),
+        ask.searchable(),
+        ask.listed(),
+        format::bytes(ask.bytes_read),
+    );
     let folds_elapsed = started.elapsed();
 
     let evidence = dashboard::evidence_index(&coaching);
@@ -484,6 +586,7 @@ fn fold_and_publish(
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
+            ask: &ask,
             folds_elapsed,
             refreshed,
             redactor,
@@ -492,20 +595,26 @@ fn fold_and_publish(
     )
     .unwrap_or_else(|_| b"{}".to_vec());
     eprintln!(
-        "qanungo dashboard: refresh {} — three lanes in {} · payload {} · {} anchors over {} \
-         sessions · serialized at {}",
+        "qanungo dashboard: refresh {} — four lanes in {} · payload {} · {} anchors over {} \
+         sessions · {} searchable summaries · serialized at {}",
         refreshed.generation,
         format::elapsed(folds_elapsed),
         format::bytes(body.len() as u64),
         evidence.anchors(),
         evidence.sessions(),
+        ask.searchable(),
         format::elapsed(started.elapsed()),
     );
     Ok(Served {
         generation: refreshed.generation,
+        // The same number, because this *is* the fold that generation names. The two only come
+        // apart when a later refresh fails and republishes this one.
+        fold_generation: refreshed.generation,
         refreshed_at: refreshed.at,
+        stale_since: refreshed.stale_since,
         body,
         evidence,
+        ask: Arc::new(ask),
     })
 }
 
@@ -598,6 +707,15 @@ fn refresh_loop(
 /// upstream of this function: the standup section is 71% of that body, and bounding what a served
 /// narrative renders is the follow-up where it gets addressed — see [`crate::dashboard`]'s
 /// "One route, measured".
+///
+/// # Why the body's own generation is left alone
+///
+/// The publication number goes up and the *document* keeps saying `provenance.generation: N`,
+/// because N is the fold it is still showing. Patching the number to N+1 was the other way to close
+/// the gap this function once opened — an ask answer stamping N+1 while the payload beside it said
+/// N — and it is the wrong way round: it would make the document claim a refresh that never
+/// happened, which is exactly the lie `stale_since` exists to prevent. So [`Served::fold_generation`]
+/// carries N through the re-stamp instead, and the ask route stamps that. One patched key, still.
 fn republish_as_stale(service: &Service, generation: u64, since: DateTime<Utc>) {
     let current = service.snapshot();
     let stale = format!(r#""stale_since":"{}""#, crate::report::stamp(since));
@@ -609,11 +727,19 @@ fn republish_as_stale(service: &Service, generation: u64, since: DateTime<Utc>) 
     };
     service.publish(Served {
         generation,
+        // Kept, not bumped: the body below is still the fold it was, and it still says so. This is
+        // what an ask answer stamps, so a search and the document it sits beside name one fold.
+        fold_generation: current.fold_generation,
         refreshed_at: current.refreshed_at,
+        stale_since: Some(since),
         body,
         // The same anchors: this is the same fold, re-stamped. A stale page that can still expand
         // its own findings is the point of keeping the numbers at all.
         evidence: current.evidence.clone(),
+        // And the same corpus, for the same reason: a search that still answers over the summaries
+        // of the last good refresh is better than one that refuses, provided the answer says how old
+        // they are — which `stale_since` above is what lets it do.
+        ask: Arc::clone(&current.ask),
     });
 }
 
@@ -711,6 +837,11 @@ fn handle(mut stream: TcpStream, service: &Service) {
             locator,
         } => {
             let (status, body) = evidence_response(service, &source_hash, locator);
+            eprintln!("qanungo dashboard: {peer} - {request} {status}");
+            let _ = write_response(&mut stream, status, "application/json", &body);
+        }
+        Route::Ask(ask) => {
+            let (status, body) = ask_response(service, &ask);
             eprintln!("qanungo dashboard: {peer} - {request} {status}");
             let _ = write_response(&mut stream, status, "application/json", &body);
         }
@@ -813,6 +944,69 @@ fn evidence_response(
             &error.to_string(),
         ),
     }
+}
+
+/// Answers one search request: the ranking over the current generation's corpus — or the refusal
+/// that stopped it before anything was parsed.
+///
+/// The order is the same argument the excerpt route's is, reaching the same place from the other
+/// end. **The cap is checked before the parse**, so a kilobyte of a caller's choosing is never split
+/// into terms, let alone scored against every summary in the archive. **The corpus is the served
+/// one**, taken with the payload's own snapshot, so an answer and the document it sits beside are
+/// the same generation and the answer says which. And **there is nothing here to fetch**: the corpus
+/// was mirrored on the refresh timer, and a search that came up empty is an empty answer rather than
+/// a reason to reach for the archive.
+///
+/// A query with no searchable word in it takes the short path [`command::ask`] takes: the answer
+/// shape with `state: "no-searchable-terms"` and no ranking at all, which costs nothing over a
+/// corpus of any size.
+fn ask_response(service: &Service, request: &AskRequest) -> (&'static str, Vec<u8>) {
+    let (query, limit) = match request {
+        AskRequest::Search { query, limit } => (query, *limit),
+        // A 400 rather than the evidence route's 404: that route refuses to say whether something
+        // exists, and there is nothing to be coy about here — the caller's request is malformed by
+        // a published grammar, and saying so with the bound is what lets them fix it. No byte of
+        // the query is echoed back; the two numbers are this build's own.
+        AskRequest::TooLong { bytes } => {
+            return (
+                "400 Bad Request",
+                serialize(&json!({
+                    "error": "the query is too long to search",
+                    "reason": "query-too-long",
+                    "bytes": bytes,
+                    "max_bytes": MAX_QUERY_BYTES,
+                })),
+            );
+        }
+    };
+    let served = service.snapshot();
+    let parsed = Query::parse(query);
+    // Parsed but never scored when there is nothing to score on — the same refusal `qanungo ask`
+    // makes before it touches the archive, made here before it touches the corpus.
+    let ask = (!parsed.is_empty()).then(|| served.ask.search(&parsed, &service.redactor, limit));
+    (
+        "200 OK",
+        serialize(
+            &dashboard::AskAnswer {
+                query: &parsed,
+                limit,
+                ask: ask.as_ref(),
+                corpus: &served.ask,
+                refreshed: Refreshed {
+                    // The **fold's** generation, not the publication's: it is the number the
+                    // payload's own provenance block carries, and the page compares the two to
+                    // decide whether an answer it is still showing predates the corpus in hand. A
+                    // stale re-stamp bumps the publication and re-reads nothing, so stamping that
+                    // here would tell a reader to search again for a corpus that never moved.
+                    generation: served.fold_generation,
+                    at: served.refreshed_at,
+                    stale_since: served.stale_since,
+                },
+                redactor: &service.redactor,
+            }
+            .build(),
+        ),
+    )
 }
 
 /// One refusal, as JSON. The hash and the locator are echoed back because both have already been
@@ -945,7 +1139,7 @@ fn logged_request(method: &str, target: &str) -> String {
     request
 }
 
-/// Which of the four routes a request is for.
+/// Which of the five routes a request is for.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
     /// The embedded page.
@@ -960,10 +1154,27 @@ enum Route {
         source_hash: String,
         locator: u64,
     },
+    /// One ranked search over the current generation's summary corpus, already bounded.
+    Ask(AskRequest),
     NotFound,
 }
 
-/// Routes a request. `GET` only, case-sensitively, and the query string decides nothing.
+/// One ask request as the router settled it, before anything has been parsed or scored.
+///
+/// Two arms rather than an `Option`, because an over-long query is **refused with a status** and a
+/// missing one is answered: "you sent me a kilobyte" and "you sent me nothing to search on" are
+/// different sentences, and the second is one of this lane's three honest answers rather than an
+/// error. Both are decided in [`route`], so a request that will be refused never becomes a lookup
+/// against what this process holds.
+#[derive(Debug, PartialEq, Eq)]
+enum AskRequest {
+    /// A query inside the cap, percent-decoded, with the limit already clamped.
+    Search { query: String, limit: usize },
+    /// The raw `q` was over [`MAX_QUERY_BYTES`] and was refused before it was decoded.
+    TooLong { bytes: usize },
+}
+
+/// Routes a request. `GET` only, case-sensitively.
 ///
 /// There is no 405: a non-`GET` request to this surface is not a method mismatch worth negotiating,
 /// it is a caller who has the wrong server. Nothing is read from the filesystem, so path traversal
@@ -974,17 +1185,114 @@ enum Route {
 /// store cannot come to disagree about what a hash is — and a bare bounded positive integer. A
 /// target with a trailing slash, an extra segment, an uppercase hex digit, or a locator with a sign
 /// is not a repairable request; it is not this route.
+///
+/// # The one route whose query string is its argument
+///
+/// For four of the five, the query string decides nothing and is discarded before anything else
+/// happens. `/api/ask` is the exception and is bounded in the same breath as it is read: `q` capped
+/// and `limit` clamped by [`ask_route`], every other parameter ignored. What has not changed is the
+/// thing that sentence was ever protecting — **no parameter on this surface selects a redaction
+/// posture, a window, a scope, or a session**, so nothing a caller writes can make this process say
+/// something about the archive it would not otherwise say.
 fn route(method: &str, target: &str) -> Route {
     if method != "GET" {
         return Route::NotFound;
     }
-    let path = target.split('?').next().unwrap_or(target);
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (target, ""),
+    };
     match path {
         "/" | "/index.html" => Route::Page,
         "/api/data" => Route::Data,
         "/api/events" => Route::Events,
+        "/api/ask" => Route::Ask(ask_route(query)),
         _ => evidence_route(path),
     }
+}
+
+/// `?q=<terms>&limit=<n>`, bounded.
+///
+/// Both parameters are optional and neither is trusted. An absent, empty, or unparseable `limit`
+/// takes [`DEFAULT_ASK_LIMIT`] and any value is clamped into `1..=`[`MAX_ASK_LIMIT`]; an absent `q`
+/// is an empty query, which is answered rather than refused. The **first** occurrence of each key
+/// wins — a fixed rule rather than last-wins, so `?q=a&q=b` has one meaning and not two.
+///
+/// The cap is measured on the raw value before [`decode_query_value`] touches it, which is the
+/// point: percent-decoding can only shrink a value, so refusing on the encoded length bounds both
+/// and does it before this process has spent anything on the request.
+fn ask_route(query: &str) -> AskRequest {
+    let raw = query_parameter(query, "q").unwrap_or("");
+    if raw.len() > MAX_QUERY_BYTES {
+        return AskRequest::TooLong { bytes: raw.len() };
+    }
+    let limit = query_parameter(query, "limit")
+        .and_then(|value| decode_query_value(value).parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ASK_LIMIT)
+        .clamp(1, MAX_ASK_LIMIT);
+    AskRequest::Search {
+        query: decode_query_value(raw),
+        limit,
+    }
+}
+
+/// The first value of `name` in a query string, undecoded, or `None` when the key is not there.
+///
+/// A bare key (`?q`) reads as absent rather than as an empty value: there is no difference worth
+/// distinguishing on this route, and treating it as present would be inventing one.
+fn query_parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value)
+}
+
+/// Percent-decoding, for the one route that reads a parameter.
+///
+/// Hand-rolled rather than a dependency, on the same reasoning the rest of this lane is hand-rolled
+/// (munshi ADR 0006): it is a dozen lines and the alternative is a crate on a path that has to be
+/// auditable. `+` is a space, `%XX` is a byte, and anything else is itself — a lone `%` or a `%` with
+/// a bad tail is passed through rather than refused, because this is a *search query* and the honest
+/// answer to a malformed escape is to search for what was sent.
+///
+/// The decoded bytes are read back as UTF-8 **lossily**. A caller can send any byte here; what comes
+/// out is a `String`, and [`crate::ask::Query::parse`] then keeps only its alphanumeric runs, so
+/// nothing a caller chose reaches an answer or a log except through that filter and
+/// [`format::logged`].
+fn decode_query_value(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => match hex_byte(bytes[index + 1], bytes[index + 2]) {
+                Some(byte) => {
+                    decoded.push(byte);
+                    index += 3;
+                }
+                None => {
+                    decoded.push(b'%');
+                    index += 1;
+                }
+            },
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Two hex digits as the byte they spell, in either case, or `None` when they are not two hex digits.
+fn hex_byte(high: u8, low: u8) -> Option<u8> {
+    let digit = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
+    Some(digit(high)? << 4 | digit(low)?)
 }
 
 /// `/api/evidence/<64 hex>/<locator>`, or nothing.
@@ -1063,8 +1371,46 @@ fn write_response<W: Write>(
 mod tests {
     use super::*;
 
+    /// A corpus with nothing in it, for the tests that are about the payload plumbing rather than
+    /// about the search. An archive whose every session is unreadable is exactly this state, so it
+    /// is a real value and not only a stand-in.
+    fn empty_corpus() -> Arc<command::AskCorpus> {
+        Arc::new(command::AskCorpus::over(Utc::now(), Vec::new(), 0))
+    }
+
+    /// One search request, as the handler answers it.
+    fn ask(service: &Service, target: &str) -> (&'static str, serde_json::Value) {
+        let Route::Ask(request) = route("GET", target) else {
+            panic!("{target} is the ask route");
+        };
+        let (status, body) = ask_response(service, &request);
+        (
+            status,
+            serde_json::from_slice(&body).expect("the answer is JSON"),
+        )
+    }
+
+    /// A service over an empty corpus, which is all the two refusal paths need.
+    fn service_over_nothing() -> (Service, tempfile::TempDir) {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let service = Service::new(
+            Served {
+                generation: 2,
+                fold_generation: 2,
+                refreshed_at: Utc::now(),
+                stale_since: None,
+                body: b"{}".to_vec(),
+                evidence: EvidenceIndex::default(),
+                ask: empty_corpus(),
+            },
+            BlobCache::open(scratch.path()).expect("a scratch cache"),
+            Redactor::new(),
+        );
+        (service, scratch)
+    }
+
     #[test]
-    fn the_four_routes_are_the_only_routes() {
+    fn the_five_routes_are_the_only_routes() {
         assert_eq!(route("GET", "/"), Route::Page);
         assert_eq!(route("GET", "/index.html"), Route::Page);
         assert_eq!(route("GET", "/api/data"), Route::Data);
@@ -1076,6 +1422,13 @@ mod tests {
                 locator: 12,
             },
         );
+        assert_eq!(
+            route("GET", "/api/ask?q=redaction&limit=3"),
+            Route::Ask(AskRequest::Search {
+                query: "redaction".to_owned(),
+                limit: 3,
+            }),
+        );
         for target in [
             "/api",
             "/api/data/",
@@ -1085,8 +1438,15 @@ mod tests {
             "/api/v1/artifacts/abc/content",
             "/api/evidence",
             "/api/evidence/",
+            // The ask route is one exact path, like the other four: a trailing slash or a segment
+            // under it is not a narrower search, it is not this route.
+            "/api/ask/",
+            "/api/ask/redaction",
         ] {
             assert_eq!(route("GET", target), Route::NotFound, "{target}");
+        }
+        for method in ["POST", "PUT", "DELETE", "HEAD", "get"] {
+            assert_eq!(route(method, "/api/ask?q=x"), Route::NotFound, "{method}");
         }
     }
 
@@ -1142,14 +1502,162 @@ mod tests {
         }
     }
 
-    /// A query string is a caller's business and never the server's: `/api/data?since=x` is the
-    /// same route as `/api/data`, and no route reads a parameter at all — a per-request knob on a
-    /// surface with a redaction posture is exactly what the grilling ruled out.
+    /// A query string is a caller's business and never the server's on the four routes that answer
+    /// from the served payload: `/api/data?since=x` is the same route as `/api/data`, and none of
+    /// them reads a parameter at all — a per-request knob on a surface with a redaction posture is
+    /// exactly what the grilling ruled out.
     #[test]
-    fn query_strings_do_not_change_the_route() {
+    fn query_strings_do_not_change_the_four_payload_routes() {
         assert_eq!(route("GET", "/api/data?cachebust=1"), Route::Data);
         assert_eq!(route("GET", "/?x=y"), Route::Page);
         assert_eq!(route("GET", "/api/events?last=99"), Route::Events);
+        assert_eq!(
+            route("GET", &format!("/api/evidence/{}/1?raw=1", "a".repeat(64))),
+            Route::Evidence {
+                source_hash: "a".repeat(64),
+                locator: 1,
+            },
+        );
+    }
+
+    /// The ask route is the one that reads its query string, and what it will read is two keys.
+    ///
+    /// The sentence the exception has to survive is the one above: no parameter on this surface
+    /// selects a redaction posture, a window, a scope, or a session. So every other key here —
+    /// including ones named after the page's own scope controls — is ignored rather than
+    /// interpreted, and a request carrying them is the *same* request as one that does not.
+    #[test]
+    fn the_ask_route_reads_two_parameters_and_ignores_every_other() {
+        let plain = route("GET", "/api/ask?q=redaction");
+        assert_eq!(
+            plain,
+            Route::Ask(AskRequest::Search {
+                query: "redaction".to_owned(),
+                limit: DEFAULT_ASK_LIMIT,
+            }),
+        );
+        for target in [
+            "/api/ask?q=redaction&repository=surdy/qanungo",
+            "/api/ask?q=redaction&device=macbookpro&harness=claude-code",
+            "/api/ask?q=redaction&last=30d",
+            "/api/ask?redact=off&q=redaction",
+            "/api/ask?q=redaction&verbatim=1",
+        ] {
+            assert_eq!(route("GET", target), plain, "{target}");
+        }
+        // No `q` at all is an empty query — answered, not refused. See `ask_response`.
+        assert_eq!(
+            route("GET", "/api/ask"),
+            Route::Ask(AskRequest::Search {
+                query: String::new(),
+                limit: DEFAULT_ASK_LIMIT,
+            }),
+        );
+        // The first occurrence of a key wins, so a repeated one has one meaning and not two.
+        assert_eq!(route("GET", "/api/ask?q=first&q=second"), {
+            Route::Ask(AskRequest::Search {
+                query: "first".to_owned(),
+                limit: DEFAULT_ASK_LIMIT,
+            })
+        });
+    }
+
+    /// `limit` is clamped rather than trusted or refused: this is a browser's request, so it gets an
+    /// answer, and the answer says which limit was used.
+    #[test]
+    fn the_ask_limit_is_clamped_into_its_range() {
+        let limit_of = |target: &str| match route("GET", target) {
+            Route::Ask(AskRequest::Search { limit, .. }) => limit,
+            other => panic!("{target} is a search: {other:?}"),
+        };
+        assert_eq!(limit_of("/api/ask?q=x&limit=3"), 3);
+        assert_eq!(limit_of("/api/ask?q=x&limit=0"), 1, "never nothing");
+        assert_eq!(limit_of("/api/ask?q=x&limit=9999"), MAX_ASK_LIMIT);
+        assert_eq!(
+            limit_of("/api/ask?q=x&limit=-1"),
+            DEFAULT_ASK_LIMIT,
+            "unparseable is the default, not an error",
+        );
+        assert_eq!(limit_of("/api/ask?q=x&limit=lots"), DEFAULT_ASK_LIMIT);
+        assert_eq!(limit_of("/api/ask?q=x&limit="), DEFAULT_ASK_LIMIT);
+        assert_eq!(limit_of("/api/ask?q=x"), DEFAULT_ASK_LIMIT);
+    }
+
+    /// The cap is on the raw value and is checked at the router, before a single byte is decoded —
+    /// so a kilobyte of somebody's choosing never becomes terms, let alone a scan of every summary.
+    #[test]
+    fn an_over_long_query_is_refused_before_it_is_decoded() {
+        let inside = "a".repeat(MAX_QUERY_BYTES);
+        assert_eq!(
+            route("GET", &format!("/api/ask?q={inside}")),
+            Route::Ask(AskRequest::Search {
+                query: inside,
+                limit: DEFAULT_ASK_LIMIT,
+            }),
+            "the cap is inclusive",
+        );
+        let over = "a".repeat(MAX_QUERY_BYTES + 1);
+        assert_eq!(
+            route("GET", &format!("/api/ask?q={over}")),
+            Route::Ask(AskRequest::TooLong {
+                bytes: MAX_QUERY_BYTES + 1
+            }),
+        );
+        // Measured on the *encoded* value: escapes only shrink, so this is the bound on both.
+        let escaped = "%41".repeat(MAX_QUERY_BYTES);
+        assert!(matches!(
+            route("GET", &format!("/api/ask?q={escaped}")),
+            Route::Ask(AskRequest::TooLong { .. }),
+        ));
+
+        let (service, _scratch) = service_over_nothing();
+        let (status, body) = ask(&service, &format!("/api/ask?q={}", "a".repeat(4096)));
+        assert_eq!(status, "400 Bad Request");
+        // The page renders `error` to the reader and matches on `reason`, so both are pinned.
+        assert_eq!(body["error"], "the query is too long to search");
+        assert_eq!(body["reason"], "query-too-long");
+        assert_eq!(body["max_bytes"], MAX_QUERY_BYTES);
+        assert_eq!(body["bytes"], 4096);
+        // Not one byte of what was sent comes back: the refusal is made of this build's own words
+        // and two numbers.
+        assert!(
+            !serde_json::to_string(&body).unwrap().contains("aaaa"),
+            "{body}",
+        );
+    }
+
+    /// Percent-decoding, for the one route that reads a parameter. A malformed escape is searched
+    /// for rather than refused — this is a query box, and the honest answer to `50%` is to look for
+    /// what was typed.
+    #[test]
+    fn a_query_value_is_percent_decoded_and_a_bad_escape_is_kept() {
+        assert_eq!(decode_query_value("payments+api"), "payments api");
+        assert_eq!(decode_query_value("payments%20api"), "payments api");
+        assert_eq!(decode_query_value("price%2Dtable"), "price-table");
+        assert_eq!(decode_query_value("%E2%9C%93"), "✓");
+        assert_eq!(decode_query_value("100%"), "100%");
+        assert_eq!(decode_query_value("50%zz"), "50%zz");
+        assert_eq!(decode_query_value("%2"), "%2");
+        assert_eq!(decode_query_value(""), "");
+        assert_eq!(hex_byte(b'4', b'1'), Some(b'A'));
+        assert_eq!(hex_byte(b'e', b'2'), Some(0xe2));
+        assert_eq!(hex_byte(b'E', b'2'), Some(0xe2));
+        assert_eq!(hex_byte(b'z', b'1'), None);
+    }
+
+    /// A query with no word to search on is answered rather than refused, and answered without
+    /// ranking anything — the same short path `qanungo ask` takes before it touches the archive.
+    #[test]
+    fn a_query_with_nothing_to_search_on_is_an_answer() {
+        let (service, _scratch) = service_over_nothing();
+        let (status, body) = ask(&service, "/api/ask?q=the+a+of");
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["state"], "no-searchable-terms");
+        assert_eq!(body["query"]["terms"], serde_json::json!([]));
+        assert_eq!(body["hits"], serde_json::json!([]));
+        assert_eq!(body["corpus"]["generation"], 2);
+        // And so is no `q` at all.
+        assert_eq!(ask(&service, "/api/ask").1["state"], "no-searchable-terms");
     }
 
     /// Read-only by construction: there is no verb here but `GET`, and the match is case-sensitive
@@ -1264,10 +1772,13 @@ mod tests {
     fn a_refresh_notice_is_one_line_of_parseable_json() {
         let served = Served {
             evidence: EvidenceIndex::default(),
+            ask: empty_corpus(),
             generation: 7,
+            fold_generation: 7,
             refreshed_at: DateTime::parse_from_rfc3339("2026-08-24T09:30:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            stale_since: None,
             body: Vec::new(),
         };
         let notice = served.notice();
@@ -1391,6 +1902,7 @@ mod tests {
             PAGE.contains("/api/events"),
             "the page subscribes to refreshes"
         );
+        assert!(PAGE.contains("/api/ask?q="), "the page can search");
         // The three sections the payload feeds, each fed from its own key rather than from a
         // second fetch: one document, one generation, and no route added to serve a section.
         for section in ["data.cost", "data.standup", "data.lanes", "data.findings"] {
@@ -1398,8 +1910,8 @@ mod tests {
         }
         assert_eq!(
             PAGE.matches("fetch(").count(),
-            2,
-            "the payload and one excerpt at a time, and nothing else",
+            3,
+            "the payload, one excerpt at a time, and one search — and nothing else",
         );
         assert!(
             !PAGE.contains("href"),
@@ -1425,9 +1937,12 @@ mod tests {
         let service = Arc::new(Service::new(
             Served {
                 generation: 1,
+                fold_generation: 1,
                 refreshed_at: Utc::now(),
+                stale_since: None,
                 body: br#"{"generation":1,"stale_since":null}"#.to_vec(),
                 evidence: EvidenceIndex::default(),
+                ask: empty_corpus(),
             },
             BlobCache::open(scratch.path()).expect("a scratch cache"),
             Redactor::new(),
@@ -1457,9 +1972,12 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         service.publish(Served {
             generation: 2,
+            fold_generation: 2,
             refreshed_at: Utc::now(),
+            stale_since: None,
             body: br#"{"generation":2,"stale_since":null}"#.to_vec(),
             evidence: EvidenceIndex::default(),
+            ask: empty_corpus(),
         });
         assert_eq!(waiter.join().expect("the waiter did not panic"), Some(2));
         assert_eq!(service.snapshot().generation, 2);
@@ -1476,9 +1994,14 @@ mod tests {
         let service = Service::new(
             Served {
                 generation: 4,
+                fold_generation: 4,
                 refreshed_at: taken_at,
-                body: br#"{"provenance":{"sessions_folded":703,"stale_since":null}}"#.to_vec(),
+                stale_since: None,
+                body:
+                    br#"{"provenance":{"generation":4,"sessions_folded":703,"stale_since":null}}"#
+                        .to_vec(),
                 evidence: EvidenceIndex::default(),
+                ask: empty_corpus(),
             },
             BlobCache::open(scratch.path()).expect("a scratch cache"),
             Redactor::new(),
@@ -1494,6 +2017,10 @@ mod tests {
             "a page's numbers going stale is a change"
         );
         assert_eq!(
+            served.fold_generation, 4,
+            "the fold behind it did not move, and nothing that reads it may say otherwise",
+        );
+        assert_eq!(
             served.refreshed_at, taken_at,
             "the payload is still the fold it was, taken when it was",
         );
@@ -1503,8 +2030,79 @@ mod tests {
             "2026-08-24T09:05:00Z"
         );
         assert_eq!(
+            document["provenance"]["generation"], 4,
+            "the document still names the fold it is showing, never a refresh that never happened",
+        );
+        assert_eq!(
             document["provenance"]["sessions_folded"], 703,
             "the numbers survive the restamp",
+        );
+    }
+
+    /// The property the two generation fields exist for: **a search and the document beside it name
+    /// one fold**, through a failing run.
+    ///
+    /// The page decides whether an answer it is still showing predates the corpus in hand by
+    /// comparing the answer's `corpus.generation` against the payload's `provenance.generation`. A
+    /// stale re-stamp bumps the *publication* and re-reads nothing, so an answer stamped with the
+    /// publication would sit a generation ahead of the payload and the page would tell a reader to
+    /// search again for a corpus that had not moved — a wrong instruction, and inverted.
+    ///
+    /// This is what [`a_stale_corpus_dates_its_answer_rather_than_refusing_it`] in
+    /// [`crate::dashboard`] could not see: it builds one answer from one [`Refreshed`] and never
+    /// meets the re-stamp that makes the two numbers differ.
+    #[test]
+    fn a_stale_republish_keeps_an_answer_and_the_payload_on_one_generation() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let service = Service::new(
+            Served {
+                generation: 6,
+                fold_generation: 6,
+                refreshed_at: DateTime::parse_from_rfc3339("2026-08-24T09:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                stale_since: None,
+                body: br#"{"provenance":{"generation":6,"stale_since":null}}"#.to_vec(),
+                evidence: EvidenceIndex::default(),
+                ask: empty_corpus(),
+            },
+            BlobCache::open(scratch.path()).expect("a scratch cache"),
+            Redactor::new(),
+        );
+        // Healthy: the publication, the document, and an answer all agree.
+        let stated = |service: &Service| {
+            let document: serde_json::Value =
+                serde_json::from_slice(&service.snapshot().body).expect("the body is JSON");
+            let answered = ask(service, "/api/ask?q=redaction").1;
+            (
+                document["provenance"]["generation"].clone(),
+                answered["corpus"]["generation"].clone(),
+            )
+        };
+        let (document, answer) = stated(&service);
+        assert_eq!(document, 6);
+        assert_eq!(answer, document);
+
+        // Two failed refreshes later the publication is 8 and the fold is still 6 — and the answer
+        // has to say 6, because 6 is the fold it ranked.
+        let since = DateTime::parse_from_rfc3339("2026-08-24T09:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        republish_as_stale(&service, 7, since);
+        republish_as_stale(&service, 8, since);
+        assert_eq!(service.snapshot().generation, 8, "the swap is pushed");
+
+        let (document, answer) = stated(&service);
+        assert_eq!(document, 6, "the document still names its own fold");
+        assert_eq!(
+            answer, document,
+            "the answer and the payload must never sit a generation apart",
+        );
+        // And the answer says how old the corpus is, so the staleness is stated rather than hidden
+        // behind two numbers that happen to match.
+        assert_eq!(
+            ask(&service, "/api/ask?q=redaction").1["corpus"]["stale_since"],
+            "2026-08-24T09:05:00Z",
         );
     }
 }
