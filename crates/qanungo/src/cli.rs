@@ -134,6 +134,9 @@ pub enum Command {
     /// Find instructions you have had to repeat across sessions of one repository, as Markdown on
     /// stdout.
     Doctor(DoctorArgs),
+    /// Find requests you have repeated across the whole archive, and the multi-step flows they
+    /// fall into, as Markdown on stdout.
+    Flows(FlowsArgs),
     /// Serve the coaching report's own numbers as a read-only web page, refreshed in the
     /// background.
     Dashboard(DashboardArgs),
@@ -339,6 +342,74 @@ pub struct DoctorArgs {
         value_parser = parse_cluster_cap,
     )]
     pub clusters_per_repo: usize,
+
+    #[command(flatten)]
+    pub archive: ArchiveArgs,
+
+    #[command(flatten)]
+    pub redaction: RedactionArgs,
+}
+
+/// The flows lane (qanungo #13): requests you have repeated anywhere, and the sequences they fall
+/// into.
+///
+/// The read-only half of the skill & agent finder. It runs [`crate::doctor`]'s own detection
+/// machinery — the two share [`crate::repetition`] rather than forking it — over **one pool holding
+/// every session in the reach**, and then mines the recurring two- and three-step runs of the
+/// clusters that come out. It flattens [`RedactionArgs`] because those excerpts are transcript text
+/// somebody typed: this is the CLI's third verbatim surface, after `ask --verbatim` and `doctor`.
+///
+/// # The lens is the archive, deliberately
+///
+/// `doctor` groups per repository because an instruction file belongs to one. This lane pools
+/// everything, including the sessions the archive attributes to no repository at all, because the
+/// thing it looks for — a workflow worth a skill — is worth it wherever it recurs. Repositories are
+/// what a finding is *listed by* here, never what it is grouped by.
+///
+/// # No default window, like `ask` and `doctor`
+///
+/// "What do I keep doing?" is a question about all of history, so `--last` is optional and its
+/// absence means the whole archive — the [`AskArgs`] precedent, chosen for its reason: a lane that
+/// quietly searched only a recent window would answer a narrower question than the one that was
+/// typed.
+///
+/// # It folds transcripts, so a cold run downloads the archive
+///
+/// Same substrate as `doctor`, for the same reason: what is compared is what a *person* typed, and a
+/// `summary.md` is munshi's curated prose about a session rather than the session's own words. A
+/// first run with no `--last` mirrors the whole archive before it clusters anything; warm runs ride
+/// the shared blob cache and the snapshot index, and the footer reports what either one cost.
+///
+/// # Both cuts are defaults, not ceilings
+///
+/// `--clusters` and `--flows` raise what each section renders, on qanungo #16's finding and with its
+/// semantics: the cut is on the rendering alone, every count is taken before it, zero is refused,
+/// and the document states the number in force whenever it is not the default.
+#[derive(Debug, Args)]
+pub struct FlowsArgs {
+    /// Narrow the reading to `<count><unit>` of history, with unit `h`, `d`, or `w`. Omitted, it
+    /// covers the whole archive: "what do I keep doing" is a question about all of history, so this
+    /// lane has no default window.
+    #[arg(long = "last", value_parser = parse_window)]
+    pub last: Option<Window>,
+
+    /// How many repeated-request clusters to render, best first. The rest are counted and declared
+    /// as held back rather than dropped silently, so raise this to read them; the document states
+    /// the number in force whenever it is not the default.
+    #[arg(
+        long = "clusters",
+        default_value_t = crate::flows::DEFAULT_CLUSTERS,
+        value_parser = parse_cluster_cap,
+    )]
+    pub clusters: usize,
+
+    /// How many multi-step flows to render, best first, on the same terms as `--clusters`.
+    #[arg(
+        long = "flows",
+        default_value_t = crate::flows::DEFAULT_FLOWS,
+        value_parser = parse_cluster_cap,
+    )]
+    pub flows: usize,
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
@@ -621,7 +692,7 @@ mod tests {
         for bad in ["0", "9", "64", "-1", "many"] {
             assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
         }
-        for command in ["report", "cost", "standup", "doctor", "dashboard"] {
+        for command in ["report", "cost", "standup", "doctor", "flows", "dashboard"] {
             assert!(Cli::try_parse_from(["qanungo", command, "--concurrency", "64"]).is_err());
         }
     }
@@ -730,8 +801,66 @@ mod tests {
         // Doctor quotes the repeated instruction itself, so it takes them too.
         assert!(Cli::try_parse_from(["qanungo", "doctor", "--no-redact"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "doctor", "--filter-profanity"]).is_ok());
+        // Flows quotes the repeated request and every step of a flow — the third verbatim surface.
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--no-redact"]).is_ok());
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--filter-profanity"]).is_ok());
         assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
         assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
+    }
+
+    /// Flows is the third lane with no default window, for `ask` and `doctor`'s reason: "what do I
+    /// keep doing" is a lifetime question. It takes no positional argument either — there is
+    /// nothing to search *for*, only history to read.
+    #[test]
+    fn flows_reads_all_history_until_a_window_narrows_it() {
+        let Command::Flows(args) = Cli::parse_from(["qanungo", "flows"]).command else {
+            panic!("`flows` parses as the flows command");
+        };
+        assert!(args.last.is_none(), "no window means all of history");
+        assert_eq!(args.clusters, crate::flows::DEFAULT_CLUSTERS);
+        assert_eq!(args.flows, crate::flows::DEFAULT_FLOWS);
+        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
+        assert!(args.archive.cache_dir.is_none());
+        assert!(!args.redaction.no_redact, "the scrub is the default");
+
+        let Command::Flows(scoped) = Cli::parse_from(["qanungo", "flows", "--last", "4w"]).command
+        else {
+            panic!("`flows` parses as the flows command");
+        };
+        assert_eq!(
+            scoped.last.expect("a window was given").delta(),
+            TimeDelta::weeks(4),
+        );
+
+        // The grammar is the crate's, so the month unit is refused here too, and the lane takes no
+        // positional argument.
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--last", "5m"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "flows", "payments"]).is_err());
+    }
+
+    /// Both of the flows lane's cuts are numbers the operator can move, refused at zero on
+    /// `--clusters-per-repo`'s reasoning: a section that can show no finding is not a shorter
+    /// document, it is a heading with a footnote under it.
+    #[test]
+    fn flows_takes_two_caps_and_refuses_zero_on_either() {
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--clusters", "0"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--flows", "0"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--clusters", "many"]).is_err());
+
+        let Command::Flows(args) =
+            Cli::parse_from(["qanungo", "flows", "--clusters", "50", "--flows", "5"]).command
+        else {
+            panic!("`flows` parses as the flows command");
+        };
+        assert_eq!(args.clusters, 50);
+        assert_eq!(args.flows, 5);
+
+        // They are this lane's own cuts: neither `doctor` nor any other lane learned them, and this
+        // lane did not learn `doctor`'s.
+        assert!(Cli::try_parse_from(["qanungo", "doctor", "--clusters", "50"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "flows", "--clusters-per-repo", "50"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "report", "--flows", "5"]).is_err());
     }
 
     /// Doctor is the second lane with no default window, for `ask`'s reason: "have I been repeating

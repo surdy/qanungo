@@ -218,6 +218,37 @@
 //! - **The CLI's second verbatim surface.** Clustering reads the transcript's own bytes — a secret
 //!   must not change what clusters — and the one excerpt a cluster renders is scrubbed on the way
 //!   in, through the same scrub-collapse-clip pipeline `ask --verbatim` quotes with.
+//!
+//! # The skill & agent finder (qanungo #13)
+//!
+//! ```text
+//! qanungo flows
+//! ```
+//!
+//! is the sixth lane and the read-only half of the skill & agent finder ([`flows`],
+//! [`flows_report`]). It runs the doctor's detection machinery — the two share [`repetition`]
+//! rather than forking it, and the doctor's output is unchanged by the factoring — through the
+//! opposite lens:
+//!
+//! - **The pool is the archive, not a repository.** An instruction file belongs to a repository, so
+//!   the doctor groups by one; a workflow worth a skill is worth it *wherever* it recurs, so this
+//!   lane compares every session against every other and lists a finding by the repositories it
+//!   turned up in. Sessions the archive attributes to no repository join the comparison here, where
+//!   the doctor sets them aside — a repeated request needs no repository to be one.
+//! - **Flows are sequences of clusters, mined per session.** Within one session, the clustered
+//!   messages in file order are a sequence of cluster ids, and the recurring two- and three-step
+//!   runs of that sequence are the findings. Adjacency is among *clustered* messages, so ordinary
+//!   conversation between two steps does not break them apart; a request restated back-to-back
+//!   collapses to one step; and a flow must recur in two distinct conversations, which the same
+//!   merge that protects the doctor supplies.
+//! - **Requests, never outcomes.** Nothing here reads whether a flow worked or what it produced, and
+//!   an ordering in a transcript is not a cause. Whether a repetition is worth tooling is the
+//!   `contrib/skills/skill-finder` half's judgement, made with the user under their own permission
+//!   prompts.
+//! - **The CLI's third verbatim surface**, on the doctor's terms: cluster unscrubbed, scrub every
+//!   rendered excerpt on the way in. The pooled lens makes one noise class worse rather than better
+//!   — injected prose the authored filter cannot certify clusters with itself in every repository at
+//!   once — so the document names it in its own preamble instead of guessing at a semantic filter.
 
 pub mod ask;
 pub mod ask_report;
@@ -231,6 +262,8 @@ pub mod dashboard_server;
 pub mod doctor;
 pub mod doctor_report;
 pub mod evidence;
+pub mod flows;
+pub mod flows_report;
 pub mod format;
 pub mod heatmap;
 pub mod http;
@@ -238,6 +271,7 @@ pub mod metrics;
 pub mod patwari;
 pub mod pricing;
 pub mod redaction;
+pub mod repetition;
 pub mod report;
 pub mod rules;
 pub mod scopes;

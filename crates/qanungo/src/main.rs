@@ -45,6 +45,7 @@ fn run(command: &Command) -> Result<(), Box<dyn Error>> {
         Command::Standup(args) => command::standup(args, &mut out)?,
         Command::Ask(args) => command::ask(args, &mut out)?,
         Command::Doctor(args) => command::doctor(args, &mut out)?,
+        Command::Flows(args) => command::flows(args, &mut out)?,
         Command::Dashboard(args) => return Ok(dashboard_server::run(args)?),
     }
     out.flush().map_err(command::CommandError::Output)?;

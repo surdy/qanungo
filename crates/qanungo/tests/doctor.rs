@@ -89,7 +89,7 @@ impl Archive {
             .cache
             .open_blob(&mirrored.source_hash)
             .expect("the blob is readable");
-        let messages = qanungo::doctor::read_messages(
+        let messages = qanungo::repetition::read_messages(
             source_for_agent(&mirrored.source_agent).expect("this build interprets claude-code"),
             mirrored.artifact_set_version,
             BufReader::new(blob),

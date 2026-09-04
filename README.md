@@ -28,7 +28,7 @@ ADR 0012 anticipated qanungo carrying "application commands such as a prompt-cor
 - **ask** — plain-language questions over your history ("have I touched the payments API?"), backed by the `session-recall` funnel: Notesmith search → hash → verbatim grep in Patwari.
 - **instructions-doctor** — mines sessions for instructions you have had to give more than once in one repository, quotes each repetition and cites the transcript moments it happened at, and leaves the `CLAUDE.md` / `AGENTS.md` edit to a harness skill. It reports repetition; it never claims a missing instruction *caused* anything, because nothing it reads could support that.
 - **cost** — token/cost breakdown by model/repo/machine, and premium-waste flags.
-- **skill & agent finder** — detects repeated multi-step prompt patterns and drafts a reusable skill or custom subagent from them.
+- **skill & agent finder** — detects repeated requests and the multi-step flows they fall into, pooled across the whole archive rather than per repository, and leaves drafting the reusable skill or custom subagent to a harness skill. It reports requests, never outcomes: an ordering in a transcript is not a cause, and whether a repetition is worth tooling is yours to decide.
 
 ## The dashboard
 
@@ -38,7 +38,7 @@ A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mir
 
 ## Skills & agents
 
-Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, `/coach`, and — the one that proposes a write — `instructions-editor`, over `qanungo doctor`. Beside them sits one remaining scaffold, `skill-finder`, waiting on the command behind it (#13); what else the directory grows is that issue's business, not this README's. None of them write derived data back into the archive: they render or propose; you decide.
+Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, `/coach`, and the two that propose a write — `instructions-editor`, over `qanungo doctor`, and `skill-finder`, over `qanungo flows`. What else the directory grows is the issues' business, not this README's. None of them write derived data back into the archive: they render or propose; you decide.
 
 ## Design rules (inherited, non-negotiable)
 
@@ -158,6 +158,8 @@ cargo run -- dashboard --cost-last 4w --standup-last 3d   # narrow the bill and 
 cargo run -- doctor                                  # all of history, because that is the question
 cargo run -- doctor --last 4w                        # or narrow it, on the same grammar
 cargo run -- doctor --clusters-per-repo 50           # and read the clusters the default cut hides
+cargo run -- flows                                   # what do I keep asking for, anywhere
+cargo run -- flows --clusters 50 --flows 40          # each section's cut is a default, not a ceiling
 cargo run -- dashboard --bind 100.64.0.7:8878        # the tailnet, unauthenticated, and it says so
 ```
 
@@ -177,9 +179,9 @@ back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
 flags work on every lane. The coaching report renders **aggregates, tool names, and content hashes
 only**, and the cost report adds exactly the model, billing-modifier, and repository identifiers the
 archive itself recorded, each clamped on the way out — never transcript content, in either. The
-three documents that do render archived text — the standup's summary prose, `ask`'s matched
-snippets and `--verbatim` excerpts, and `doctor`'s repeated instructions — are the three that take
-`--no-redact` and `--filter-profanity`; there is no `--redact`, because losing the scrub should be
+four documents that do render archived text — the standup's summary prose, `ask`'s matched
+snippets and `--verbatim` excerpts, `doctor`'s repeated instructions, and `flows`' repeated requests
+and flow steps — are the four that take `--no-redact` and `--filter-profanity`; there is no `--redact`, because losing the scrub should be
 something a reader of the command line, and of the document's own footer, can see happened. Rule
 thresholds are named constants in `crates/qanungo/src/rules.rs`, and the scoring
 constants in `crates/qanungo/src/scoring.rs` are the same kind of knob — all explicitly arbitrary
@@ -225,6 +227,22 @@ those is what keeps one long conversation from reporting as a page of repetition
 CLI's second verbatim surface after `ask --verbatim`:
 the clustering reads the transcript's own bytes, so a credential cannot change what clusters, and
 the one excerpt each cluster renders is scrubbed before it is cut.
+
+Beside it sits the **skill & agent finder** ([#13](https://github.com/surdy/qanungo/issues/13)):
+`qanungo flows` runs that same detection machinery — the two share one module rather than forking it
+— through the opposite lens. The doctor groups per repository because an instruction file belongs to
+one; a workflow worth a skill is worth it **wherever** it recurs, so this lane pools every session in
+the reach into one comparison, takes in the sessions the archive attributes to no repository at all,
+and lists each finding by the repositories it turned up in. Over the clusters that come out it mines
+the recurring two- and three-step runs of each session's clustered messages, in order: adjacency is
+among *clustered* messages, so ordinary conversation between two steps does not break them apart, a
+request restated back-to-back collapses to one step, and a flow has to recur in two distinct
+conversations. It reads **requests and never outcomes** — nothing in it knows whether a flow worked
+— and it makes the doctor's one known noise class *worse* rather than better, which the document
+says out loud in its own preamble: harness-injected prose the authored filter cannot certify
+clusters with itself in every repository at once, which can genuinely make it the most repeated text
+in the corpus and still worth nothing. Triaging that, and drafting anything, is
+`contrib/skills/skill-finder`'s half.
 
 Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
 dashboard's own remaining slices — per-*device* scope once a hostname has accrued in the archive,

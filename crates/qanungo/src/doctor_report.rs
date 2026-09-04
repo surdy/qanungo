@@ -41,12 +41,14 @@ use chrono::{DateTime, Utc};
 
 use crate::cli::Window;
 use crate::doctor::{
-    Cluster, DEFAULT_CLUSTERS_PER_REPOSITORY, Doctor, Friction, MIN_CLUSTER_SESSIONS,
-    MIN_CLUSTERABLE_WORDS, MIN_SHARED_INSTRUCTIONS, RepositoryClusters, SAME_CONVERSATION_PERCENT,
-    SHINGLE_WORDS, SIMILARITY_THRESHOLD_PERCENT,
+    Cluster, DEFAULT_CLUSTERS_PER_REPOSITORY, Doctor, Friction, RepositoryClusters,
 };
 use crate::format;
 use crate::redaction::{PATTERN_REVISION, Redactor};
+use crate::repetition::{
+    MIN_CLUSTER_SESSIONS, MIN_CLUSTERABLE_WORDS, MIN_SHARED_INSTRUCTIONS,
+    SAME_CONVERSATION_PERCENT, SHINGLE_WORDS, SIMILARITY_THRESHOLD_PERCENT,
+};
 use crate::report::{SkippedNote, stamp};
 use crate::standup_report::{redaction_counts, redaction_line};
 use crate::sync::SyncStats;
@@ -405,8 +407,9 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doctor::{Citation, Unexamined};
+    use crate::doctor::Unexamined;
     use crate::redaction::RedactionReport;
+    use crate::repetition::Citation;
 
     fn at(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

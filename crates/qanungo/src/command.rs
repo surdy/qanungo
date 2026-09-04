@@ -89,11 +89,15 @@ use thiserror::Error;
 use crate::ask::{Ask, Escalation, Query};
 use crate::ask_report::{AskInstrumentation, AskReport, VerbatimStats};
 use crate::cache::BlobCache;
-use crate::cli::{ArchiveArgs, AskArgs, CostArgs, DoctorArgs, ReportArgs, StandupArgs, Window};
+use crate::cli::{
+    ArchiveArgs, AskArgs, CostArgs, DoctorArgs, FlowsArgs, ReportArgs, StandupArgs, Window,
+};
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
 use crate::doctor::{Doctor, DoctorSession};
 use crate::doctor_report::{DoctorInstrumentation, DoctorReport};
+use crate::flows::{Flows, FlowsSession};
+use crate::flows_report::{FlowsInstrumentation, FlowsReport};
 use crate::format;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
@@ -764,7 +768,7 @@ pub fn fold_doctor(
     let mut skipped = prepared.mirror.skipped.clone();
     let mut sessions = Vec::with_capacity(placed.reported.len());
     for session in &placed.reported {
-        match read_one_doctor(&prepared.cache, session) {
+        match read_one_transcript(&prepared.cache, session) {
             Ok(messages) => sessions.push(DoctorSession {
                 source_hash: session.source_hash.clone(),
                 archived_at: session.archived_at,
@@ -806,12 +810,16 @@ pub fn fold_doctor(
 }
 
 /// Reads one cached transcript's user messages, streaming it off disk rather than reading it whole.
-fn read_one_doctor(
+///
+/// Shared by `doctor` and `flows`: the two lanes read the same substrate and differ only in how they
+/// pool what comes out of it, so a second reader would be a second place for "what a person typed"
+/// to come to mean something slightly different.
+fn read_one_transcript(
     cache: &BlobCache,
     mirrored: &MirroredSession,
-) -> Result<crate::doctor::SessionMessages, SkipReason> {
+) -> Result<crate::repetition::SessionMessages, SkipReason> {
     let (source, blob) = open_for_fold(cache, mirrored)?;
-    crate::doctor::read_messages(source, mirrored.artifact_set_version, BufReader::new(blob))
+    crate::repetition::read_messages(source, mirrored.artifact_set_version, BufReader::new(blob))
         .map_err(|error| SkipReason::Unreadable(error.to_string()))
 }
 
@@ -833,6 +841,106 @@ pub fn doctor(args: &DoctorArgs, out: &mut impl Write) -> Result<(), CommandErro
         clusters_per_repo: args.clusters_per_repo,
         generated_at: folded.generated_at,
         doctor: &folded.doctor,
+        instrumentation: &folded.instrumentation,
+    }
+    .render();
+
+    out.write_all(markdown.as_bytes())
+        .map_err(CommandError::Output)
+}
+
+/// What `fold_flows` returns: the clustering, the mined flows, and what they cost.
+pub struct FoldedFlows {
+    pub generated_at: DateTime<Utc>,
+    pub flows: Flows,
+    pub instrumentation: FlowsInstrumentation,
+}
+
+/// Runs the flows lane's `sync → read → cluster → mine` over one reach (qanungo #13).
+///
+/// The mirror, the substrate and the gap handling are [`fold_doctor`]'s, line for line: both lanes
+/// read `transcript.jsonl` because what they compare is what a *person* typed, both take the whole
+/// archive when `window` is `None`, and both hand the mirror's own scrubbed gap summary to the fold
+/// so the document's footer counts it. The single difference is downstream of here — [`Flows::fold`]
+/// pools every session into one comparison where [`Doctor::fold`] groups by repository first.
+///
+/// Everything the fold renders is scrubbed inside [`Flows::fold`], so [`FoldedFlows`] carries no
+/// pre-scrub string for any surface to leak.
+///
+/// # Errors
+///
+/// Returns an error when the cache is unusable or the archive cannot be listed. A session whose
+/// transcript this build cannot read is a stated gap, never a failed run.
+pub fn fold_flows(
+    archive: &ArchiveArgs,
+    window: Option<&Window>,
+    redactor: Redactor,
+    clusters: usize,
+    flows: usize,
+) -> Result<FoldedFlows, CommandError> {
+    let prepared = match window {
+        Some(window) => Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowOnly)?,
+        None => Prepared::mirror_all(archive, Artifact::Transcript)?,
+    };
+
+    let fold_started = Instant::now();
+    let placed = prepared.placement();
+    let mut skipped = prepared.mirror.skipped.clone();
+    let mut sessions = Vec::with_capacity(placed.reported.len());
+    for session in &placed.reported {
+        match read_one_transcript(&prepared.cache, session) {
+            Ok(messages) => sessions.push(FlowsSession {
+                source_hash: session.source_hash.clone(),
+                archived_at: session.archived_at,
+                repository: session.repository.clone(),
+                bytes_folded: session.size_bytes,
+                messages,
+            }),
+            Err(reason) => skipped.push(Skip {
+                source_agent: session.source_agent.clone(),
+                reason,
+            }),
+        }
+    }
+    let mut gap_redaction = RedactionReport::default();
+    let gaps = summarize(&skipped, placed.unplaceable, &redactor, &mut gap_redaction);
+    let found = Flows::fold(&sessions, gaps, &gap_redaction, &redactor, clusters, flows);
+    let fold_elapsed = fold_started.elapsed();
+
+    let instrumentation = FlowsInstrumentation {
+        sync: prepared.mirror.stats.clone(),
+        fold_elapsed,
+        redactor,
+        patwari_url: prepared.patwari_url.clone(),
+        cache_root: prepared.cache.root().to_path_buf(),
+    };
+    Ok(FoldedFlows {
+        generated_at: prepared.generated_at,
+        flows: found,
+        instrumentation,
+    })
+}
+
+/// Runs `qanungo flows`, writing Markdown to `out`.
+///
+/// # Errors
+///
+/// Returns an error on the same conditions the other lanes do. A session whose transcript cannot be
+/// read is a stated gap, never a failed run.
+pub fn flows(args: &FlowsArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    let folded = fold_flows(
+        &args.archive,
+        args.last.as_ref(),
+        args.redaction.redactor(),
+        args.clusters,
+        args.flows,
+    )?;
+    let markdown = FlowsReport {
+        window: args.last.as_ref(),
+        clusters: args.clusters,
+        flows: args.flows,
+        generated_at: folded.generated_at,
+        found: &folded.flows,
         instrumentation: &folded.instrumentation,
     }
     .render();
