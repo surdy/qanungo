@@ -93,7 +93,11 @@ rather than on entropy, with every pattern's provenance dated and committed besi
 ([`docs/redaction-patterns-2026-08-24.md`](docs/redaction-patterns-2026-08-24.md), amended by
 [`docs/redaction-patterns-2026-08-31.md`](docs/redaction-patterns-2026-08-31.md) for the two
 patterns [#15](https://github.com/surdy/qanungo/issues/15) added, whose evidence is a credential noun
-standing in prose and a `username=` beside a live `password=` rather than a separator). Its report
+standing in prose and a `username=` beside a live `password=` rather than a separator, and by
+[`docs/redaction-patterns-2026-09-04.md`](docs/redaction-patterns-2026-09-04.md) for the one
+[#17](https://github.com/surdy/qanungo/issues/17) added, which carries that same adjacency evidence
+over a **sentence** instead of over a URL, so that `username : … and password …` loses both halves).
+Its report
 carries counts per pattern id and *nothing about what it matched* — no offset, no excerpt, not even
 in `Debug` — because the thing that ends up in a footer or a panic message must not be the leak.
 `report` and `cost` are deliberately not wired to it: a filter over a document that carries no

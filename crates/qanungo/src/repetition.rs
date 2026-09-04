@@ -251,6 +251,41 @@ const HARNESS_PREFIXES: &[&str] = &[
     "<system_reminder>",
     // munshi's own summarizer, talking to the harness through the user surface.
     "{\"instruction\":",
+    // The Notesmith MCP host's own system block, which it writes onto the *user* surface. Certified
+    // by the qanungo #17 scan: 81 occurrences across 81 session-hits of the production archive, in
+    // two families that differ only in whether the vault is named — `the Notesmith vault `memory``
+    // (55, three vault names) and `a Notesmith vault (a directory of Markdown notes)` (26, three
+    // trailing shapes). Spelled as two literals rather than one shorter one, on `SLACK_PREFIXES`'
+    // reasoning: `You are an assistant operating inside ` is a sentence a person could write, and a
+    // class is a widening nobody has to notice. Every entry here names the product, which nothing
+    // but its MCP host does.
+    //
+    // The archive's *human* mentions of the vault are all mid-sentence — "I checked your Notesmith
+    // vault…", "There were some issues with Notesmith vault MCP…" — and an opening test cannot
+    // reach them, which is why matching is on the opening and not on a substring.
+    "You are an assistant operating inside the Notesmith vault",
+    "You are an assistant operating inside a Notesmith vault",
+    // Claude Code skill bodies, prefixed whole onto the user surface without the
+    // `Base directory for this skill:` header the entry above catches. **These are the first two
+    // entries in this list that are ordinary English rather than a marker**, and the length is the
+    // whole of what makes them certifiable: the short forms qanungo #17 proposed — "Approach this
+    // as the design lead…", "Draw as the engineer…" — are sentences a person writing a brief could
+    // plausibly type, and are refused. What is certified is the *archive-computed* longest opening
+    // every observed occurrence agrees on, cut back to a sentence:
+    //
+    // - the design body: 44 occurrences across 44 sessions, a single shape for 418 bytes, cut here
+    //   at its first sentence (168);
+    // - the diagramming body: 11 occurrences across 11 sessions in two shapes that agree for 194
+    //   bytes and then differ by one dash, cut here at 191. **The thinner of the two**, and named as
+    //   such: eleven sightings is above the two-session clustering floor and below the 32 the
+    //   `<system_reminder>` entry was certified on.
+    //
+    // Neither phrase opens any message in the archive that is not the injected body; both appear
+    // elsewhere only inside `<task-notification>`, which this list already excludes. A skill body
+    // that is edited stops matching, and the noise returns to the clustering — the failure this
+    // list documents about itself, and the safe direction for it to fail in.
+    "Approach this as the design lead at a small studio known for their versatility, giving every client a visual identity pitched at the treatment the task actually calls for.",
+    "Draw as the engineer who has to live with the decision, not as a decorator: a diagram earns its place when it lets a cold reader see a mechanism they would otherwise have to assemble from prose",
 ];
 
 /// Whether a user message is text a person typed, rather than something the harness injected.
@@ -954,6 +989,13 @@ pub(crate) mod tests {
             "Base directory for this skill: /skills/run **Running means launching the app**",
             "This session is being continued from a previous conversation that ran out of context.",
             "{\"instruction\":\"Summarize this coding session as exactly one JSON object\"}",
+            // The Notesmith MCP host's block, in both archived families — with the vault named and
+            // without.
+            "You are an assistant operating inside the Notesmith vault `memory` (a directory of Markdown notes).",
+            "You are an assistant operating inside a Notesmith vault (a directory of Markdown notes). To read, search",
+            // The two skill bodies, at the length the archive proved every occurrence agrees on.
+            "Approach this as the design lead at a small studio known for their versatility, giving every client a visual identity pitched at the treatment the task actually calls for.\n\n## Read the request first",
+            "Draw as the engineer who has to live with the decision, not as a decorator: a diagram earns its place when it lets a cold reader see a mechanism they would otherwise have to assemble from prose — where data flows",
         ] {
             assert!(!authored(injected), "{injected}");
             // Leading whitespace does not smuggle one past the list.
@@ -965,6 +1007,16 @@ pub(crate) mod tests {
         assert!(authored(
             "when you see <bash-input> in a transcript that is the harness talking, not me",
         ));
+        // The two prose entries are certified at the length that distinguishes them, and the short
+        // forms qanungo #17 proposed are refused: a person writing a brief plausibly opens with one.
+        for typed in [
+            "Approach this as the design lead and tell me what you would change about the header",
+            "Draw as the engineer, not as an architect — I want the wiring, not the boxes",
+            "You are an assistant operating inside a repo you have never seen before",
+            "I checked your Notesmith vault and found nothing about scheduling",
+        ] {
+            assert!(authored(typed), "{typed}");
+        }
 
         let read = transcript(&[
             "[Image: original 2400x1080, displayed at 2000x900. Multiply coordinates by 1.20.]",

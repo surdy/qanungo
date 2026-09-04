@@ -1,5 +1,10 @@
 # Redaction pattern research — amendment of 2026-08-31
 
+> **Superseded in one part.** §5 defers "a prose *username* pattern"; qanungo#17 found the
+> spaced-prose half of §1's own string still readable and reversed that deferral.
+> [`redaction-patterns-2026-09-04.md`](redaction-patterns-2026-09-04.md) is the amendment that adds
+> `prose-paired-username`, and `PATTERN_REVISION` is now `2026-09-04`. Everything else below stands.
+
 Input for qanungo#15 (two patterns whose evidence is not a separator). This file is an
 **amendment**, not a replacement: [`redaction-patterns-2026-08-24.md`](redaction-patterns-2026-08-24.md)
 remains the provenance of every pattern it describes, of §0's standing trade, and of §4's profanity

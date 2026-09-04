@@ -69,6 +69,23 @@
 //!   `password=` that fired on its own*. A username is not a secret; half of a live pair is, and
 //!   only for as long as the other half is beside it. See [`paired_username`].
 //!
+//! # The same pair, written as a sentence (qanungo #17)
+//!
+//! [`PatternId::ProsePairedUsername`] was added at revision `2026-09-04`, from the *left half* of
+//! the very string above. `2026-08-31` scrubbed the prose password and the URL username and left
+//! `username : feedface00` standing in cleartext beside them, because the spaced-prose form is a
+//! query parameter to nobody and `username` is deliberately not a credential noun. #13's `flows`
+//! then lifted that excerpt into the archive's global top five, where it is read rather than merely
+//! stored.
+//!
+//! The new pattern is [`paired_username`]'s prose sibling and carries the same evidence — **the
+//! password beside it** — measured over a sentence instead of over a URL. The two partition the
+//! space rather than competing for it: a `user`/`username` whose byte before is `?` or `&` is the
+//! query form and belongs to [`paired_username`]; everything else is prose and belongs to
+//! [`prose_paired_username`]. Neither ever re-implements the other half of the pair — the trigger is
+//! a *call* to [`prose_credential`], [`secret_assignment`], or [`url_credentials`], so a password
+//! those refuse leaves the username readable.
+//!
 //! # The report never carries what it matched
 //!
 //! [`RedactionReport`] holds counts per [`PatternId`] and nothing else — no offsets, no excerpts,
@@ -103,9 +120,10 @@
 /// retiring one moves the date and amends that file.
 ///
 /// `2026-08-31` adds [`PatternId::ProseCredential`] and [`PatternId::PairedUsername`] for qanungo
-/// #15; `docs/redaction-patterns-2026-08-31.md` is the amendment, and the `2026-08-24` file it
-/// names remains the provenance of everything it does not restate.
-pub const PATTERN_REVISION: &str = "2026-08-31";
+/// #15; `2026-09-04` adds [`PatternId::ProsePairedUsername`] for qanungo #17. Each has its own
+/// amendment file — `docs/redaction-patterns-2026-09-04.md` is the current one — and the
+/// `2026-08-24` file they build on remains the provenance of everything they do not restate.
+pub const PATTERN_REVISION: &str = "2026-09-04";
 
 /// Secrets are scrubbed unless a person says otherwise. Not a tunable.
 pub const REDACT_SECRETS_BY_DEFAULT: bool = true;
@@ -168,12 +186,16 @@ pub enum PatternId {
     /// The `username=` of a URL whose `password=` fired — half of a pair, sensitive only because
     /// the other half is beside it.
     PairedUsername,
+    /// The `username`/`user` of a *sentence* whose password half fired in the same span:
+    /// `username : feedface00 and password c0ffeec0ffee`. The same adjacency evidence as
+    /// [`Self::PairedUsername`], outside a URL.
+    ProsePairedUsername,
     /// A masked word from the profanity list. Not a secret pattern; never appears in a marker.
     Profanity,
 }
 
 /// Every id, secrets and profanity alike, in report order.
-pub const PATTERNS: [PatternId; 17] = [
+pub const PATTERNS: [PatternId; 18] = [
     PatternId::GithubToken,
     PatternId::AnthropicKey,
     PatternId::OpenAiKey,
@@ -190,12 +212,13 @@ pub const PATTERNS: [PatternId; 17] = [
     PatternId::SecretAssignment,
     PatternId::ProseCredential,
     PatternId::PairedUsername,
+    PatternId::ProsePairedUsername,
     PatternId::Profanity,
 ];
 
 /// The ids the secrets pass can produce — [`PATTERNS`] without [`PatternId::Profanity`].
-pub const SECRET_PATTERNS: [PatternId; 16] = {
-    let mut secrets = [PatternId::GithubToken; 16];
+pub const SECRET_PATTERNS: [PatternId; 17] = {
+    let mut secrets = [PatternId::GithubToken; 17];
     let mut index = 0;
     while index < secrets.len() {
         secrets[index] = PATTERNS[index];
@@ -224,6 +247,7 @@ impl PatternId {
             Self::SecretAssignment => "secret-assignment",
             Self::ProseCredential => "prose-credential",
             Self::PairedUsername => "paired-username",
+            Self::ProsePairedUsername => "prose-paired-username",
             Self::Profanity => "profanity",
         }
     }
@@ -390,7 +414,10 @@ type Matcher = fn(&[u8], usize) -> Option<Hit>;
 
 /// Every matcher, most specific first. Order is the tie-break when two matchers accept ranges
 /// ending at the same byte; length wins first.
-const MATCHERS: [Matcher; 15] = [
+///
+/// [`prose_paired_username`] is last because it is the least specific thing in the set: its value
+/// is not credential-shaped at all, only adjacent to something that is.
+const MATCHERS: [Matcher; 16] = [
     github_token,
     anthropic_key,
     openai_key,
@@ -406,6 +433,7 @@ const MATCHERS: [Matcher; 15] = [
     secret_assignment,
     prose_credential,
     paired_username,
+    prose_paired_username,
 ];
 
 /// The matchers that recognize a credential by its *own* shape, with no surrounding evidence.
@@ -1427,14 +1455,279 @@ fn url_password_fires(bytes: &[u8], at: usize) -> bool {
 /// Whether the parameter name at `index` normalizes to a password-class word.
 fn is_password_parameter(bytes: &[u8], index: usize) -> bool {
     let key = run(bytes, index, is_key_name_byte);
-    if !(MIN_KEY_CHARS..=MAX_KEY_CHARS).contains(&key) || bytes.get(index + key) != Some(&b'=') {
-        return false;
+    bytes.get(index + key) == Some(&b'=') && is_password_key(bytes, index)
+}
+
+/// Whether the key name beginning at `at` normalizes to a password-class word.
+///
+/// The half of [`is_password_parameter`] that is about the *name*, split out because
+/// [`prose_paired_username`] wants the same test over a key bound by a `:` with spaces around it
+/// rather than by a query string's `=`. Neither caller decides what the value is worth — that is
+/// [`secret_assignment`]'s to say, and both ask it.
+fn is_password_key(bytes: &[u8], at: usize) -> bool {
+    let key = run(bytes, at, is_key_name_byte);
+    (MIN_KEY_CHARS..=MAX_KEY_CHARS).contains(&key)
+        && normalized_key(&bytes[at..at + key]).is_some_and(|(buffer, length)| {
+            PAIRED_PASSWORD_WORDS
+                .iter()
+                .any(|word| buffer[..length].ends_with(word))
+        })
+}
+
+// --- the same pair, written as a sentence (qanungo #17) ---------------------------------------
+
+/// The nouns [`prose_paired_username`] will scrub the value of. The same two names
+/// [`PAIRED_USER_KEYS`] carries, because it is the same pattern outside a URL.
+const PROSE_USER_WORDS: [&[u8]; 2] = [b"username", b"user"];
+
+/// The bytes those nouns can begin with, in either case — the cheap reject that keeps this matcher
+/// from measuring a word at every letter of a two-megabyte transcript, as [`PROSE_FIRST_BYTES`]
+/// does for [`prose_credential`].
+const PROSE_USER_FIRST_BYTES: [u8; 2] = *b"uU";
+
+/// The password-class nouns whose *prose* form makes a username the other half of a live login.
+///
+/// [`PROSE_SECRET_WORDS`] narrowed to the password family, on exactly [`PAIRED_PASSWORD_WORDS`]'s
+/// reasoning: a `token` or a `secret` in the same sentence as a `user` is a session and a user id,
+/// which is what half the lines in any transcript look like. It is the *password* that turns the
+/// username into half of a login.
+const PROSE_PASSWORD_WORDS: [&[u8]; 6] = [
+    b"password",
+    b"passwords",
+    b"passwd",
+    b"passphrase",
+    b"pass",
+    b"pwd",
+];
+
+/// Shortest username value this will believe.
+///
+/// Lower than [`MIN_PROSE_SECRET_CHARS`] on purpose, and the reason is what the two patterns are
+/// anchored on. [`prose_credential`] has nothing but the value's own shape, so the shape has to do
+/// all the work; here the evidence is the **password beside it**, and a login name is allowed to be
+/// an ordinary short word. Six is where `admin`, `alice`, `guest`, and `me` stop and a name long
+/// enough to be worth half a pair begins.
+const MIN_PROSE_USERNAME_CHARS: usize = 6;
+
+/// How far either side of the username this looks for the password that makes it half of a pair.
+///
+/// **A sentence, spelled as two bounds that both hold.** The span never crosses a newline — that is
+/// the natural sentence boundary in a rendered transcript, and it is what keeps a `user:` line of a
+/// YAML block from pairing with a `password:` three lines down — and it never runs further than this
+/// many bytes either way, which is what keeps the search a constant rather than a walk over a
+/// two-megabyte record. The byte bound is the one that does the work on **raw JSONL**, where a line
+/// is a whole record and the newlines inside it are two-byte `\n` escapes rather than newlines; the
+/// archive scan therefore sees wider spans than any rendered surface does, which over-counts and
+/// never under-counts.
+///
+/// 256 is generous against the production sighting, where twenty-five bytes separate the username's
+/// value from the word `password`, and mean against a paragraph.
+const MAX_PAIR_SPAN_BYTES: usize = 256;
+
+/// Which structure bound the noun to its value, which is how much the value itself has to prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsernameGap {
+    /// `username : x`, `username=x`, `user: x` — a separator, with any blanks around it. The
+    /// separator is structure: a sentence does not write *user : alice logged in*.
+    Separator,
+    /// `username x`, `the user is x` — [`prose_credential`]'s gap, and no structure at all.
+    Prose,
+}
+
+/// The `username`/`user` of a **sentence** whose password half fires in the same span.
+///
+/// [`paired_username`]'s prose sibling, added for qanungo #17 from the left half of the same
+/// production string. `2026-08-31` scrubbed that string's prose password and its URL username and
+/// left `username : feedface00` readable between them; `flows` then promoted the excerpt into the
+/// archive's global top five.
+///
+/// # The evidence is adjacency, and the id says so
+///
+/// A username is not a secret — [`SECRET_KEY_WORDS`] and [`PROSE_SECRET_WORDS`] both leave it out
+/// deliberately, and prose usernames with no password near them stay readable. What is sensitive is
+/// a **live pair**. So the value here is scrubbed for one reason only: a password-class pattern
+/// **fires** within [`MAX_PAIR_SPAN_BYTES`] of it, on the same line. Fires, not "looks like it might
+/// be there": the trigger is a call to [`prose_credential`] with a password-family noun, to
+/// [`secret_assignment`] on a password-family key, or to [`url_credentials`], and a password those
+/// three refuse — an empty value, a bare number, an expression, a sentence — is no pair, so the
+/// username stays. Re-implementing any of their acceptance here is exactly the drift that would let
+/// the two halves disagree.
+///
+/// # The query form is somebody else's
+///
+/// A `user`/`username` whose preceding byte is `?` or `&` is a query parameter and belongs to
+/// [`paired_username`], which has the tighter evidence of a URL run to lean on. Standing down there
+/// is what makes the two patterns a partition rather than a race in [`best_match`], and it is why
+/// this one cannot take a single hit from that one.
+///
+/// # What the value has to prove depends on what bound it
+///
+/// - **With a separator** ([`UsernameGap::Separator`]): the credential charset, at least
+///   [`MIN_PROSE_USERNAME_CHARS`], and at least one letter. A plain word is allowed, because the
+///   separator is structure the sentence had to supply — `user: postgres` beside a live password is
+///   a login, and *user alice logged in* is not written with a colon. The letter test is what keeps
+///   `user: 61184` from reading as a name.
+/// - **Without one** ([`UsernameGap::Prose`]): everything above **and a digit**, which is
+///   [`prose_credential`]'s own floor. Bare prose has nothing on the left but a noun and a space,
+///   and *the user is testing*, *user alice logged in*, and *the user was notified* are that exact
+///   grammar. An all-letter run after a bare `user` is a word, and this pattern will not eat words.
+///
+/// Wrappers, the SHOUTING_SNAKE_CASE refusal, the dotted-tail stand-down, and the vendor stand-down
+/// are [`prose_credential`]'s, for [`prose_credential`]'s reasons — a wrapper is a boundary and
+/// never evidence, a name is not key material, and a partial redaction is the worst outcome this
+/// module has.
+///
+/// # Idempotence
+///
+/// Both halves scrub in the **same** pass, in either order: [`scrub_secrets`] matches against the
+/// original bytes and writes into a separate buffer, so a password already replaced in the output is
+/// still live in the text this reads. On a second pass there is nothing left to decide — the
+/// username is itself a marker by then, and a marker is not a value. The one case that does change
+/// is text arriving **already scrubbed by an earlier revision**: a `[REDACTED:…]` where the password
+/// was is not a firing password, so the username stays. That is [`paired_username`]'s answer to the
+/// same question, given for the same reason — this pattern reports on evidence it can see, and
+/// inventing a pair from a marker would be guessing.
+fn prose_paired_username(bytes: &[u8], at: usize) -> Option<Hit> {
+    if !PROSE_USER_FIRST_BYTES.contains(&bytes[at]) || !boundary_before(bytes, at) {
+        return None;
     }
-    normalized_key(&bytes[index..index + key]).is_some_and(|(buffer, length)| {
-        PAIRED_PASSWORD_WORDS
-            .iter()
-            .any(|word| buffer[..length].ends_with(word))
+    // The query form is `paired_username`'s, and standing down here is what keeps the two from
+    // competing for the same bytes in `best_match`.
+    if at > 0 && matches!(bytes[at - 1], b'?' | b'&') {
+        return None;
+    }
+    let word = run(bytes, at, |byte| byte.is_ascii_alphabetic());
+    if !word_is(bytes, at, word, &PROSE_USER_WORDS) {
+        return None;
+    }
+    let mut cursor = at + word;
+    // A noun in a code span closes it before the gap begins, in the matching delimiter.
+    if at > 0
+        && PROSE_WRAPPERS.contains(&bytes[at - 1])
+        && bytes.get(cursor) == Some(&bytes[at - 1])
+    {
+        cursor += 1;
+    }
+    let separator = cursor + run(bytes, cursor, is_blank);
+    let gap = if matches!(bytes.get(separator), Some(b':' | b'=')) {
+        // `==` is a comparison, not an assignment — `secret_assignment` makes the same refusal.
+        if bytes.get(separator + 1) == Some(&b'=') {
+            return None;
+        }
+        cursor = separator + 1;
+        cursor += run(bytes, cursor, is_blank);
+        UsernameGap::Separator
+    } else {
+        if !single_space(bytes, cursor) {
+            return None;
+        }
+        cursor += 1;
+        let filler = run(bytes, cursor, |byte| byte.is_ascii_alphabetic());
+        if word_is(bytes, cursor, filler, &PROSE_FILLER_WORDS)
+            && single_space(bytes, cursor + filler)
+        {
+            cursor += filler + 1;
+        }
+        UsernameGap::Prose
+    };
+    let wrapper = bytes
+        .get(cursor)
+        .copied()
+        .filter(|byte| PROSE_WRAPPERS.contains(byte));
+    let value_at = cursor + usize::from(wrapper.is_some());
+    let value_end = value_at + run(bytes, value_at, is_prose_value_byte);
+    let value = &bytes[value_at..value_end];
+    if value.len() < MIN_PROSE_USERNAME_CHARS || !value.iter().any(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    if gap == UsernameGap::Prose && !value.iter().any(u8::is_ascii_digit) {
+        return None;
+    }
+    // A name, not key material — and a login name is not written in SHOUTING_SNAKE_CASE either.
+    if value.contains(&b'_') && !value.iter().any(u8::is_ascii_lowercase) {
+        return None;
+    }
+    match wrapper {
+        Some(wrapper) if bytes.get(value_end) != Some(&wrapper) => return None,
+        // Two ways a *bare* value can run past where this charset could see it, and both would put
+        // a marker beside a fragment of the thing it claims to have removed. A dotted tail is
+        // somebody else's token; a `=` is **base64 padding**, which the archive scan found in a
+        // Kubernetes `Secret` manifest — `data:` / `username: <base64>=` / `password: <base64>` —
+        // rendering as `[REDACTED:prose-paired-username]=`. Padding carries no information, but a
+        // value that ends in it was written in the assignment's charset rather than this one, and
+        // whole-value-or-nothing is not a rule with an exception for harmless leftovers.
+        None if bytes.get(value_end) == Some(&b'=')
+            || (bytes.get(value_end) == Some(&b'.')
+                && bytes.get(value_end + 1).is_some_and(|b| is_word_byte(*b))) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    if VENDOR_MATCHERS
+        .into_iter()
+        .any(|matcher| matcher(bytes, value_at).is_some())
+    {
+        return None;
+    }
+    // Last, because it is the only expensive test here and every cheap one has already run.
+    password_fires_in_span(bytes, at).then_some(Hit {
+        id: PatternId::ProsePairedUsername,
+        start: value_at,
+        end: value_end,
     })
+}
+
+/// The sentence around `at`: back to the previous newline and forward to the next, each bounded at
+/// [`MAX_PAIR_SPAN_BYTES`].
+fn pair_span(bytes: &[u8], at: usize) -> (usize, usize) {
+    let floor = at.saturating_sub(MAX_PAIR_SPAN_BYTES);
+    let from = bytes[floor..at]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(floor, |offset| floor + offset + 1);
+    let ceiling = (at + MAX_PAIR_SPAN_BYTES).min(bytes.len());
+    let to = bytes[at..ceiling]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(ceiling, |offset| at + offset);
+    (from, to)
+}
+
+/// Whether a password-class pattern **accepts** somewhere in the sentence around `at`.
+///
+/// Three ways a password is written outside a query string, and each is asked of the matcher that
+/// owns it rather than re-tested here. Order within the span is not evidence: the password may sit
+/// on either side of the username.
+fn password_fires_in_span(bytes: &[u8], at: usize) -> bool {
+    let (from, to) = pair_span(bytes, at);
+    (from..to).any(|index| {
+        prose_password_fires(bytes, index)
+            || password_assignment_fires(bytes, index)
+            || url_credentials(bytes, index).is_some()
+    })
+}
+
+/// Whether [`prose_credential`] accepts at `index` *and* the noun it accepted on is a password.
+fn prose_password_fires(bytes: &[u8], index: usize) -> bool {
+    matches!(bytes[index], b'p' | b'P')
+        && boundary_before(bytes, index)
+        && word_is(
+            bytes,
+            index,
+            run(bytes, index, |byte| byte.is_ascii_alphabetic()),
+            &PROSE_PASSWORD_WORDS,
+        )
+        && prose_credential(bytes, index).is_some()
+}
+
+/// Whether [`secret_assignment`] accepts at `index` on a password-class key. The key may be quoted,
+/// which is how a JSONL transcript writes most of them.
+fn password_assignment_fires(bytes: &[u8], index: usize) -> bool {
+    let key_at = index + usize::from(matches!(bytes[index], b'"' | b'\''));
+    boundary_before(bytes, key_at)
+        && is_password_key(bytes, key_at)
+        && secret_assignment(bytes, index).is_some()
 }
 
 /// How many consecutive bytes *before* `at`, up to `limit`, satisfy `allowed`.
@@ -1670,10 +1963,15 @@ mod tests {
     /// keyboard filler of the right shape — and every one is a *complete* example, because a
     /// pattern set tested only on the prefix would pass while redacting nothing real.
     ///
-    /// [`PatternId::PairedUsername`] is the one id with no row here, and the reason is the pattern
-    /// itself: its evidence is a password beside it, so any string that fires it fires twice and
-    /// cannot be a single-fire canary. It is held to
-    /// `a_username_is_scrubbed_only_beside_a_password_in_the_same_url` instead.
+    /// The **two adjacency patterns** are the ids with no row here, and the reason is what they are
+    /// anchored on: their evidence is a password beside them, so any string that fires one fires
+    /// twice and cannot be a single-fire canary. They are held to
+    /// `a_username_is_scrubbed_only_beside_a_password_in_the_same_url`
+    /// ([`PatternId::PairedUsername`]) and to
+    /// `a_prose_username_goes_when_its_password_fires_in_the_same_sentence`
+    /// ([`PatternId::ProsePairedUsername`]) instead, with
+    /// `no_half_of_a_planted_pair_survives_either_spelling` standing in for
+    /// [`CANARY_BODIES`]'s survival check over a corpus of planted pairs.
     const CANARIES: [(PatternId, &str); 20] = [
         (
             PatternId::GithubToken,
@@ -2285,27 +2583,37 @@ mod tests {
     /// username, a twelve-character hex password, both spelled twice.
     const ISSUE_15: &str = "use http://line.example.com username : fake64f1ab and password fakefake0123 for xtream. and http://line.example.com/get.php?username=fake64f1ab&password=fakefake0123&type=m3u_plus";
 
-    /// The gap itself. Before this revision the prose password and the URL username were both
-    /// readable beside a marker claiming the string had been scrubbed.
+    /// The gap itself, and then the gap qanungo #17 found in the fix. At `2026-08-31` this string
+    /// lost its prose password and its URL username; the spaced-prose `username : fake64f1ab`
+    /// between them stayed readable, because it is a query parameter to nobody and `username` is
+    /// deliberately not a credential noun. At `2026-09-04` all four credentials go, each reported by
+    /// the pattern whose evidence actually caught it.
     #[test]
     fn the_issue_15_instruction_loses_both_halves_of_the_pair() {
         let scrubbed = secrets().scrub(ISSUE_15);
         assert_eq!(
             scrubbed.text,
-            "use http://line.example.com username : fake64f1ab and password [REDACTED:prose-credential] for xtream. and http://line.example.com/get.php?username=[REDACTED:paired-username]&password=[REDACTED:secret-assignment]&type=m3u_plus"
+            "use http://line.example.com username : [REDACTED:prose-paired-username] and password [REDACTED:prose-credential] for xtream. and http://line.example.com/get.php?username=[REDACTED:paired-username]&password=[REDACTED:secret-assignment]&type=m3u_plus"
         );
         assert_eq!(scrubbed.report.count(PatternId::ProseCredential), 1);
         assert_eq!(scrubbed.report.count(PatternId::PairedUsername), 1);
+        assert_eq!(scrubbed.report.count(PatternId::ProsePairedUsername), 1);
         assert_eq!(scrubbed.report.count(PatternId::SecretAssignment), 1);
+        for body in ["fakefake0123", "fake64f1ab"] {
+            assert!(
+                !scrubbed.text.contains(body),
+                "{body} survived: {:?}",
+                scrubbed.text
+            );
+        }
+        // The query half stays `paired-username` and the prose half is its own id: a reader has to
+        // be able to tell which evidence took which value, and one id for both would say the URL
+        // context was what caught a sentence.
         assert!(
-            !scrubbed.text.contains("fakefake0123"),
-            "a password survived: {:?}",
-            scrubbed.text
+            scrubbed
+                .text
+                .contains("username : [REDACTED:prose-paired-username]")
         );
-        // The prose username survives, and that is the design: a username is not a secret, and a
-        // report that redacts the reader's own login everywhere it appears is noise. Only the half
-        // of a *live pair* goes.
-        assert!(scrubbed.text.contains("username : fake64f1ab"));
         // Twice through two surfaces changes nothing.
         let twice = secrets().scrub(&scrubbed.text);
         assert_eq!(twice.text, scrubbed.text);
@@ -2471,11 +2779,14 @@ mod tests {
     #[test]
     fn the_table_spelling_of_the_same_pair_is_scrubbed_too() {
         let scrubbed = secrets().scrub("- user `fake64f1ab` · pass `fakefake0123`");
+        // Both halves at `2026-09-04`: the row is a live pair, and #17's prose sibling reads the
+        // `pass` fire beside it as the evidence for the `user`.
         assert_eq!(
             scrubbed.text,
-            "- user `fake64f1ab` · pass `[REDACTED:prose-credential]`"
+            "- user `[REDACTED:prose-paired-username]` · pass `[REDACTED:prose-credential]`"
         );
         assert_eq!(scrubbed.report.count(PatternId::ProseCredential), 1);
+        assert_eq!(scrubbed.report.count(PatternId::ProsePairedUsername), 1);
         // The wrapper survives on both sides, which is what makes the row still read as a row —
         // and what makes a second scrub a no-op rather than a nested marker.
         let twice = secrets().scrub(&scrubbed.text);
@@ -2550,7 +2861,7 @@ mod tests {
         assert_eq!(twice.text, scrubbed.text);
         assert!(twice.report.is_empty());
 
-        const UNPAIRED: [&str; 6] = [
+        const UNPAIRED: [&str; 5] = [
             // No password parameter at all.
             "https://example.com/api?username=fake64f1ab&type=m3u",
             // A password parameter whose value the assignment pattern refuses — an empty value, a
@@ -2559,11 +2870,15 @@ mod tests {
             "https://example.com/api?username=fake64f1ab&password=12345678",
             // A different URL: whitespace ends the one the username is in.
             "https://example.com/a?username=fake64f1ab and https://example.com/b?password=fakefake0123",
-            // Not a URL at all — no scheme, so this is a shell line or a struct literal.
+            // Not a URL at all — no scheme, so this is a shell line or a struct literal. The prose
+            // sibling stands down here too, on the `?` before the name: the query form is this
+            // pattern's, whether or not it accepts.
             "?username=fake64f1ab&password=fakefake0123",
-            // Not a query parameter: a sentence about the field.
-            "the username fake64f1ab goes with password=fakefake0123 in https://example.com/x",
         ];
+        // The sixth case this list carried at `2026-08-31` — `the username fake64f1ab goes with
+        // password=fakefake0123 …`, "not a query parameter: a sentence about the field" — is the
+        // qanungo #17 gap, and now fires `prose-paired-username`. It moved to
+        // `a_prose_username_goes_when_its_password_fires_in_the_same_sentence`.
         for text in UNPAIRED {
             let scrubbed = secrets().scrub(text);
             assert_eq!(
@@ -2576,6 +2891,321 @@ mod tests {
                 "the username went anyway: {:?}",
                 scrubbed.text
             );
+        }
+    }
+
+    /// The qanungo #17 shape, in every spelling the production string and the archive write it.
+    /// Each is a `user`/`username` outside a URL whose password half fires in the same sentence.
+    #[test]
+    fn a_prose_username_goes_when_its_password_fires_in_the_same_sentence() {
+        let cases = [
+            // The production form: a separator with spaces around it, which is a query parameter to
+            // nobody and was the whole of qanungo #17.
+            (
+                "username : fake64f1ab and password fakefake0123",
+                "username : [REDACTED:prose-paired-username] and password [REDACTED:prose-credential]",
+            ),
+            // Order is not evidence: the password may come first.
+            (
+                "password fakefake0123 for username : fake64f1ab",
+                "password [REDACTED:prose-credential] for username : [REDACTED:prose-paired-username]",
+            ),
+            // The #15 prose gap, on the username side: one space, optionally a copula.
+            (
+                "the username fake64f1ab goes with password=fakefake0123",
+                "the username [REDACTED:prose-paired-username] goes with password=[REDACTED:secret-assignment]",
+            ),
+            (
+                "the user is fake64f1ab and the password is fakefake0123",
+                "the user is [REDACTED:prose-paired-username] and the password is [REDACTED:prose-credential]",
+            ),
+            // A command line, which is how the archive writes the same pair a third way.
+            (
+                "adb shell --user=fake64f1ab --password=fakefake0123",
+                "adb shell --user=[REDACTED:prose-paired-username] --password=[REDACTED:secret-assignment]",
+            ),
+            // A separator plus a plain-word value: the separator is the structure a sentence would
+            // not have supplied, so a login name is allowed to be an ordinary word.
+            (
+                "{\"user\": \"postgres\", \"password\": \"letmein\"}",
+                "{\"user\": \"[REDACTED:prose-paired-username]\", \"password\": \"[REDACTED:secret-assignment]\"}",
+            ),
+            // The `url-credentials` trigger: the pair is in the URL and the name is repeated beside
+            // it in prose.
+            (
+                "log in as user fake64f1ab at https://fake64f1ab:fakefake0123@example.com/x",
+                "log in as user [REDACTED:prose-paired-username] at https://[REDACTED:url-credentials]@example.com/x",
+            ),
+        ];
+        for (text, expected) in cases {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(scrubbed.text, expected, "missed the pair in {text:?}");
+            assert_eq!(
+                scrubbed.report.count(PatternId::ProsePairedUsername),
+                1,
+                "{text:?}"
+            );
+            // Both halves scrub in the *same* pass, and a second pass is a no-op: the scanner reads
+            // the original bytes and writes into a separate buffer, so a password already replaced
+            // in the output is still live in the text the username's span search reads.
+            let twice = secrets().scrub(&scrubbed.text);
+            assert_eq!(twice.text, scrubbed.text, "a second pass moved {text:?}");
+            assert!(twice.report.is_empty());
+        }
+    }
+
+    /// The evidence is a password that **fires**, in the same sentence, and every way of removing
+    /// that evidence must leave the username readable.
+    #[test]
+    fn a_prose_username_stays_when_nothing_makes_it_half_of_a_pair() {
+        /// The line, and the name that has to still be in it afterwards.
+        const READABLE: [(&str, &str); 14] = [
+            // No credential anywhere: this is the over-match minefield the pattern stands in.
+            ("user alice logged in", "alice"),
+            ("the user fake64f1ab logged in", "fake64f1ab"),
+            ("username field is required", "field"),
+            ("the user is testing the login flow", "testing"),
+            ("user : postgres is the connection owner", "postgres"),
+            ("the username fake64f1ab was renamed", "fake64f1ab"),
+            // A password-class noun with nothing credential-shaped after it. `prose_credential`
+            // refuses, so there is no pair — the trigger is a call to it, not a sight of the word.
+            (
+                "user : fake64f1ab and the password is stored in the keychain",
+                "fake64f1ab",
+            ),
+            (
+                "user fake64f1ab must pass the build before merging",
+                "fake64f1ab",
+            ),
+            ("user : fake64f1ab and password manager notes", "fake64f1ab"),
+            // A password-class *key* whose value the assignment matcher refuses.
+            (
+                "user : fake64f1ab with password = self.next_password",
+                "fake64f1ab",
+            ),
+            ("user : fake64f1ab with password: 12345678", "fake64f1ab"),
+            // A `token` or a `secret` is a session and a user id, not a login half — the same
+            // narrowing `paired-username` makes.
+            ("user : fake64f1ab and token fakefake0123", "fake64f1ab"),
+            (
+                "user : fake64f1ab and the secret is fakefake0123",
+                "fake64f1ab",
+            ),
+            // Already scrubbed upstream: a marker is not a firing password, so the username stays.
+            // The honest answer rather than a guess, and `paired-username`'s answer too.
+            (
+                "user : fake64f1ab and password [REDACTED:prose-credential]",
+                "fake64f1ab",
+            ),
+        ];
+        for (text, name) in READABLE {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.report.count(PatternId::ProsePairedUsername),
+                0,
+                "scrubbed an unpaired username: {text:?}"
+            );
+            assert!(
+                scrubbed.text.contains(name),
+                "{name} went anyway: {:?}",
+                scrubbed.text
+            );
+        }
+    }
+
+    /// The span is a sentence: bounded by a newline first and by [`MAX_PAIR_SPAN_BYTES`] second, on
+    /// both sides. A password on the next line, or a paragraph away, is not this username's.
+    #[test]
+    fn the_pair_span_is_one_sentence_in_both_directions() {
+        // A newline ends it, whichever side the password is on.
+        for text in [
+            "user : fake64f1ab\nand password fakefake0123 for something else",
+            "password fakefake0123 for something else\nuser : fake64f1ab",
+        ] {
+            let scrubbed = secrets().scrub(text);
+            assert_eq!(
+                scrubbed.report.count(PatternId::ProsePairedUsername),
+                0,
+                "paired across a newline: {text:?}"
+            );
+            assert!(scrubbed.text.contains("fake64f1ab"));
+        }
+        // And the byte bound, which is what holds on raw JSONL where a record has no newlines in it
+        // at all. Just inside pairs; just outside does not.
+        let filler = |bytes: usize| "x".repeat(bytes);
+        let near = format!(
+            "user : fake64f1ab {} password fakefake0123",
+            filler(MAX_PAIR_SPAN_BYTES - 40)
+        );
+        assert_eq!(
+            secrets()
+                .scrub(&near)
+                .report
+                .count(PatternId::ProsePairedUsername),
+            1,
+            "missed a password inside the span"
+        );
+        let far = format!(
+            "user : fake64f1ab {} password fakefake0123",
+            filler(MAX_PAIR_SPAN_BYTES + 40)
+        );
+        let scrubbed = secrets().scrub(&far);
+        assert_eq!(
+            scrubbed.report.count(PatternId::ProsePairedUsername),
+            0,
+            "paired past the span"
+        );
+        assert!(scrubbed.text.contains("fake64f1ab"));
+    }
+
+    /// The query form belongs to [`paired_username`] and this pattern stands down in it, which is
+    /// what makes the two a partition rather than a race in [`best_match`]. If this ever regresses,
+    /// `paired-username`'s archive count moves and the id in the rendered text lies about the
+    /// evidence.
+    #[test]
+    fn the_query_form_stays_paired_usernames_and_this_pattern_takes_none_of_it() {
+        let url = "https://example.com/get.php?username=fake64f1ab&password=fakefake0123&type=m3u";
+        let scrubbed = secrets().scrub(url);
+        assert_eq!(scrubbed.report.count(PatternId::PairedUsername), 1);
+        assert_eq!(scrubbed.report.count(PatternId::ProsePairedUsername), 0);
+        assert!(
+            scrubbed
+                .text
+                .contains("username=[REDACTED:paired-username]")
+        );
+        // Including the `&` form, and including a URL whose scheme is missing — where
+        // `paired_username` refuses and this one still must not step in, because the query context
+        // is not this pattern's to judge.
+        let bare = "?user=fake64f1ab&password=fakefake0123";
+        let scrubbed = secrets().scrub(bare);
+        assert_eq!(scrubbed.report.count(PatternId::ProsePairedUsername), 0);
+        assert!(scrubbed.text.contains("fake64f1ab"));
+    }
+
+    /// The gate as a grid, [`the_prose_gate_is_the_noun_list_crossed_with_the_value_shape`]'s
+    /// sibling: every noun crossed with every gap, every value shape, every wrapper, and the one
+    /// thing that is not a shape at all — whether a password fires in the span. A widening of any
+    /// list moves a count here.
+    #[test]
+    fn the_prose_pair_gate_is_the_noun_and_gap_crossed_with_the_value_and_the_password() {
+        const NOUNS: [(&str, bool); 5] = [
+            ("username", true),
+            ("user", true),
+            // Not nouns: the plural is a word about the field, and neither of the others is in the
+            // list — `usage` is there so the whole-word test is exercised and not just the
+            // first-byte reject.
+            ("usernames", false),
+            ("usage", false),
+            ("login", false),
+        ];
+        /// The gap, and whether it makes the value prove it is credential-shaped. `None` is a gap
+        /// that is not one — two spaces is a column, and a column is not a sentence.
+        const GAPS: [(&str, Option<bool>); 7] = [
+            (" : ", Some(false)),
+            (": ", Some(false)),
+            (":", Some(false)),
+            ("=", Some(false)),
+            (" ", Some(true)),
+            (" is ", Some(true)),
+            ("  ", None),
+        ];
+        /// The value, whether a separator will take it, and whether bare prose will.
+        const VALUES: [(&str, bool, bool); 8] = [
+            ("fake64f1ab", true, true),   // the production shape
+            ("postgres", true, false), // a plain word: a name, and only a separator vouches for it
+            ("alice", false, false),   // five: under the floor, whatever bound it
+            ("123456", false, false),  // no letter: a measurement, not a name
+            ("fake_64_ab", true, true), // the credential charset's own separator
+            ("FAKE_64_AB", false, false), // SHOUTING_SNAKE_CASE is a name, not key material
+            ("fake.64.ab", false, false), // dotted: somebody else's value, left whole
+            ("fake/64/ab", false, false), // a path — the run stops at `/`, leaving four characters
+        ];
+        /// The tail, and whether it puts a firing password in the span.
+        const TAILS: [(&str, bool); 3] = [
+            (" and the password is fakefake0123", true),
+            (" and password=fakefake0123", true),
+            (" and the tests pass consistently", false),
+        ];
+        for (noun, is_noun) in NOUNS {
+            for (gap, credential_needed) in GAPS {
+                for (value, separator_ok, prose_ok) in VALUES {
+                    for wrapper in ["", "`", "\"", "'"] {
+                        for (tail, paired) in TAILS {
+                            let text = format!("note: {noun}{gap}{wrapper}{value}{wrapper}{tail}");
+                            let value_ok = match credential_needed {
+                                Some(true) => prose_ok,
+                                Some(false) => separator_ok,
+                                None => false,
+                            };
+                            let fired = secrets()
+                                .scrub(&text)
+                                .report
+                                .count(PatternId::ProsePairedUsername);
+                            assert_eq!(
+                                fired,
+                                usize::from(is_noun && value_ok && paired),
+                                "{text:?} fired {fired} times"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // A wrapped value must close where the value charset ends, or the match is refused whole —
+        // the never-a-partial-redaction invariant, on this pattern too. And a bare value followed
+        // by base64 padding is the archive's own instance of it: the scan found a Kubernetes
+        // `Secret` manifest rendering `username: [REDACTED:…]=` beside its scrubbed password.
+        for text in [
+            "user : `fake64f1ab and password fakefake0123",
+            "user : \"fake64f1ab\nand password fakefake0123",
+            "data:\n  username: ZmFrZTY0ZjFhYg==\n  password: fakefake0123456789",
+            "user : fake64f1ab= and password fakefake0123",
+        ] {
+            assert_eq!(
+                secrets()
+                    .scrub(text)
+                    .report
+                    .count(PatternId::ProsePairedUsername),
+                0,
+                "matched inside an unclosed wrapper: {text:?}"
+            );
+        }
+        // `==` is a comparison, not an assignment.
+        let comparison = "if user == fake64f1ab and password fakefake0123";
+        assert_eq!(
+            secrets()
+                .scrub(comparison)
+                .report
+                .count(PatternId::ProsePairedUsername),
+            0
+        );
+    }
+
+    /// The two adjacency patterns have no canary row in [`CANARIES`] — any string that fires one
+    /// fires twice — so the bodies they are responsible for are pinned here instead: nothing of a
+    /// planted pair survives, whichever half caught which.
+    #[test]
+    fn no_half_of_a_planted_pair_survives_either_spelling() {
+        const PAIRS: [&str; 3] = [
+            "use http://line.example.com username : fake64f1ab and password fakefake0123 for xtream",
+            "- user `fake64f1ab` · pass `fakefake0123`",
+            "https://example.com/get.php?username=fake64f1ab&password=fakefake0123",
+        ];
+        let corpus = PAIRS.join("\n");
+        let scrubbed = secrets().scrub(&corpus);
+        for body in ["fake64f1ab", "fakefake0123"] {
+            assert!(
+                !scrubbed.text.contains(body),
+                "{body} survived into {:?}",
+                scrubbed.text
+            );
+        }
+        assert_eq!(scrubbed.report.count(PatternId::ProsePairedUsername), 2);
+        assert_eq!(scrubbed.report.count(PatternId::PairedUsername), 1);
+        // And the report still carries nothing but counts.
+        let rendered = format!("{:?}", scrubbed.report);
+        for body in ["fake64f1ab", "fakefake0123", "fake"] {
+            assert!(!rendered.contains(body), "{body} leaked into the report");
         }
     }
 
