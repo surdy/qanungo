@@ -26,6 +26,12 @@
 //! finding from a threshold artefact. So the scope block states the phrase length, the overlap it
 //! insisted on, the floor under a clusterable message, and the sessions a cluster has to span —
 //! the same discipline the ask lane's rubric line holds, for the same reason.
+//!
+//! The per-repository cut is stated the same way, but only when it is not the default: the number
+//! the reader needs is the one the run actually used, and a document that named the constant while
+//! a flag had raised it would be describing a different document (qanungo #16). At the default it
+//! stays unstated, because the "not shown" line under a section already says the cut bit and a
+//! sentence about a cut that hid nothing is noise.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -35,9 +41,9 @@ use chrono::{DateTime, Utc};
 
 use crate::cli::Window;
 use crate::doctor::{
-    Cluster, Doctor, Friction, MIN_CLUSTER_SESSIONS, MIN_CLUSTERABLE_WORDS,
-    MIN_SHARED_INSTRUCTIONS, RepositoryClusters, SAME_CONVERSATION_PERCENT, SHINGLE_WORDS,
-    SIMILARITY_THRESHOLD_PERCENT,
+    Cluster, DEFAULT_CLUSTERS_PER_REPOSITORY, Doctor, Friction, MIN_CLUSTER_SESSIONS,
+    MIN_CLUSTERABLE_WORDS, MIN_SHARED_INSTRUCTIONS, RepositoryClusters, SAME_CONVERSATION_PERCENT,
+    SHINGLE_WORDS, SIMILARITY_THRESHOLD_PERCENT,
 };
 use crate::format;
 use crate::redaction::{PATTERN_REVISION, Redactor};
@@ -61,6 +67,11 @@ pub struct DoctorInstrumentation {
 pub struct DoctorReport<'a> {
     /// The window that narrowed the reach, or `None` for all of history.
     pub window: Option<&'a Window>,
+    /// The per-repository cluster cut the fold was run with — the effective value of
+    /// `--clusters-per-repo`, not [`DEFAULT_CLUSTERS_PER_REPOSITORY`], which is merely what it
+    /// defaults to. Stated in the document whenever the two differ, so a section with no "not
+    /// shown" line under it cannot be mistaken for one the default happened to fit.
+    pub clusters_per_repo: usize,
     pub generated_at: DateTime<Utc>,
     pub doctor: &'a Doctor,
     pub instrumentation: &'a DoctorInstrumentation,
@@ -142,6 +153,17 @@ impl DoctorReport<'_> {
              comparison, so a cluster that is plainly machinery rather than an instruction is a gap \
              in that list — not a contradiction of the count above.\n",
         );
+        if self.clusters_per_repo != DEFAULT_CLUSTERS_PER_REPOSITORY {
+            let _ = writeln!(
+                out,
+                "\nEach repository's section below renders at most {} clusters, because \
+                 `--clusters-per-repo` asked for that rather than the usual {}. The cut is on the \
+                 rendering and never on the clustering: every count of what was found is the \
+                 number it would have been at the default, and only how much of it is shown has \
+                 moved.",
+                self.clusters_per_repo, DEFAULT_CLUSTERS_PER_REPOSITORY,
+            );
+        }
         if doctor.sessions_without_messages > 0 {
             let _ = writeln!(
                 out,
@@ -406,8 +428,18 @@ mod tests {
         doctor: &'a Doctor,
         instrumentation: &'a DoctorInstrumentation,
     ) -> DoctorReport<'a> {
+        capped(doctor, instrumentation, DEFAULT_CLUSTERS_PER_REPOSITORY)
+    }
+
+    /// The same document, rendered as a run that set `--clusters-per-repo` would render it.
+    fn capped<'a>(
+        doctor: &'a Doctor,
+        instrumentation: &'a DoctorInstrumentation,
+        clusters_per_repo: usize,
+    ) -> DoctorReport<'a> {
         DoctorReport {
             window: None,
+            clusters_per_repo,
             generated_at: at("2026-08-30T00:00:00Z"),
             doctor,
             instrumentation,
@@ -483,6 +515,35 @@ mod tests {
         assert!(rendered.contains("arbitrary-until-measured"));
     }
 
+    /// The per-repository cut is stated when it is not the default, and the number stated is the
+    /// **effective** one — a document that named the constant while `--clusters-per-repo` had moved
+    /// it would be describing a run that never happened (qanungo #16).
+    #[test]
+    fn a_moved_cut_is_stated_and_the_default_one_is_not() {
+        let doctor = found(vec![cluster(3, 3)], 1);
+        let instrumentation = instrumentation();
+
+        let default = report(&doctor, &instrumentation).render();
+        assert!(
+            !default.contains("clusters-per-repo"),
+            "a cut that hid nothing and moved nothing is not news: {default}",
+        );
+
+        let raised = capped(&doctor, &instrumentation, 50).render();
+        assert!(raised.contains("renders at most 50 clusters"));
+        assert!(raised.contains("rather than the usual 10"));
+        assert!(
+            raised.contains("never on the clustering"),
+            "and the sentence says what the flag did not touch: {raised}",
+        );
+        // Every count is the one the fold reported, at either cut.
+        assert!(raised.contains("**1 cluster in 1 of the 3 repositories examined**"));
+
+        // It reads the same way downwards, with the effective number and never the constant.
+        let lowered = capped(&doctor, &instrumentation, 3).render();
+        assert!(lowered.contains("renders at most 3 clusters"));
+    }
+
     /// An empty result is an answer about the archive, not a blank section a reader has to guess
     /// at, and it is not phrased as a truncation.
     #[test]
@@ -517,6 +578,11 @@ mod tests {
         assert!(rendered.contains("- _and 4 further occurrences, not listed_"));
         assert!(rendered.contains("_4 further clusters in this repository are not shown._"));
         assert!(rendered.contains("- archived 2026-08-20T10:00:00Z (UTC) · `event 1` · `"));
+
+        // The sentence counts what this section is actually missing, so a raised cut that still
+        // truncates still says so — the line is drawn from the section, never from the cap.
+        let raised = capped(&doctor, &instrumentation, 50).render();
+        assert!(raised.contains("_4 further clusters in this repository are not shown._"));
     }
 
     /// The friction table is aggregates, and the sentence above it refuses to let them read as a
@@ -610,6 +676,7 @@ mod tests {
         let window = "4w".parse::<TestWindow>().unwrap().0;
         let narrowed = DoctorReport {
             window: Some(&window),
+            clusters_per_repo: DEFAULT_CLUSTERS_PER_REPOSITORY,
             generated_at: at("2026-08-30T00:00:00Z"),
             doctor: &doctor,
             instrumentation: &instrumentation,

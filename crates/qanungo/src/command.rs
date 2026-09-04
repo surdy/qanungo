@@ -744,10 +744,15 @@ pub struct FoldedDoctor {
 ///
 /// Returns an error when the cache is unusable or the archive cannot be listed. A session whose
 /// transcript this build cannot read is a stated gap, never a failed run.
+///
+/// `clusters_per_repo` is the rendering cut `--clusters-per-repo` sets; it reaches
+/// [`Doctor::fold`] and the document alike, from the one argument, so the number the cut used and
+/// the number the document states cannot drift apart.
 pub fn fold_doctor(
     archive: &ArchiveArgs,
     window: Option<&Window>,
     redactor: Redactor,
+    clusters_per_repo: usize,
 ) -> Result<FoldedDoctor, CommandError> {
     let prepared = match window {
         Some(window) => Prepared::mirror(archive, window, Artifact::Transcript, Reach::WindowOnly)?,
@@ -777,7 +782,13 @@ pub fn fold_doctor(
     }
     let mut gap_redaction = RedactionReport::default();
     let gaps = summarize(&skipped, placed.unplaceable, &redactor, &mut gap_redaction);
-    let doctor = Doctor::fold(&sessions, gaps, &gap_redaction, &redactor);
+    let doctor = Doctor::fold(
+        &sessions,
+        gaps,
+        &gap_redaction,
+        &redactor,
+        clusters_per_repo,
+    );
     let fold_elapsed = fold_started.elapsed();
 
     let instrumentation = DoctorInstrumentation {
@@ -811,9 +822,15 @@ fn read_one_doctor(
 /// Returns an error on the same conditions the other lanes do. A session whose transcript cannot be
 /// read is a stated gap, never a failed run.
 pub fn doctor(args: &DoctorArgs, out: &mut impl Write) -> Result<(), CommandError> {
-    let folded = fold_doctor(&args.archive, args.last.as_ref(), args.redaction.redactor())?;
+    let folded = fold_doctor(
+        &args.archive,
+        args.last.as_ref(),
+        args.redaction.redactor(),
+        args.clusters_per_repo,
+    )?;
     let markdown = DoctorReport {
         window: args.last.as_ref(),
+        clusters_per_repo: args.clusters_per_repo,
         generated_at: folded.generated_at,
         doctor: &folded.doctor,
         instrumentation: &folded.instrumentation,

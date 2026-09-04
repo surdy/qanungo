@@ -199,11 +199,18 @@ pub const MAX_SHINGLE_POSTINGS: usize = 200;
 /// ([`Cluster::occurrences`]) so a cut list is never mistaken for the whole of what was found.
 pub const MAX_CITATIONS_PER_CLUSTER: usize = 8;
 
-/// Clusters one repository renders before the list is cut short.
+/// Clusters one repository renders before the list is cut short, when nobody says otherwise.
 ///
 /// A tunable, for the same reason and with the same discipline: [`RepositoryClusters::found`] counts
 /// them all, so the document can say how many it is not showing.
-pub const MAX_CLUSTERS_PER_REPOSITORY: usize = 10;
+///
+/// **A default, not a ceiling** (qanungo #16). The reader of this document is often the
+/// `instructions-editor` skill, which acts on clusters in the weight class this cut lands in — the
+/// first production run hid two 2-occurrence clusters behind the "not shown" line while a
+/// 2-occurrence cluster above it produced a shipped instruction-file edit. So `--clusters-per-repo`
+/// raises it, [`Doctor::fold`] takes the effective value as an argument, and the document states it
+/// whenever it is not this number.
+pub const DEFAULT_CLUSTERS_PER_REPOSITORY: usize = 10;
 
 /// Openings this build has certified, against the production archive, as text the **harness** put
 /// on the user surface rather than text a person typed.
@@ -368,7 +375,8 @@ pub struct Cluster {
 pub struct RepositoryClusters {
     /// The repository the archive listed these sessions under, clamped and then scrubbed.
     pub repository: String,
-    /// The clusters this document renders, at most [`MAX_CLUSTERS_PER_REPOSITORY`].
+    /// The clusters this document renders, at most the cap [`Doctor::fold`] was given —
+    /// [`DEFAULT_CLUSTERS_PER_REPOSITORY`] unless `--clusters-per-repo` said otherwise.
     pub clusters: Vec<Cluster>,
     /// How many were found before that cut, so a truncated section can say so.
     pub found: usize,
@@ -455,11 +463,18 @@ impl Doctor {
     /// the mirror's own vocabulary, which lives with the commands, and the scrub that summary ran on
     /// each harness label has to reach this document's footer — a marker in the Gaps section under
     /// "redaction none" would be the document contradicting itself.
+    ///
+    /// `clusters_per_repo` is the rendering cut, [`DEFAULT_CLUSTERS_PER_REPOSITORY`] unless
+    /// `--clusters-per-repo` raised it. It bounds what each section *shows* and nothing else: every
+    /// count on this struct — [`Doctor::clusters`], [`RepositoryClusters::found`],
+    /// [`RepositoryClusters::occurrences`] — is taken before the cut, so raising it reveals clusters
+    /// without moving a single number.
     pub fn fold(
         sessions: &[DoctorSession],
         gaps: Vec<SkippedNote>,
         gap_redaction: &RedactionReport,
         redactor: &Redactor,
+        clusters_per_repo: usize,
     ) -> Self {
         let mut redaction = RedactionReport::default();
         redaction.absorb(gap_redaction);
@@ -526,9 +541,13 @@ impl Doctor {
             if found.is_empty() {
                 continue;
             }
-            counted
-                .repositories
-                .push(build_section(label, found, redactor, &mut redaction));
+            counted.repositories.push(build_section(
+                label,
+                found,
+                redactor,
+                &mut redaction,
+                clusters_per_repo,
+            ));
         }
 
         counted.repositories.sort_by(most_repeated_first);
@@ -559,6 +578,7 @@ fn build_section(
     mut found: Vec<Repetition>,
     redactor: &Redactor,
     redaction: &mut RedactionReport,
+    clusters_per_repo: usize,
 ) -> RepositoryClusters {
     found.sort_by(most_occurrences_first);
     let occurrences = found.iter().map(|cluster| cluster.occurrences.len()).sum();
@@ -568,7 +588,7 @@ fn build_section(
         occurrences,
         clusters: found
             .into_iter()
-            .take(MAX_CLUSTERS_PER_REPOSITORY)
+            .take(clusters_per_repo)
             .map(|repetition| {
                 // Scrub, then collapse, then clip — [`crate::ask::snippet`]'s pipeline, so every
                 // quotation this crate prints is cut at one length by one rule and none of them is
@@ -1192,6 +1212,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert_eq!(folded.repositories.len(), 1);
         let section = &folded.repositories[0];
@@ -1228,6 +1249,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(folded.is_empty());
         assert_eq!(folded.unexamined.len(), 1);
@@ -1254,6 +1276,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(
             folded.is_empty(),
@@ -1281,6 +1304,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(folded.is_empty(), "one session each, nothing to cluster");
         assert_eq!(folded.unexamined.len(), 2);
@@ -1312,6 +1336,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(
             folded.repositories.is_empty(),
@@ -1334,6 +1359,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(folded.is_empty());
         assert_eq!(folded.repositories_examined, 0);
@@ -1342,6 +1368,92 @@ mod tests {
         assert_eq!(folded.unexamined[0].reason, NOT_A_REPOSITORY);
         assert_eq!(folded.friction.len(), 1);
         assert_eq!(folded.friction[0].repository, NO_REPOSITORY);
+    }
+
+    /// Twelve mutually unrelated instructions, one per index.
+    ///
+    /// Built rather than hand-written: what is under test is the *cut*, and twelve realistic
+    /// instructions that all had to stay under the similarity threshold would be twelve sentences
+    /// chosen to prove something other than the thing being asserted. Each index appears three
+    /// times in the sentence, so any two of these share only the phrases none of the three positions
+    /// falls in — far under [`SIMILARITY_THRESHOLD_PERCENT`], which the test asserts by counting the
+    /// clusters that form.
+    fn distinct_instruction(index: usize) -> String {
+        format!(
+            "always regenerate the {index} bindings and rerun the {index} fixtures before you tell \
+             me the {index} migration is finished"
+        )
+    }
+
+    /// The per-repository cut hides clusters and says so; raising it reveals exactly those, and
+    /// moves no count (qanungo #16).
+    ///
+    /// This is the finding the flag exists for: the hidden clusters are the *weakest* of what was
+    /// found, which is the same weight class the `instructions-editor` skill acts on, so a reader
+    /// that cannot raise the cut is reading a truncated input rather than a shorter one.
+    #[test]
+    fn the_per_repository_cut_is_a_default_the_caller_can_raise() {
+        // Two sessions per instruction rather than two sessions carrying all twelve: a pair of
+        // sessions sharing twelve instructions is a resumed conversation by
+        // [`SAME_CONVERSATION_PERCENT`]'s reckoning, and would be folded into one before any of this
+        // was cut. A pair sharing one is what repetition actually looks like.
+        let texts: Vec<String> = (0..12).map(distinct_instruction).collect();
+        let sessions: Vec<DoctorSession> = texts
+            .iter()
+            .enumerate()
+            .flat_map(|(index, text)| {
+                let hash = |offset: usize| char::from(b'a' + (index + offset) as u8);
+                [
+                    session(
+                        hash(0),
+                        "2026-08-20T10:00:00Z",
+                        Some("surdy/qanungo"),
+                        &[text],
+                    ),
+                    session(
+                        hash(12),
+                        "2026-08-21T10:00:00Z",
+                        Some("surdy/qanungo"),
+                        &[text],
+                    ),
+                ]
+            })
+            .collect();
+        let fold = |cap: usize| {
+            Doctor::fold(
+                &sessions,
+                Vec::new(),
+                &RedactionReport::default(),
+                &Redactor::new(),
+                cap,
+            )
+        };
+
+        let capped = fold(DEFAULT_CLUSTERS_PER_REPOSITORY);
+        let section = &capped.repositories[0];
+        assert_eq!(section.found, 12, "twelve instructions, twelve clusters");
+        assert_eq!(section.clusters.len(), DEFAULT_CLUSTERS_PER_REPOSITORY);
+
+        let raised = fold(50);
+        let widened = &raised.repositories[0];
+        assert_eq!(
+            widened.clusters.len(),
+            12,
+            "a cap above what was found shows all of it and invents nothing",
+        );
+        assert_eq!(
+            widened.clusters[..DEFAULT_CLUSTERS_PER_REPOSITORY],
+            section.clusters[..],
+            "the cut takes a prefix: raising it reveals, it never reorders",
+        );
+
+        // The cut is on the rendering alone, so nothing counted moves with it.
+        assert_eq!(raised.clusters, capped.clusters);
+        assert_eq!(widened.found, section.found);
+        assert_eq!(widened.occurrences, section.occurrences);
+
+        // And it cuts downwards on the same rule, for the operator who wanted a shorter read.
+        assert_eq!(fold(3).repositories[0].clusters.len(), 3);
     }
 
     /// The same corpus folded twice is the same document, and the clustering does not depend on the
@@ -1372,6 +1484,7 @@ mod tests {
                 Vec::new(),
                 &RedactionReport::default(),
                 &Redactor::new(),
+                DEFAULT_CLUSTERS_PER_REPOSITORY,
             )
         };
         let first = fold(&forwards);
@@ -1412,6 +1525,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         let cluster = &folded.repositories[0].clusters[0];
         assert_eq!(cluster.occurrences, 2, "the secret did not split the pair");
@@ -1432,6 +1546,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new().with_secrets(false),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(bare.repositories[0].clusters[0].excerpt.contains(secret));
     }
@@ -1459,6 +1574,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         let labels: Vec<&str> = folded
             .repositories
@@ -1639,6 +1755,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert!(
             folded.is_empty(),
@@ -1674,6 +1791,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert_eq!(folded.conversations, 2);
         assert_eq!(folded.repositories.len(), 1);
@@ -1696,6 +1814,7 @@ mod tests {
             Vec::new(),
             &RedactionReport::default(),
             &Redactor::new(),
+            DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
         assert_eq!(folded.sessions, 1);
         assert_eq!(folded.sessions_without_messages, 1);

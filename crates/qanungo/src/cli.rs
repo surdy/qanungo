@@ -310,6 +310,16 @@ pub struct AskArgs {
 /// mirrors the whole archive — several gigabytes — before it clusters anything. Warm runs ride the
 /// shared blob cache and the snapshot index like `report` does, and the instrumentation footer
 /// reports what either one actually cost rather than leaving the reader to guess.
+///
+/// # The cut on each section is a default, not a ceiling
+///
+/// Each repository's clusters are rendered best-first and cut at
+/// [`crate::doctor::DEFAULT_CLUSTERS_PER_REPOSITORY`], under a line saying how many were held back.
+/// `--clusters-per-repo` raises that cut, because the reader of this document is often the
+/// `instructions-editor` skill and the cut lands *inside* the weight class it acts on: the first
+/// production run hid two two-occurrence clusters behind that line while a two-occurrence cluster
+/// above it produced a shipped instruction-file edit (qanungo #16). Raising it changes what is
+/// shown and nothing that is counted — the cut is on the rendering, never on the clustering.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Narrow the reading to `<count><unit>` of history, with unit `h`, `d`, or `w`. Omitted, it
@@ -317,6 +327,18 @@ pub struct DoctorArgs {
     /// so this lane has no default window.
     #[arg(long = "last", value_parser = parse_window)]
     pub last: Option<Window>,
+
+    /// How many clusters each repository's section renders, best first. The rest are counted and
+    /// declared as held back rather than dropped silently, so raise this to read them; the document
+    /// states the number in force whenever it is not the default. Refused rather than clamped below
+    /// one: a section that can show no cluster is not a shorter finding, it is a heading with a
+    /// footnote under it.
+    #[arg(
+        long = "clusters-per-repo",
+        default_value_t = crate::doctor::DEFAULT_CLUSTERS_PER_REPOSITORY,
+        value_parser = parse_cluster_cap,
+    )]
+    pub clusters_per_repo: usize,
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
@@ -502,6 +524,20 @@ fn parse_limit(value: &str) -> Result<usize, String> {
         .map_err(|_| format!("`{value}` is not a result count"))?;
     if count == 0 {
         return Err("a limit of zero would print no matches".to_owned());
+    }
+    Ok(count)
+}
+
+/// Refuses a cluster cap of zero for [`parse_limit`]'s reason, spelled for what this one cuts: a
+/// section rendering none of its clusters is not a shorter finding, it is a repository heading with
+/// nothing under it but a line saying how much is hidden. Kept separate from [`parse_limit`] so each
+/// message can name the thing the operator was actually setting.
+fn parse_cluster_cap(value: &str) -> Result<usize, String> {
+    let count: usize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a cluster count"))?;
+    if count == 0 {
+        return Err("a cap of zero would render every cluster as hidden".to_owned());
     }
     Ok(count)
 }
@@ -707,6 +743,10 @@ mod tests {
             panic!("`doctor` parses as the doctor command");
         };
         assert!(args.last.is_none(), "no window means all of history");
+        assert_eq!(
+            args.clusters_per_repo,
+            crate::doctor::DEFAULT_CLUSTERS_PER_REPOSITORY,
+        );
         assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
         assert!(args.archive.cache_dir.is_none());
@@ -828,6 +868,29 @@ mod tests {
             panic!("`ask` parses as the ask command");
         };
         assert_eq!(args.limit, 3);
+    }
+
+    /// The doctor lane's per-repository cut is a number the operator can move, refused at zero on
+    /// [`parse_limit`]'s rule and belonging to this lane alone (qanungo #16).
+    #[test]
+    fn doctor_takes_a_cluster_cap_and_refuses_zero() {
+        assert_eq!(parse_cluster_cap("1").unwrap(), 1);
+        assert_eq!(parse_cluster_cap("50").unwrap(), 50);
+        for bad in ["0", "-1", "all", ""] {
+            assert!(parse_cluster_cap(bad).is_err(), "`{bad}` must be refused");
+        }
+        assert!(Cli::try_parse_from(["qanungo", "doctor", "--clusters-per-repo", "0"]).is_err());
+
+        let Command::Doctor(args) =
+            Cli::parse_from(["qanungo", "doctor", "--clusters-per-repo", "50"]).command
+        else {
+            panic!("`doctor` parses as the doctor command");
+        };
+        assert_eq!(args.clusters_per_repo, 50);
+
+        // It is the doctor's own cut, not a limit the other lanes learned.
+        assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--clusters-per-repo", "50"]).is_err());
+        assert!(Cli::try_parse_from(["qanungo", "report", "--clusters-per-repo", "50"]).is_err());
     }
 
     /// The dashboard's scrub is decided once, on the command line, and typing nothing is the safe

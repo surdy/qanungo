@@ -157,6 +157,7 @@ cargo run -- dashboard --last 30d                    # http://127.0.0.1:8878, re
 cargo run -- dashboard --cost-last 4w --standup-last 3d   # narrow the bill and the narrative
 cargo run -- doctor                                  # all of history, because that is the question
 cargo run -- doctor --last 4w                        # or narrow it, on the same grammar
+cargo run -- doctor --clusters-per-repo 50           # and read the clusters the default cut hides
 cargo run -- dashboard --bind 100.64.0.7:8878        # the tailnet, unauthenticated, and it says so
 ```
 

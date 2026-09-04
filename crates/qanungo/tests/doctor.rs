@@ -18,7 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use qanungo::ask::MAX_SNIPPET_CHARS;
 use qanungo::cache::BlobCache;
-use qanungo::doctor::{Doctor, DoctorSession};
+use qanungo::doctor::{DEFAULT_CLUSTERS_PER_REPOSITORY, Doctor, DoctorSession};
 use qanungo::doctor_report::{DoctorInstrumentation, DoctorReport};
 use qanungo::metrics::source_for_agent;
 use qanungo::patwari::sha256_hex;
@@ -121,8 +121,16 @@ fn one_repository(archive: &Archive) -> Vec<DoctorSession> {
     ]
 }
 
+/// Folded at the default per-repository cut: these fixtures cluster far under it, and what the cut
+/// itself does is `doctor.rs`'s own test.
 fn fold(sessions: &[DoctorSession], redactor: &Redactor) -> Doctor {
-    Doctor::fold(sessions, Vec::new(), &RedactionReport::default(), redactor)
+    Doctor::fold(
+        sessions,
+        Vec::new(),
+        &RedactionReport::default(),
+        redactor,
+        DEFAULT_CLUSTERS_PER_REPOSITORY,
+    )
 }
 
 fn render(doctor: &Doctor, redactor: Redactor) -> String {
@@ -135,6 +143,7 @@ fn render(doctor: &Doctor, redactor: Redactor) -> String {
     };
     DoctorReport {
         window: None,
+        clusters_per_repo: DEFAULT_CLUSTERS_PER_REPOSITORY,
         generated_at: at("2026-08-30T00:00:00Z"),
         doctor,
         instrumentation: &instrumentation,
