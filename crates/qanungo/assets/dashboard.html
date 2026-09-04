@@ -1392,6 +1392,67 @@ function costSection(cost) {
     nodes.push(list);
   }
 
+  /* Small sessions at the top price tier: the same reading the document renders, and the
+     same refusal to draw a conclusion from it. Nothing here scores or ranks — the archive
+     records what a session cost and how much it wrote, never what it was worth. */
+  const premium = cost.premium;
+  if (premium.any) {
+    nodes.push(
+      el(
+        "p",
+        "note",
+        premium.totals.sessions +
+          " of the " +
+          premium.sessions +
+          " sessions priced wholly at the dearest rate the price table held on the day the" +
+          " archive took them billed at most " +
+          premium.floors.max_messages +
+          " messages and produced at most " +
+          premium.floors.max_output_tokens_rendered +
+          " output tokens. " +
+          (premium.totals.sessions === 1 ? "That session cost " : "Together they cost ") +
+          premium.totals.dollars_rendered +
+          " — dollars already inside the total above and inside their model's row in it, not" +
+          " beside them. This is an observation about spend and not a score: nothing here says a" +
+          " cheaper model would have done, and both floors are arbitrary-until-measured constants."
+      )
+    );
+    nodes.push(
+      table(
+        "Small sessions at the top price tier",
+        [
+          { label: "Archived", name: true },
+          { label: "Model", name: true },
+          { label: "Messages", figure: true },
+          { label: "Output", figure: true },
+          { label: "Cost", figure: true },
+          { label: "Session", name: true },
+        ],
+        premium.rows.map((row) => [
+          row.archived_at === null ? "an unreadable time" : row.archived_at,
+          row.models.join(", "),
+          row.messages,
+          row.output_rendered,
+          row.dollars_rendered,
+          row.source_hash,
+        ])
+      )
+    );
+    if (premium.rows_hidden) {
+      nodes.push(
+        el(
+          "p",
+          "note",
+          premium.rows_hidden +
+            (premium.rows_hidden === 1
+              ? " further session under the same floors is not shown; "
+              : " further sessions under the same floors are not shown; ") +
+            "the totals above count every one of them."
+        )
+      );
+    }
+  }
+
   if (cost.duplicate_records) {
     nodes.push(
       el(

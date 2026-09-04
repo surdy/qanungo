@@ -49,7 +49,7 @@
 //! `assistant_meta` is read and its `classification` — the user text, the assistant text, the
 //! tool arguments — is never touched. See [`crate::cost_report`] for the rendering line.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::BufRead;
 
 use chrono::{DateTime, Utc};
@@ -64,6 +64,39 @@ use crate::pricing::{self, Price, Rates, Unpriced};
 /// stated rather than silent — usage past it is summed per record and flagged as
 /// undeduplicatable, so a capped session over-counts *visibly* instead of dropping spend.
 pub const MAX_TRACKED_MESSAGE_IDS: usize = 100_000;
+
+/// The most output tokens a session may have produced and still be listed by [`PremiumFlag`].
+///
+/// **Arbitrary until measured**, and measured once — the whole archive as of 2026-09-04, which is
+/// 907 sessions, 391 of them priced, 61 of *those* priced wholly at the day's top tier. The output
+/// distribution of those 61 is long-tailed: a median of 88,389 tokens, a maximum of 482,603, and a
+/// visible floor cluster of four sessions at 687, 696, 2,040 and 2,845 tokens with a gap to the
+/// next one at 4,404. This constant is set in that gap. It selects 4 of 61 (6.6%), which is a
+/// handful somebody can open; the median would have selected half the window, which is a census.
+///
+/// The cluster is where a session stops looking like a piece of work and starts looking like a
+/// question and an answer — but that is a description of a *shape*, not a judgement about it. A
+/// session under this floor is a small session, and whether small was the wrong place for the
+/// dearest model is the reader's call and nobody else's.
+pub const PREMIUM_FLAG_MAX_OUTPUT_TOKENS: u64 = 3_000;
+
+/// The most billed messages a session may have carried and still be listed by [`PremiumFlag`].
+///
+/// **Arbitrary until measured**, on the same 61-session distribution: the median top-tier session
+/// billed 102 messages and the largest 598, so a ceiling of eight is a handful of exchanges rather
+/// than a working session. Over that archive it was **not** the binding floor — all four sessions
+/// [`PREMIUM_FLAG_MAX_OUTPUT_TOKENS`] selected billed seven messages or fewer, and this one
+/// excluded none of them — and it is carried anyway, because the two floors describe different
+/// shapes: a session can write very little across a hundred messages, and that is a working
+/// session with a quiet model rather than a small one.
+///
+/// Billed *messages*, deliberately, and not user requests. This fold reads
+/// [`munshi_transcript::Record`]'s `assistant_meta` and never a record's classification, so the
+/// count it can honestly state is the number of distinct API messages the session was billed for —
+/// which is also the number the report's by-model table prints, so the two reconcile. Counting user
+/// turns would mean reading the conversation, which is exactly what the cost lane's redaction line
+/// forbids.
+pub const PREMIUM_FLAG_MAX_MESSAGES: u64 = 8;
 
 /// What a harness's transcripts can say about money.
 ///
@@ -472,6 +505,101 @@ impl Flagged {
     }
 }
 
+/// One session whose whole measured usage was priced at the top tier of the price table on the day
+/// the archive took it, and whose size fell under both of [`PremiumFlag`]'s floors.
+///
+/// Every field is an aggregate or an archive-stated identifier, so this carries the cost lane's
+/// redaction line unchanged: the models are the harness's own strings and `source_hash` is the
+/// content digest a reader fetches the session with. There is no excerpt, no title, and no
+/// repository-shaped narrative here — the *reading* is the numbers, and the transcript behind them
+/// is one archive request away for anyone who wants it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PremiumSession {
+    /// The transcript's content hash — the handle for reading the session in full.
+    pub source_hash: String,
+    /// When the archive took it, which is also the day its tier was read as of. Always `Some` for
+    /// a session that reaches this list — nothing prices without an archive time — and carried as
+    /// an option anyway rather than unwrapped, on [`SessionCost::archived_at`]'s own reasoning.
+    pub archived_at: Option<DateTime<Utc>>,
+    /// The top-tier models it billed under, deduplicated and sorted. More than one only where the
+    /// table priced two models identically that day.
+    pub models: Vec<String>,
+    pub dollars: f64,
+    pub output: u64,
+    /// Distinct API messages billed — the same quantity the by-model table counts.
+    pub messages: u64,
+}
+
+/// Sessions the window priced entirely at the day's dearest published rate, and the small ones
+/// among them.
+///
+/// # What "premium" is allowed to mean here
+///
+/// Exactly [`crate::pricing::is_top_tier_model`]: the model whose published output rate was the
+/// highest of any row effective on the session's archive date, plus any model tied with it
+/// exactly. No model id is named in this file. A list of "expensive models" would be a second
+/// price opinion with no date on it sitting beside a dated table, and it would go stale silently
+/// the first time the catalogue moved — which the price table is arranged never to do.
+///
+/// # Which sessions are eligible at all
+///
+/// Only claude-code sessions, because only they have dollars and a tier: a Copilot session records
+/// output tokens and nothing else and its billing regime is not recoverable from a transcript, so
+/// it has no rate to be at the top of ([`BillingSignal`]), and a Codex session records no usage at
+/// all. Neither ever appears here, in any window.
+///
+/// And, among those, only sessions this build could read *whole*: every priced billing key at a
+/// top-tier model, and no tokens at all on any key that did not price — no cheaper model beside it,
+/// no unpriced model, no token-carrying `<synthetic>` placeholder. That refusal is what makes the
+/// three figures below the session's entire measured production rather than a share of it, and it
+/// is the same posture as the rest of the lane: a session whose shape this build cannot state in
+/// full is one it declines to characterize.
+///
+/// # It is a reading, not a verdict
+///
+/// Nothing here scores, ranks against a target, or says a cheaper model would have done. A
+/// transcript records what a session cost and how much it wrote; it does not record what the
+/// session was worth, and no arithmetic over the first two produces the third. The flag exists so
+/// a reader can look at a handful of specific sessions and decide for themselves — which is why it
+/// lists them, with the hash to go and read each one, instead of reporting a rate.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PremiumFlag {
+    /// Sessions that met the eligibility above, whatever their size — the denominator the flagged
+    /// count is a share of, without which "three sessions" is a number with no scale.
+    pub sessions: usize,
+    /// Those of them under both floors, dearest first and then by hash: a deterministic order, so
+    /// two runs over one window render the same document.
+    pub flagged: Vec<PremiumSession>,
+}
+
+impl PremiumFlag {
+    /// Whether anything at all is flagged. An empty flag renders nothing — the section is elided,
+    /// not printed as a heading over an empty table.
+    pub fn any(&self) -> bool {
+        !self.flagged.is_empty()
+    }
+
+    /// What the flagged sessions cost between them, in the dollars the window's own total already
+    /// contains. Summed rather than stored so it cannot disagree with the list it is a total of.
+    pub fn dollars(&self) -> f64 {
+        self.flagged.iter().map(|session| session.dollars).sum()
+    }
+
+    /// Output tokens across the flagged sessions.
+    pub fn output(&self) -> u64 {
+        self.flagged
+            .iter()
+            .fold(0, |total, session| total.saturating_add(session.output))
+    }
+
+    /// Billed messages across the flagged sessions.
+    pub fn messages(&self) -> u64 {
+        self.flagged
+            .iter()
+            .fold(0, |total, session| total.saturating_add(session.messages))
+    }
+}
+
 /// Copilot's token volumes for one model. No dollars, by construction — see [`BillingSignal`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CopilotTokens {
@@ -499,6 +627,11 @@ pub struct CostTotals {
     /// report can say a harness contributed nothing rather than leaving it unmentioned.
     pub no_signal_sessions: BTreeMap<String, usize>,
     pub flagged: Flagged,
+    /// Sessions priced wholly at the day's top tier, and the small ones among them. An annotation
+    /// on the window and never a part of it: nothing in [`PremiumFlag`] moves a dollar or a token
+    /// in any figure above, and every dollar it names is already inside
+    /// [`CostTotals::priced`] and inside its model's row.
+    pub premium: PremiumFlag,
     /// Records read across every folded session.
     pub records_read: u64,
     /// Records dropped as repeats of a message already counted, across every folded session.
@@ -533,6 +666,15 @@ impl CostTotals {
                 }
             }
         }
+        // Deterministic, and sorted once at the end rather than maintained per session: dearest
+        // first, because the reason to read a list of small expensive sessions is to see the
+        // expensive ones, and by hash under a tie so two runs over one window agree byte for byte.
+        totals.premium.flagged.sort_by(|left, right| {
+            right
+                .dollars
+                .total_cmp(&left.dollars)
+                .then_with(|| left.source_hash.cmp(&right.source_hash))
+        });
         totals
     }
 
@@ -540,6 +682,7 @@ impl CostTotals {
     /// window, the model, and the repository.
     fn absorb_priceable(&mut self, session: &SessionCost) {
         self.priceable_sessions += 1;
+        let mut reading = PremiumReading::default();
         for (key, tally) in &session.fold.usage {
             match pricing::price_for(
                 key.model.as_deref(),
@@ -573,6 +716,7 @@ impl CostTotals {
                         .model
                         .clone()
                         .expect("a priced key names the model it was priced by");
+                    reading.observe_priced(&model, session.archived_at, tally, priced.dollars);
                     self.by_model.entry(model).or_default().absorb(&priced);
                     self.by_repository
                         .entry(session.repository.clone())
@@ -594,13 +738,26 @@ impl CostTotals {
                             .saturating_add(tally.cache_write_untiered_messages);
                     }
                 }
-                Price::Unbilled => self.flagged.synthetic.absorb(tally),
-                Price::Unpriced(reason) => self
-                    .flagged
-                    .unpriced
-                    .entry(reason)
-                    .or_default()
-                    .absorb(tally),
+                Price::Unbilled => {
+                    reading.observe_unpriced(tally);
+                    self.flagged.synthetic.absorb(tally);
+                }
+                Price::Unpriced(reason) => {
+                    reading.observe_unpriced(tally);
+                    self.flagged
+                        .unpriced
+                        .entry(reason)
+                        .or_default()
+                        .absorb(tally);
+                }
+            }
+        }
+        if let Some(premium) = reading.settle(&session.source_hash, session.archived_at) {
+            self.premium.sessions += 1;
+            if premium.output <= PREMIUM_FLAG_MAX_OUTPUT_TOKENS
+                && premium.messages <= PREMIUM_FLAG_MAX_MESSAGES
+            {
+                self.premium.flagged.push(premium);
             }
         }
     }
@@ -618,6 +775,88 @@ impl CostTotals {
     /// Whether any priced session contributed anything at all.
     pub fn priced_anything(&self) -> bool {
         self.priced.tokens.messages > 0
+    }
+}
+
+/// One session's answer to [`PremiumFlag`]'s eligibility question, accumulated as its billing keys
+/// are priced.
+///
+/// A separate accumulator rather than three locals in [`CostTotals::absorb_priceable`] because the
+/// question it answers is a conjunction over *every* key — one cheaper model, or one token on a key
+/// that did not price, and the session is not one this build will characterize — and a conjunction
+/// spread across a match arm is the kind of thing that quietly becomes a disjunction.
+#[derive(Debug)]
+struct PremiumReading {
+    models: BTreeSet<String>,
+    dollars: f64,
+    output: u64,
+    messages: u64,
+    /// Whether every key that priced did so at a top-tier model. Starts `true` — the vacuous truth
+    /// a conjunction starts from, which is why this default is written out rather than derived.
+    wholly_top_tier: bool,
+    /// Whether anything priced at all. A session with no billable usage is not a cheap top-tier
+    /// session; it is a session with nothing to read.
+    priced_anything: bool,
+    /// Tokens on keys that did not price — unpriced models, and `<synthetic>` placeholders. Any at
+    /// all and the figures above stop being the whole of what the session produced.
+    unpriced_tokens: u64,
+}
+
+impl Default for PremiumReading {
+    fn default() -> Self {
+        Self {
+            models: BTreeSet::new(),
+            dollars: 0.0,
+            output: 0,
+            messages: 0,
+            wholly_top_tier: true,
+            priced_anything: false,
+            unpriced_tokens: 0,
+        }
+    }
+}
+
+impl PremiumReading {
+    /// Folds one priced billing key.
+    fn observe_priced(
+        &mut self,
+        model: &str,
+        archived_at: Option<DateTime<Utc>>,
+        tally: &TokenTally,
+        dollars: f64,
+    ) {
+        self.priced_anything = true;
+        if archived_at.is_some_and(|at| pricing::is_top_tier_model(model, at)) {
+            self.models.insert(model.to_owned());
+        } else {
+            self.wholly_top_tier = false;
+        }
+        self.dollars += dollars;
+        self.output = self.output.saturating_add(tally.output);
+        self.messages = self.messages.saturating_add(tally.messages);
+    }
+
+    /// Folds one key that carried no dollars, for either reason.
+    fn observe_unpriced(&mut self, tally: &TokenTally) {
+        self.unpriced_tokens = self.unpriced_tokens.saturating_add(tally.total());
+    }
+
+    /// The session, if this build read the whole of it at the top tier.
+    fn settle(
+        self,
+        source_hash: &str,
+        archived_at: Option<DateTime<Utc>>,
+    ) -> Option<PremiumSession> {
+        (self.wholly_top_tier && self.priced_anything && self.unpriced_tokens == 0).then(|| {
+            PremiumSession {
+                source_hash: source_hash.to_owned(),
+                archived_at,
+                models: self.models.into_iter().collect(),
+                dollars: self.dollars,
+                output: self.output,
+                messages: self.messages,
+            }
+        })
     }
 }
 
@@ -1047,6 +1286,337 @@ mod tests {
         // And the real cap is far above any session the archive holds — 29,591 message ids
         // across all 623 of them, measured 2026-08-23.
         const { assert!(MAX_TRACKED_MESSAGE_IDS >= 29_591) };
+    }
+
+    // -----------------------------------------------------------------------
+    // The top-tier flag
+    // -----------------------------------------------------------------------
+
+    /// A session whose whole usage is one small billing key, at `model`, archived at `archived_at`.
+    fn small_session(hash: &str, model: &str, archived_at: &str, output: u64) -> SessionCost {
+        SessionCost {
+            source_hash: hash.to_owned(),
+            archived_at: Some(at(archived_at)),
+            ..session(
+                fold_claude(&claude_record(
+                    "msg_1",
+                    model,
+                    &format!(r#"{{"output_tokens":{output}}}"#),
+                )),
+                None,
+            )
+        }
+    }
+
+    /// The flag's whole premise: "premium" is the table's own top tier on the session's own date,
+    /// never a list of models. Fable 5 at $50 of output is the dearest row today, so a small
+    /// session on it is listed and an equally small one on Opus 5 at $25 is not — and the second
+    /// half of that is the point, because Opus is the model somebody would have put on a list.
+    #[test]
+    fn only_the_days_dearest_published_model_is_read_as_premium() {
+        let totals = CostTotals::fold(&[
+            small_session(
+                &"a".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                500,
+            ),
+            small_session(
+                &"b".repeat(64),
+                "claude-opus-5",
+                "2026-08-01T00:00:00Z",
+                500,
+            ),
+            small_session(
+                &"c".repeat(64),
+                "claude-sonnet-5",
+                "2026-08-01T00:00:00Z",
+                500,
+            ),
+        ]);
+        assert_eq!(totals.premium.sessions, 1, "{:?}", totals.premium);
+        assert_eq!(totals.premium.flagged.len(), 1);
+        assert_eq!(totals.premium.flagged[0].source_hash, "a".repeat(64));
+        assert_eq!(totals.premium.flagged[0].models, vec!["claude-fable-5"]);
+        assert_eq!(totals.premium.flagged[0].output, 500);
+        assert_eq!(totals.premium.flagged[0].messages, 1);
+        // $50/MTok on 500 output tokens, and the same dollars the by-model row carries.
+        let expected = pricing::dollars(500, 50.00, 1.0);
+        assert!((totals.premium.flagged[0].dollars - expected).abs() < 1e-12);
+        assert!((totals.by_model["claude-fable-5"].dollars - expected).abs() < 1e-12);
+    }
+
+    /// The tier is read as of the session's **own** archive time, so the same model and the same
+    /// tokens flag on one side of a launch and not on the other. Before Fable 5 existed, Opus 4.8
+    /// was the dearest row in the table and a small session on it was a small session at the top
+    /// tier; from the launch instant it is not, and nothing in this build was edited to say so.
+    #[test]
+    fn the_tier_moves_with_the_table_rather_than_with_the_build() {
+        let before = CostTotals::fold(&[small_session(
+            &"a".repeat(64),
+            "claude-opus-4-8",
+            "2026-06-08T23:59:59Z",
+            500,
+        )]);
+        assert_eq!(before.premium.flagged.len(), 1, "{:?}", before.premium);
+
+        let after = CostTotals::fold(&[small_session(
+            &"a".repeat(64),
+            "claude-opus-4-8",
+            "2026-06-09T00:00:00Z",
+            500,
+        )]);
+        assert_eq!(after.premium.sessions, 0, "{:?}", after.premium);
+        assert!(!after.premium.any());
+        // And the money is untouched by which side of the boundary it fell on: the flag annotates
+        // the window, it does not price it.
+        assert!((before.priced.dollars - after.priced.dollars).abs() < 1e-12);
+    }
+
+    /// Both floors, and both directions of each. A session over either one is not listed, and a
+    /// session at exactly either one is — the floors are inclusive, which is the reading the
+    /// report's own sentence ("at most") states.
+    #[test]
+    fn a_session_over_either_floor_is_not_listed() {
+        let output = |tokens: u64| {
+            CostTotals::fold(&[small_session(
+                &"a".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                tokens,
+            )])
+        };
+        assert_eq!(
+            output(PREMIUM_FLAG_MAX_OUTPUT_TOKENS).premium.flagged.len(),
+            1
+        );
+        let over = output(PREMIUM_FLAG_MAX_OUTPUT_TOKENS + 1);
+        assert_eq!(over.premium.flagged.len(), 0);
+        assert_eq!(
+            over.premium.sessions, 1,
+            "still a top-tier session, and still counted as the denominator it is",
+        );
+
+        // The message floor, exercised on its own: tiny output spread across too many messages.
+        let messages = |count: u64| {
+            let transcript = (0..count)
+                .map(|index| {
+                    claude_record(
+                        &format!("msg_{index}"),
+                        "claude-fable-5",
+                        r#"{"output_tokens":1}"#,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            CostTotals::fold(&[SessionCost {
+                archived_at: Some(at("2026-08-01T00:00:00Z")),
+                ..session(fold_claude(&transcript), None)
+            }])
+        };
+        assert_eq!(messages(PREMIUM_FLAG_MAX_MESSAGES).premium.flagged.len(), 1);
+        let chatty = messages(PREMIUM_FLAG_MAX_MESSAGES + 1);
+        assert_eq!(chatty.premium.flagged.len(), 0);
+        assert_eq!(chatty.premium.sessions, 1);
+    }
+
+    /// Copilot has no rate and therefore no tier, and Codex records no usage at all: neither can
+    /// reach the list in any window, however small its sessions are. The lane's standing rule,
+    /// pinned here rather than left to the fact that `absorb_priceable` happens not to be called
+    /// for them.
+    #[test]
+    fn copilot_and_codex_sessions_never_reach_the_top_tier_list() {
+        let copilot = SessionCost {
+            source_agent: "copilot-cli".to_owned(),
+            fold: fold_cost(
+                Source::Copilot,
+                2,
+                r#"{"type":"assistant.message","timestamp":"2026-08-01T10:00:00.000Z","data":{"content":"one","messageId":"m1","model":"claude-fable-5","outputTokens":100}}"#.as_bytes(),
+            )
+            .unwrap(),
+            ..small_session(&"a".repeat(64), "claude-fable-5", "2026-08-01T00:00:00Z", 100)
+        };
+        let codex = SessionCost {
+            source_agent: "codex-cli".to_owned(),
+            fold: CostFold::default(),
+            ..small_session(
+                &"b".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                100,
+            )
+        };
+        let totals = CostTotals::fold(&[copilot, codex]);
+        assert_eq!(totals.premium.sessions, 0, "{:?}", totals.premium);
+        assert!(!totals.premium.any());
+    }
+
+    /// Only sessions this build read *whole*. A cheaper model beside the dear one, a model with no
+    /// price row, and a token-bearing `<synthetic>` placeholder each leave a session out — because
+    /// the three figures the list would print for it would be a share of that session rather than
+    /// all of it. A zero-token placeholder takes nothing away, so it does not.
+    #[test]
+    fn a_session_this_build_could_not_read_whole_is_not_characterized() {
+        let two_models = SessionCost {
+            archived_at: Some(at("2026-08-01T00:00:00Z")),
+            ..session(
+                fold_claude(
+                    &[
+                        claude_record("msg_1", "claude-fable-5", r#"{"output_tokens":100}"#),
+                        claude_record("msg_2", "claude-opus-5", r#"{"output_tokens":100}"#),
+                    ]
+                    .join("\n"),
+                ),
+                None,
+            )
+        };
+        assert_eq!(CostTotals::fold(&[two_models]).premium.sessions, 0);
+
+        let with_unpriced = SessionCost {
+            archived_at: Some(at("2026-08-01T00:00:00Z")),
+            ..session(
+                fold_claude(
+                    &[
+                        claude_record("msg_1", "claude-fable-5", r#"{"output_tokens":100}"#),
+                        claude_record("msg_2", "claude-fable-5-1", r#"{"output_tokens":100}"#),
+                    ]
+                    .join("\n"),
+                ),
+                None,
+            )
+        };
+        assert_eq!(CostTotals::fold(&[with_unpriced]).premium.sessions, 0);
+
+        let with_synthetic = |output: u64| SessionCost {
+            archived_at: Some(at("2026-08-01T00:00:00Z")),
+            ..session(
+                fold_claude(
+                    &[
+                        claude_record("msg_1", "claude-fable-5", r#"{"output_tokens":100}"#),
+                        claude_record(
+                            "msg_2",
+                            pricing::SYNTHETIC_MODEL,
+                            &format!(r#"{{"output_tokens":{output}}}"#),
+                        ),
+                    ]
+                    .join("\n"),
+                ),
+                None,
+            )
+        };
+        assert_eq!(
+            CostTotals::fold(&[with_synthetic(0)]).premium.flagged.len(),
+            1,
+            "a placeholder that carried no tokens took nothing away from the reading",
+        );
+        assert_eq!(
+            CostTotals::fold(&[with_synthetic(50)]).premium.sessions,
+            0,
+            "one that carried tokens did",
+        );
+    }
+
+    /// Two models tied at the top of the table share the tier, and a session that used both is
+    /// still a session read whole — it names both. Built against a date on which the shipped table
+    /// has no tie, by pricing usage that resolves to the same top rate through the fast tier.
+    #[test]
+    fn a_fast_tier_session_is_still_a_session_on_its_own_model() {
+        // Opus 5's fast tier bills at Fable 5's base rate, but the model it bills is still Opus 5,
+        // whose *published* row is $25 — so the day's top tier is Fable's and this is not on it.
+        let fast = SessionCost {
+            archived_at: Some(at("2026-08-01T00:00:00Z")),
+            ..session(
+                fold_claude(&claude_record(
+                    "msg_1",
+                    "claude-opus-5",
+                    r#"{"output_tokens":100,"speed":"fast"}"#,
+                )),
+                None,
+            )
+        };
+        let totals = CostTotals::fold(&[fast]);
+        assert_eq!(
+            totals.premium.sessions, 0,
+            "a tier is not a model: what ranks is the row the catalogue publishes",
+        );
+        assert_eq!(totals.priced.fast_messages, 1, "and it still billed fast");
+    }
+
+    /// The order is deterministic and dearest-first, so two runs over one window render the same
+    /// document. Ties on dollars fall back to the hash, which is the only other thing a listed
+    /// session carries that cannot collide.
+    #[test]
+    fn the_listed_sessions_are_ordered_dearest_first_then_by_hash() {
+        let totals = CostTotals::fold(&[
+            small_session(
+                &"c".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                100,
+            ),
+            small_session(
+                &"a".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                900,
+            ),
+            small_session(
+                &"b".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                100,
+            ),
+        ]);
+        let order: Vec<&str> = totals
+            .premium
+            .flagged
+            .iter()
+            .map(|session| &session.source_hash[..1])
+            .collect();
+        assert_eq!(order, vec!["a", "b", "c"]);
+
+        // The totals are sums over the whole list, so a render that caps the table still states
+        // what every listed session came to.
+        assert_eq!(totals.premium.output(), 1_100);
+        assert_eq!(totals.premium.messages(), 3);
+        let expected = pricing::dollars(1_100, 50.00, 1.0);
+        assert!((totals.premium.dollars() - expected).abs() < 1e-12);
+    }
+
+    /// The flag annotates and never moves a number: the window's dollars, tokens, by-model, and
+    /// by-repository cuts are identical whether or not a session in it happened to be small.
+    #[test]
+    fn the_flag_moves_no_dollar_and_no_token_in_the_window() {
+        let sessions = [
+            small_session(
+                &"a".repeat(64),
+                "claude-fable-5",
+                "2026-08-01T00:00:00Z",
+                100,
+            ),
+            small_session(
+                &"b".repeat(64),
+                "claude-opus-5",
+                "2026-08-01T00:00:00Z",
+                100,
+            ),
+        ];
+        let totals = CostTotals::fold(&sessions);
+        assert!(totals.premium.any());
+
+        let flagged_dollars = totals.premium.dollars();
+        assert!(flagged_dollars > 0.0);
+        assert!(
+            totals.priced.dollars > flagged_dollars,
+            "the flagged session's dollars are inside the total, not the whole of it",
+        );
+        assert_eq!(totals.priced.tokens.output, 200);
+        assert_eq!(totals.priced.tokens.messages, 2);
+        assert_eq!(totals.by_model.len(), 2);
+        assert!(
+            !totals.flagged.any(),
+            "and nothing here is an unpriced flag"
+        );
     }
 
     /// Token sums saturate rather than wrapping: these are counts read from somebody else's file,

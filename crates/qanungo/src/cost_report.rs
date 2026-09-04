@@ -42,11 +42,20 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::cli::Window;
-use crate::cost::CostTotals;
+use crate::cost::{CostTotals, PREMIUM_FLAG_MAX_MESSAGES, PREMIUM_FLAG_MAX_OUTPUT_TOKENS};
 use crate::format::{self, identifier};
 use crate::pricing::PRICE_TABLE_REVISION;
 use crate::report::{SkippedNote, change, stamp};
 use crate::sync::SyncStats;
+
+/// Rows the top-tier section prints before it stops listing and starts counting.
+///
+/// A cut on the *rendering* and never on the flag: every figure in the section's own totals is the
+/// number it would be at any cap, and a run whose list is truncated says so on the line below it —
+/// the [`crate::doctor_report`] idiom, for the same reason. A window can hold hundreds of small
+/// sessions, and a document that listed all of them would be a table nobody reads instead of a
+/// handful somebody opens.
+pub const PREMIUM_SESSIONS_LISTED: usize = 20;
 
 /// What a cost run cost, folded into the footer.
 #[derive(Debug, Clone)]
@@ -89,6 +98,7 @@ impl CostReport<'_> {
         self.render_priced(&mut out);
         self.render_copilot(&mut out);
         self.render_flagged(&mut out);
+        self.render_premium(&mut out);
         self.render_gaps(&mut out);
         self.render_footer(&mut out);
         out
@@ -453,6 +463,123 @@ impl CostReport<'_> {
         }
     }
 
+    /// The window's small top-tier sessions: what each of them cost, what it produced, and the
+    /// hash to go and read it with.
+    ///
+    /// # Why this is a section and not a score
+    ///
+    /// It reports a *shape* — dollars at the day's dearest published rate, against the tokens and
+    /// messages the same session billed — and stops there. No word in it says that a listed
+    /// session was a mistake, that a cheaper model would have done, or that a reader should do
+    /// anything at all: the archive records what a session cost and how much it wrote, and it does
+    /// not record what the session was worth. That last figure is the one a judgement would need,
+    /// so the judgement stays with the reader, which is the same posture the flagged section above
+    /// takes when it refuses to price a token it cannot price.
+    ///
+    /// The section is elided when nothing is flagged, exactly as that one is: a heading over an
+    /// empty table would read as a finding of absence, and this build has not measured one.
+    fn render_premium(&self, out: &mut String) {
+        let premium = &self.totals.premium;
+        if !premium.any() {
+            return;
+        }
+        out.push_str("\n## Small sessions at the top price tier\n\n");
+        let _ = writeln!(
+            out,
+            "{} of the {} {} this build priced wholly at the dearest rate its table held on the day \
+             the archive took them billed at most {PREMIUM_FLAG_MAX_MESSAGES} messages and produced \
+             at most {} output tokens. {} **{}** and produced {} output tokens over {} billed {} — \
+             dollars already inside the total above and inside their model's row in it, not beside \
+             them.",
+            premium.flagged.len(),
+            premium.sessions,
+            plural(premium.sessions, "session", "sessions"),
+            format::tokens(PREMIUM_FLAG_MAX_OUTPUT_TOKENS),
+            plural(
+                premium.flagged.len(),
+                "That session cost",
+                "Together they cost",
+            ),
+            format::dollars(premium.dollars()),
+            format::tokens(premium.output()),
+            premium.messages(),
+            // A `u64` of messages against a `usize` of sessions, so the cast the idiom wants is
+            // done here rather than by widening `plural` for one caller. Saturating, because a
+            // count that large is already an absurd number a reader can see.
+            plural(
+                usize::try_from(premium.messages()).unwrap_or(usize::MAX),
+                "message",
+                "messages",
+            ),
+        );
+        out.push_str(
+            "\nThis is an observation about spend and not a score. The archive records what a \
+             session was billed and how much it wrote; it does not record what the session was \
+             worth, and no arithmetic over the first two produces the third. Nothing here claims a \
+             cheaper model would have done as well, and no rate, trend, or target is drawn from it \
+             — the list exists so that a handful of specific sessions can be read and judged by \
+             somebody who was there.\n",
+        );
+        let _ = writeln!(
+            out,
+            "\n**Top tier** is read from the price table rather than from a list of models: the \
+             highest published output rate of any row effective on each session's own archive date \
+             (price table {PRICE_TABLE_REVISION}, sourced in \
+             `docs/pricing-sources-{PRICE_TABLE_REVISION}.md`), together with any model tied with \
+             it exactly. A rate merely close to the top is not a tie, and no model id is named in \
+             the code that reads this — so the day the catalogue moves, the table moves with it and \
+             this section follows. Copilot sessions never appear here at all: they record output \
+             tokens and no rate, so there is no tier for them to be at.",
+        );
+        let _ = writeln!(
+            out,
+            "\nOnly sessions this build read **whole** are listed: every priced message at a \
+             top-tier model, and no tokens on anything it could not price. One carrying a cheaper \
+             model beside it, a model with no price row, or a token-bearing `<synthetic>` \
+             placeholder is left out, because the three figures below it would then be a share of \
+             that session rather than all of it. Both floors — {PREMIUM_FLAG_MAX_MESSAGES} \
+             messages, {} output tokens — are arbitrary-until-measured constants named in \
+             `crates/qanungo/src/cost.rs`.",
+            format::tokens(PREMIUM_FLAG_MAX_OUTPUT_TOKENS),
+        );
+        out.push_str("\n| Archived | Model | Messages | Output | Cost | Session |\n");
+        out.push_str("| --- | --- | ---: | ---: | ---: | --- |\n");
+        for session in premium.flagged.iter().take(PREMIUM_SESSIONS_LISTED) {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | `{}` |",
+                match session.archived_at {
+                    Some(at) => stamp(at),
+                    // Unreachable: nothing prices without an archive time to select a row as of,
+                    // and this list holds only sessions that priced. Stated rather than unwrapped,
+                    // because inventing a date for a session whose own the archive gave unreadably
+                    // is the guess the whole lane refuses to make.
+                    None => "an unreadable time".to_owned(),
+                },
+                session
+                    .models
+                    .iter()
+                    .map(|model| format!("`{}`", identifier(model)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                session.messages,
+                format::tokens(session.output),
+                format::dollars(session.dollars),
+                identifier(&session.source_hash),
+            );
+        }
+        if premium.flagged.len() > PREMIUM_SESSIONS_LISTED {
+            let hidden = premium.flagged.len() - PREMIUM_SESSIONS_LISTED;
+            let _ = writeln!(
+                out,
+                "\n_{hidden} further {} under the same floors {} not shown; the totals above count \
+                 every one of them._",
+                plural(hidden, "session", "sessions"),
+                plural(hidden, "is", "are"),
+            );
+        }
+    }
+
     fn render_gaps(&self, out: &mut String) {
         if self.skipped.is_empty() {
             return;
@@ -502,6 +629,10 @@ impl CostReport<'_> {
             display_path(&instrumentation.cache_root),
         );
     }
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
 }
 
 fn display_path(path: &Path) -> String {
@@ -868,6 +999,171 @@ mod tests {
             markdown.contains("1 recording no per-message usage at all (codex-cli)"),
             "{markdown}"
         );
+    }
+
+    /// A session on the day's dearest model, small enough to clear both floors.
+    fn small_top_tier(hash: &str, output: u64) -> SessionCost {
+        SessionCost {
+            source_hash: hash.to_owned(),
+            ..claude_session(
+                "claude-fable-5",
+                hash,
+                &format!(r#"{{"output_tokens":{output}}}"#),
+                None,
+            )
+        }
+    }
+
+    /// The section says what it measured, what it did not measure, and where the numbers already
+    /// are — and it names both floors and the table it read the tier from, so a reader never has
+    /// to go and find out what "top tier" or "small" meant on this run.
+    #[test]
+    fn the_top_tier_section_explains_its_own_constants_and_claims_nothing_more() {
+        let totals = CostTotals::fold(&[
+            small_top_tier(&"a".repeat(64), 1_000),
+            // A larger session on the same model: the denominator, and not listed.
+            claude_session(
+                "claude-fable-5",
+                "msg_big",
+                r#"{"output_tokens":500000}"#,
+                None,
+            ),
+        ]);
+        let markdown = render(&totals, None);
+        assert!(
+            markdown.contains("## Small sessions at the top price tier"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("1 of the 2 sessions this build priced wholly at the dearest rate"),
+            "{markdown}"
+        );
+        // Both floors, spelled out in the units the table beside them is printed in.
+        assert!(
+            markdown.contains("billed at most 8 messages and produced at most 3.0k output tokens"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "arbitrary-until-measured constants named in `crates/qanungo/src/cost.rs`"
+            ),
+            "{markdown}"
+        );
+        // The tier is sourced, and sourced to the same dated table the dollars are.
+        assert!(
+            markdown.contains(
+                "highest published output rate of any row effective on each session's own archive \
+                 date (price table 2026-08-23"
+            ),
+            "{markdown}"
+        );
+        // And the judgement is left where it belongs, in as many words.
+        assert!(
+            markdown.contains("an observation about spend and not a score"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("does not record what the session was worth"),
+            "{markdown}"
+        );
+        for judgement in ["waste", "should have", "too expensive", "overspend"] {
+            assert!(
+                !markdown.to_ascii_lowercase().contains(judgement),
+                "`{judgement}` reached the document: {markdown}",
+            );
+        }
+
+        // The row: 1,000 output tokens of Fable 5 at $50/MTok is five cents, and the same five
+        // cents are inside the by-model table above it.
+        assert!(
+            markdown.contains(&format!(
+                "| 2026-08-10T00:00:00Z | `claude-fable-5` | 1 | 1.0k | $0.05 | `{}` |",
+                "a".repeat(64),
+            )),
+            "{markdown}"
+        );
+        // One session, one message: the headline reads as English rather than as a template with a
+        // count dropped into it.
+        assert!(
+            markdown.contains(
+                "That session cost **$0.05** and produced 1.0k output tokens over 1 billed message \
+                 —"
+            ),
+            "{markdown}"
+        );
+    }
+
+    /// Nothing flagged, nothing rendered: the section is elided exactly as the flagged one above it
+    /// is, because a heading over an empty table reads as a measured absence and this build has
+    /// measured nothing of the sort.
+    #[test]
+    fn a_window_with_no_small_top_tier_session_renders_no_section_at_all() {
+        // A session on a cheaper model, and a large one on the dearest: neither is listed.
+        let totals = CostTotals::fold(&[
+            claude_session("claude-opus-5", "msg_1", r#"{"output_tokens":10}"#, None),
+            claude_session(
+                "claude-fable-5",
+                "msg_2",
+                r#"{"output_tokens":500000}"#,
+                None,
+            ),
+        ]);
+        let markdown = render(&totals, None);
+        assert!(!markdown.contains("top price tier"), "{markdown}");
+        // The rest of the document is unaffected by the section that did not render.
+        assert!(markdown.contains("| `claude-fable-5` |"), "{markdown}");
+
+        // And an entirely empty window, where there is not even a denominator.
+        assert!(!render(&CostTotals::default(), None).contains("top price tier"));
+    }
+
+    /// The cap is a cut on the rendering and never on the flag: the table stops at
+    /// [`PREMIUM_SESSIONS_LISTED`] rows, says how many it did not print, and the totals above it
+    /// still count every flagged session — the doctor lane's idiom, in the cost lane's document.
+    #[test]
+    fn the_listing_is_capped_and_says_what_it_did_not_print() {
+        let sessions: Vec<SessionCost> = (0..PREMIUM_SESSIONS_LISTED + 3)
+            .map(|index| small_top_tier(&format!("{index:064}"), 1_000))
+            .collect();
+        let totals = CostTotals::fold(&sessions);
+        let markdown = render(&totals, None);
+
+        let rows = markdown
+            .lines()
+            .filter(|line| line.contains("| `claude-fable-5` | 1 | 1.0k |"))
+            .count();
+        assert_eq!(rows, PREMIUM_SESSIONS_LISTED, "{markdown}");
+        assert!(
+            markdown.contains(
+                "_3 further sessions under the same floors are not shown; the totals above count \
+                 every one of them._"
+            ),
+            "{markdown}"
+        );
+        // The headline counts all 23, not the 20 it printed: 23,000 output tokens at $50/MTok.
+        assert!(
+            markdown.contains(
+                "Together they cost **$1.15** and produced 23.0k output tokens over 23 billed \
+                 messages"
+            ),
+            "{markdown}"
+        );
+    }
+
+    /// The clamp reaches this table too. A `source_hash` is the archive's own string and a rendered
+    /// table cell is not a place a peer gets to choose characters in — the same rule the by-model
+    /// table holds, pinned on the newer surface because a new cell is exactly where it gets
+    /// forgotten.
+    #[test]
+    fn a_hostile_identifier_cannot_break_out_of_the_top_tier_table_either() {
+        let totals = CostTotals::fold(&[SessionCost {
+            source_hash: "evil | hash".to_owned(),
+            ..small_top_tier("msg_evil", 1_000)
+        }]);
+        let markdown = render(&totals, None);
+        assert!(markdown.contains("## Small sessions at the top price tier"));
+        assert!(!markdown.contains("evil | hash"), "{markdown}");
+        assert!(markdown.contains(INVALID_IDENTIFIER), "{markdown}");
     }
 
     #[test]

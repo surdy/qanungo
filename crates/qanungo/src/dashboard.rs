@@ -7,8 +7,9 @@
 //!
 //! - The **coaching** section carries lane scores, rule ids, counts, rendered aggregates,
 //!   archive-stated identifiers, tool names, evidence anchors, and `sha256` content hashes.
-//! - The **cost** section carries token counts, message counts, dollars, and the model, modifier,
-//!   and repository identifiers the archive itself recorded, clamped.
+//! - The **cost** section carries token counts, message counts, dollars, the model, modifier, and
+//!   repository identifiers the archive itself recorded, clamped, and — for the small top-tier
+//!   sessions it lists one by one — the same `sha256` content hashes the coaching section cites.
 //! - Neither of those two carries a byte of transcript text. Both hold that by *construction*, the
 //!   way [`crate::report`] and [`crate::cost_report`] do: every field is read off a fold whose
 //!   types have already reduced a transcript to counts, timestamps, locators, and digests, so
@@ -243,7 +244,11 @@ use serde_json::{Value, json};
 use crate::ask::{Ask, Query};
 use crate::cli::{Refresh, Window};
 use crate::command::{AskCorpus, Folded, FoldedCost, FoldedStandup};
-use crate::cost::{CopilotTokens, CostTotals, Flagged, PricedTokens, TokenTally};
+use crate::cost::{
+    CopilotTokens, CostTotals, Flagged, PREMIUM_FLAG_MAX_MESSAGES, PREMIUM_FLAG_MAX_OUTPUT_TOKENS,
+    PremiumFlag, PricedTokens, TokenTally,
+};
+use crate::cost_report::PREMIUM_SESSIONS_LISTED;
 use crate::evidence::{self, EventAnchor, EvidenceIndex};
 use crate::format;
 use crate::heatmap::Heatmap;
@@ -560,6 +565,7 @@ impl Payload<'_> {
             "comparison": self.cost_comparison(),
             "copilot": copilot_value(totals),
             "flagged": flagged_value(&totals.flagged),
+            "premium": premium_value(&totals.premium),
             "records_read": totals.records_read,
             "duplicate_records": totals.duplicate_records,
             "price_table_revision": PRICE_TABLE_REVISION,
@@ -1203,6 +1209,63 @@ fn copilot_value(totals: &CostTotals) -> Value {
                 "messages": volumes.messages,
                 "output": volumes.output,
                 "output_rendered": format::tokens(volumes.output),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The window's small top-tier sessions, as the CLI's own section lists them.
+///
+/// The same three refusals the Markdown carries, carried onto the wire rather than restated on the
+/// page: the floors are serialized beside the rows so a reader is told what "small" was measured
+/// as, `sessions` is the denominator the flagged count is a share of, and `any` is false with a
+/// null list when nothing cleared the floors — an absent flag, not a row of zeroes a page would
+/// have to know to hide. Nothing here is a score, a rate, or a rank; the page has no more to say
+/// about these sessions than the document does.
+///
+/// Money-shaped keys are correct here and forbidden two blocks away: these are claude-code sessions
+/// priced at list, which is what [`crate::cost::PremiumFlag`] only ever admits. A Copilot session
+/// has no rate and therefore no tier, so it cannot reach this list in any window, and the
+/// copilot block's no-money rule is untouched by anything in it.
+fn premium_value(premium: &PremiumFlag) -> Value {
+    json!({
+        "any": premium.any(),
+        "sessions": premium.sessions,
+        "floors": {
+            "max_messages": PREMIUM_FLAG_MAX_MESSAGES,
+            "max_output_tokens": PREMIUM_FLAG_MAX_OUTPUT_TOKENS,
+            "max_output_tokens_rendered": format::tokens(PREMIUM_FLAG_MAX_OUTPUT_TOKENS),
+        },
+        "totals": premium.any().then(|| json!({
+            "sessions": premium.flagged.len(),
+            "dollars": premium.dollars(),
+            "dollars_rendered": format::dollars(premium.dollars()),
+            "output": premium.output(),
+            "output_rendered": format::tokens(premium.output()),
+            "messages": premium.messages(),
+        })),
+        // The same cut the Markdown section makes, at the same constant, so the page and the
+        // document list the same sessions rather than two different handfuls — and so a window
+        // that flagged hundreds cannot quietly grow the payload the whole page is one fetch of.
+        // What was cut is stated rather than dropped, and the totals above count every one.
+        "rows_hidden": premium.flagged.len().saturating_sub(PREMIUM_SESSIONS_LISTED),
+        "rows": premium
+            .flagged
+            .iter()
+            .take(PREMIUM_SESSIONS_LISTED)
+            .map(|session| json!({
+                "source_hash": format::identifier(&session.source_hash),
+                "archived_at": session.archived_at.map(stamp),
+                "models": session
+                    .models
+                    .iter()
+                    .map(|model| format::identifier(model))
+                    .collect::<Vec<_>>(),
+                "messages": session.messages,
+                "output": session.output,
+                "output_rendered": format::tokens(session.output),
+                "dollars": session.dollars,
+                "dollars_rendered": format::dollars(session.dollars),
             }))
             .collect::<Vec<_>>(),
     })
@@ -2911,6 +2974,147 @@ mod tests {
         let absent = section(folded_cost(&earlier, None));
         assert_eq!(absent["state"], "no-window");
         assert_eq!(absent["opens_at"], Value::Null);
+    }
+
+    /// The small top-tier sessions reach the page as the document lists them: the floors that
+    /// defined "small", the denominator the count is a share of, the rows with the hash to read
+    /// each session by, and totals that are the CLI's own arithmetic rather than a second one.
+    #[test]
+    fn the_cost_section_carries_the_small_top_tier_sessions_with_the_floors_that_found_them() {
+        let totals = folded_cost(
+            &[
+                cost_session("claude-fable-5", "msg_1", r#"{"output_tokens":1000}"#, None),
+                // The denominator: same model, far too large to be listed.
+                cost_session(
+                    "claude-fable-5",
+                    "msg_2",
+                    r#"{"output_tokens":500000}"#,
+                    None,
+                ),
+                // A cheaper model, which is not at the top tier however small its session is.
+                cost_session("claude-opus-5", "msg_3", r#"{"output_tokens":10}"#, None),
+            ],
+            None,
+        );
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            totals,
+            Standup::default(),
+            Redactor::new(),
+        );
+        let premium = &payload["cost"]["premium"];
+
+        assert_eq!(premium["any"], true);
+        assert_eq!(premium["sessions"], 2, "both fable sessions are eligible");
+        assert_eq!(premium["floors"]["max_messages"], PREMIUM_FLAG_MAX_MESSAGES);
+        assert_eq!(
+            premium["floors"]["max_output_tokens"],
+            PREMIUM_FLAG_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(premium["floors"]["max_output_tokens_rendered"], "3.0k");
+
+        let rows = premium["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["models"], json!(["claude-fable-5"]));
+        assert_eq!(rows[0]["messages"], 1);
+        assert_eq!(rows[0]["output"], 1_000);
+        assert_eq!(rows[0]["output_rendered"], "1.0k");
+        assert_eq!(rows[0]["dollars_rendered"], "$0.05");
+        assert_eq!(rows[0]["archived_at"], "2026-08-10T00:00:00Z");
+        assert_eq!(rows[0]["source_hash"], "0".repeat(64));
+        assert_eq!(premium["rows_hidden"], 0);
+
+        // The totals are the CLI's, and the dollars in them are inside the window's own total
+        // rather than beside it.
+        assert_eq!(premium["totals"]["sessions"], 1);
+        assert_eq!(premium["totals"]["dollars_rendered"], "$0.05");
+        assert_eq!(premium["totals"]["output"], 1_000);
+        assert_eq!(premium["totals"]["messages"], 1);
+        assert!(
+            payload["cost"]["priced"]["dollars"].as_f64().unwrap()
+                > premium["totals"]["dollars"].as_f64().unwrap(),
+        );
+
+        // A window with nothing small at the top tier says so with an absent block rather than a
+        // row of zeroes a page would have to know to hide — and still carries the floors, so the
+        // page never has to guess what was measured.
+        let clean = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            priced_window(),
+            Standup::default(),
+            Redactor::new(),
+        );
+        assert_eq!(clean["cost"]["premium"]["any"], false);
+        assert_eq!(clean["cost"]["premium"]["totals"], Value::Null);
+        assert!(
+            clean["cost"]["premium"]["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(clean["cost"]["premium"]["floors"]["max_messages"], 8);
+    }
+
+    /// The cap bites on the wire exactly as it does in the document: the page is handed
+    /// [`PREMIUM_SESSIONS_LISTED`] rows and told how many it is not being handed, and the totals
+    /// beside them still count every flagged session. Without this the payload would grow with the
+    /// flag on a window that flagged hundreds, which is the one thing a single-fetch page cannot
+    /// afford.
+    #[test]
+    fn the_top_tier_rows_are_capped_on_the_wire_and_say_how_many_were_cut() {
+        let sessions: Vec<SessionCost> = (0..PREMIUM_SESSIONS_LISTED + 1)
+            .map(|index| SessionCost {
+                source_hash: format!("{index:064}"),
+                ..cost_session("claude-fable-5", "msg_1", r#"{"output_tokens":1000}"#, None)
+            })
+            .collect();
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(&sessions, None),
+            Standup::default(),
+            Redactor::new(),
+        );
+        let premium = &payload["cost"]["premium"];
+
+        assert_eq!(
+            premium["rows"].as_array().unwrap().len(),
+            PREMIUM_SESSIONS_LISTED,
+        );
+        assert_eq!(premium["rows_hidden"], 1);
+        // The totals are over all 21, not over the 20 that were serialized: 21,000 output tokens
+        // of Fable 5 at $50/MTok.
+        assert_eq!(premium["totals"]["sessions"], PREMIUM_SESSIONS_LISTED + 1);
+        assert_eq!(premium["totals"]["output"], 21_000);
+        assert_eq!(premium["totals"]["messages"], 21);
+        assert_eq!(premium["totals"]["dollars_rendered"], "$1.05");
+        assert_eq!(premium["sessions"], PREMIUM_SESSIONS_LISTED + 1);
+    }
+
+    /// Copilot has no rate and therefore no tier, so nothing about it can reach a block full of
+    /// money keys. The copilot block's own no-money rule is unchanged by the new one beside it,
+    /// and the top-tier list stays empty in a window with no priced session at all.
+    #[test]
+    fn a_copilot_window_reaches_neither_the_top_tier_list_nor_a_dollar() {
+        let transcript = r#"{"type":"assistant.message","timestamp":"2026-08-01T10:00:00.000Z","data":{"content":"one","messageId":"m1","model":"claude-fable-5","outputTokens":128}}"#;
+        let copilot = SessionCost {
+            source_agent: "copilot-cli".to_owned(),
+            fold: crate::cost::fold_cost(
+                munshi_transcript::Source::Copilot,
+                2,
+                transcript.as_bytes(),
+            )
+            .unwrap(),
+            ..cost_session("unused", "unused", r#"{"output_tokens":0}"#, None)
+        };
+        let payload = build(
+            folded(hygiene_window("claude-code", 20, 5), Vec::new()),
+            folded_cost(&[copilot], None),
+            Standup::default(),
+            Redactor::new(),
+        );
+        assert_eq!(payload["cost"]["premium"]["any"], false);
+        assert_eq!(payload["cost"]["premium"]["sessions"], 0);
+        assert_no_money(&payload["cost"]["copilot"], "cost.copilot");
     }
 
     /// Everything the fold counted and refused to price, each reason on its own line with its own

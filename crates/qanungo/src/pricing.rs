@@ -161,6 +161,18 @@ impl PriceRow {
     /// records a local offset (see [`crate::report`]'s note on the same question). A session
     /// archived within a day of a price change can therefore land on either side of it, which is
     /// a smaller error than inventing a timezone for it.
+    ///
+    /// # Archive time can postdate the conversation
+    ///
+    /// A row is selected as of when the archive *took* the snapshot, not when the session ran, and
+    /// the two are not always the same day: a backfill batch archives months of transcripts within
+    /// minutes of each other, and this archive holds exactly that shape. It is nonetheless the
+    /// honest basis, because archive time is the lane's uniform clock — the one every window is cut
+    /// on ([`crate::command`]) and the only one every snapshot is guaranteed to carry. It is also
+    /// harmless in practice today: no model in this table has ever been repriced, so every row is a
+    /// model's only row and the selection cannot differ between the two dates. The day a second row
+    /// lands for one model, a backfilled session could be priced at the newer rate — which is a
+    /// known consequence of the clock, stated here rather than discovered later.
     pub fn effective_from(&self) -> DateTime<Utc> {
         let (year, month, day) = self.effective_from;
         let date = NaiveDate::from_ymd_opt(year, month, day)
@@ -408,6 +420,58 @@ pub fn rate_for(model: &str, at: DateTime<Utc>) -> Option<&'static PriceRow> {
         .iter()
         .filter(|row| row.model == model && row.effective_from() <= at)
         .max_by_key(|row| row.effective_from())
+}
+
+/// The highest **output** rate any model in this table was published at on `at`, or `None` when no
+/// row was effective yet.
+///
+/// This is the table's own answer to "what was the expensive end of the catalogue that day", and
+/// it is derived rather than listed: no model id appears in the code that reads it, so a new row
+/// moves the top tier without anything being edited beside it. That is the whole reason the flag
+/// in [`crate::cost`] asks the table instead of carrying a list of "premium" models — a list would
+/// be a second, undated price opinion sitting beside a dated one.
+///
+/// # Which rate column ranks
+///
+/// Output, because it is the rate a model is published and compared on, and because a session's
+/// dollars are dominated by what it wrote. Nothing else in the table is consulted for the
+/// ordering, and [`tests::the_rate_columns_do_not_disagree_about_which_tier_is_dearer`] pins the
+/// only assumption that choice rests on: across every row, ordering by output agrees with ordering
+/// by input. The day a row breaks that, the test fails and the column becomes a decision somebody
+/// has to make on purpose rather than one this function has already made for them.
+///
+/// # Fast tiers are not rows in the ranking
+///
+/// [`Rates::fast`] is the same model billed differently, not a second entry in the catalogue, so
+/// it is not compared here — otherwise a model would outrank its own base row and the day's
+/// dearest *model* would come back as not-top-tier. A fast-mode session still bills on a top-tier
+/// model if its model is one; what tier it ran at is a separate fact the report states separately.
+pub fn top_tier_output_rate(at: DateTime<Utc>) -> Option<f64> {
+    PRICES
+        .iter()
+        // Resolved per model rather than read off each row, so a repriced model contributes the
+        // rate in force on the day and not every rate it has ever had.
+        .filter_map(|row| rate_for(row.model, at))
+        .map(|row| row.rates.output)
+        .max_by(f64::total_cmp)
+}
+
+/// Whether `model` was one of the table's dearest models on `at`.
+///
+/// Ties are exact and are all top tier: two models published at the same output rate are the same
+/// tier. The machinery exists for a future tie; **today's table has none** — the Opus fast schedule
+/// equals Fable 5's base rates, but fast tiers do not rank ([`top_tier_output_rate`]), so no two
+/// *models* share the top. A rate that is merely *close* to the top is not a tie and is not top
+/// tier either — a near-miss band would be this build inventing a threshold the pricing page does
+/// not state, which is the one thing [`crate::pricing`] exists not to do.
+///
+/// A model with no row effective on `at` — unknown, or older than its first price — is not top
+/// tier, because it has no published rate to compare at all.
+pub fn is_top_tier_model(model: &str, at: DateTime<Utc>) -> bool {
+    match (rate_for(model, at), top_tier_output_rate(at)) {
+        (Some(row), Some(top)) => row.rates.output.total_cmp(&top) == std::cmp::Ordering::Equal,
+        _ => false,
+    }
 }
 
 /// Dollars for `tokens` at `rate` dollars per million, scaled by a modifier multiplier.
@@ -732,6 +796,97 @@ mod tests {
             price_for(Some("claude-opus-5"), None, Some("standard"), None, now),
             Price::Priced { .. },
         ));
+    }
+
+    /// The top tier is read off the table as of a date, so it *moves* — and the boundary is the
+    /// same midnight [`rate_for`] selects on. Before Fable 5 existed the dearest model in the
+    /// catalogue was Opus 4.8 at $25 of output; from its launch instant the top is $50, and Opus
+    /// 4.8 stops being top tier that same instant without anything in this build being edited.
+    #[test]
+    fn the_top_tier_is_whatever_the_table_says_it_was_that_day() {
+        let launch = at("2026-06-09T00:00:00Z");
+        let before = launch - chrono::TimeDelta::seconds(1);
+        assert_eq!(top_tier_output_rate(before), Some(25.00));
+        assert!(is_top_tier_model("claude-opus-4-8", before));
+        assert!(
+            !is_top_tier_model("claude-fable-5", before),
+            "not yet priced"
+        );
+
+        assert_eq!(top_tier_output_rate(launch), Some(50.00));
+        assert!(is_top_tier_model("claude-fable-5", launch));
+        assert!(
+            !is_top_tier_model("claude-opus-4-8", launch),
+            "a model does not stay top tier because it used to be",
+        );
+
+        // Nothing at all is priced before the table's first row, so there is no top tier to name —
+        // which is a different answer from "everything is".
+        assert_eq!(top_tier_output_rate(at("2020-01-01T00:00:00Z")), None);
+        assert!(!is_top_tier_model(
+            "claude-opus-5",
+            at("2020-01-01T00:00:00Z")
+        ));
+    }
+
+    /// A model the table has never heard of is not top tier, and neither is one whose row has not
+    /// come into effect yet: both have no published rate to rank at all.
+    #[test]
+    fn a_model_with_no_effective_row_is_not_top_tier() {
+        let now = at("2026-08-01T00:00:00Z");
+        assert!(!is_top_tier_model("gpt-5.6-sol", now));
+        assert!(!is_top_tier_model(SYNTHETIC_MODEL, now));
+        assert!(!is_top_tier_model(
+            "claude-opus-5",
+            at("2026-01-01T00:00:00Z"),
+        ));
+        // And the ordinary case beside the three refusals, so the function is not merely saying no.
+        assert!(is_top_tier_model("claude-fable-5", now));
+        assert!(!is_top_tier_model("claude-sonnet-5", now));
+    }
+
+    /// Ties are exact and are shared. Today's table holds no second model at $50 of output, so the
+    /// case is built here rather than asserted against the shipped rows — and the near-miss beside
+    /// it is the point: $49.99 is not a tie, because a band around the top would be this build
+    /// inventing a rate relationship the pricing page never published.
+    #[test]
+    fn an_exact_tie_shares_the_top_tier_and_a_near_miss_does_not() {
+        let top = |rates: &[f64]| {
+            rates
+                .iter()
+                .copied()
+                .max_by(f64::total_cmp)
+                .expect("a rate to rank")
+        };
+        let rates = [50.00, 50.00, 49.99, 25.00];
+        let ceiling = top(&rates);
+        let tied: Vec<bool> = rates
+            .iter()
+            .map(|rate| rate.total_cmp(&ceiling) == std::cmp::Ordering::Equal)
+            .collect();
+        assert_eq!(tied, vec![true, true, false, false]);
+    }
+
+    /// [`top_tier_output_rate`] ranks on the output column alone. That is only safe while the
+    /// table's columns agree about which schedule is dearer, so the agreement is pinned rather
+    /// than assumed: a future row that charged more for input and less for output would make the
+    /// choice of column load-bearing, and this test is what turns that into a decision somebody
+    /// makes on purpose instead of one the ranking has quietly already made.
+    #[test]
+    fn the_rate_columns_do_not_disagree_about_which_tier_is_dearer() {
+        for left in PRICES {
+            for right in PRICES {
+                let (output, input) = (
+                    left.rates.output.total_cmp(&right.rates.output),
+                    left.rates.input.total_cmp(&right.rates.input),
+                );
+                assert_eq!(
+                    output, input,
+                    "{} and {} rank differently by output than by input",
+                    left.model, right.model,
+                );
+            }
+        }
     }
 
     #[test]

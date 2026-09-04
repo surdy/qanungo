@@ -337,6 +337,90 @@ fn the_document_names_models_and_repositories_but_never_a_message_id() {
     }
 }
 
+/// The top-tier flag on a real transcript: two exchanges on the day's dearest model, priced whole,
+/// listed with the hash to read it by — and nothing of what was said in it anywhere in the
+/// document. The section is the newest surface in the lane and therefore the likeliest place for
+/// the redaction line to be crossed, so the canary check is repeated over it rather than assumed
+/// to be covered by the one above.
+#[test]
+fn a_small_session_on_the_days_dearest_model_is_listed_with_its_hash_and_nothing_else() {
+    let raw = std::fs::read_to_string(fixture("cost/claude-top-tier.jsonl")).unwrap();
+    assert!(
+        raw.contains("CANARY_TOP_TIER_"),
+        "the fixture carries canaries"
+    );
+
+    let session = fold(
+        "cost/claude-top-tier.jsonl",
+        "claude-code",
+        Some("surdy/qanungo"),
+    );
+    let hash = session.source_hash.clone();
+    let totals = CostTotals::fold(&[session]);
+
+    // Two messages and 1,000 output tokens of Fable 5 at $50/MTok, over 1,400 input at $10/MTok.
+    assert_eq!(totals.premium.sessions, 1);
+    assert_eq!(totals.premium.flagged.len(), 1);
+    let flagged = &totals.premium.flagged[0];
+    assert_eq!(flagged.messages, 2);
+    assert_eq!(flagged.output, 1_000);
+    assert_eq!(flagged.models, vec!["claude-fable-5".to_owned()]);
+    assert_eq!(flagged.source_hash, hash);
+    // The same dollars the by-model table counts, to the cent: the flag annotates, it does not add.
+    assert!((flagged.dollars - totals.by_model["claude-fable-5"].dollars).abs() < 1e-12);
+    assert!((flagged.dollars - totals.priced.dollars).abs() < 1e-12);
+    assert!((flagged.dollars - 0.064).abs() < 1e-9, "{flagged:?}");
+
+    let markdown = render(&totals);
+    assert!(
+        markdown.contains("## Small sessions at the top price tier"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains(&format!(
+            "| 2026-08-10T12:00:00Z | `claude-fable-5` | 2 | 1.0k | $0.06 | `{hash}` |"
+        )),
+        "{markdown}"
+    );
+    assert!(
+        !markdown.contains("CANARY"),
+        "the section renders aggregates and a hash, never a word of the session:\n{markdown}"
+    );
+    for forbidden in [
+        "CANARY_TOP_TIER_REQUEST",
+        "CANARY_TOP_TIER_ANSWER",
+        "CANARY_TOP_TIER_COMMAND",
+        "CANARY_TOP_TIER_BRANCH",
+        "/work/",
+        "toolu_tier",
+        "msg_tier",
+        "Bash",
+    ] {
+        assert!(
+            !markdown.contains(forbidden),
+            "`{forbidden}` reached the report:\n{markdown}"
+        );
+    }
+}
+
+/// The lane's own billing fixture is the counter-case, and deliberately so: it mixes two models,
+/// carries a `<synthetic>` placeholder and a model no table has heard of, and is therefore a
+/// session this build cannot state the whole shape of. It is not listed, not counted in the
+/// denominator, and the section does not render at all — while every dollar it does carry is
+/// unchanged.
+#[test]
+fn a_session_the_lane_cannot_read_whole_is_left_out_of_the_top_tier_section() {
+    let totals = CostTotals::fold(&[billing_session()]);
+    assert_eq!(totals.premium.sessions, 0, "{:?}", totals.premium);
+    assert!(!totals.premium.any());
+
+    let markdown = render(&totals);
+    assert!(!markdown.contains("top price tier"), "{markdown}");
+    // The flag changed nothing it was not supposed to: the same $18.00 the lane priced before it.
+    assert!((totals.priced.dollars - 18.00).abs() < 1e-9);
+    assert!(markdown.contains("**$18.00**"), "{markdown}");
+}
+
 fn window() -> Window {
     let Command::Cost(args) = Cli::parse_from(["qanungo", "cost", "--last", "12w"]).command else {
         panic!("`cost` parses as the cost command");
