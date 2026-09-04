@@ -16,18 +16,18 @@ coding session → munshi (capture, normalize, summarize) → patwari (permanent
 ```
 
 - **munshi** captures and normalizes sessions; **patwari** is the central, permanent, content-addressed archive of every machine. qanungo consumes them; it never captures.
-- qanungo keeps a **disposable** incremental mirror of the archive and a rebuildable SQLite event store. Rebuild = delete and resync. **Patwari is the only stable interface**; the derived store is a private implementation detail.
+- qanungo keeps a **disposable** incremental mirror of the archive — a content-addressed blob cache with a snapshot index beside it — that it folds in memory at read time; a persistent event store stays deferred. Rebuild = delete and resync. **Patwari is the only stable interface**; the derived store is a private implementation detail.
 - Interpretation is **read-time** (munshi [ADR 0011](https://github.com/surdy/munshi/blob/main/docs/adr/0011-interpret-transcripts-at-read-time-through-a-shared-streaming-crate.md)): qanungo folds metrics over `munshi-transcript`'s typed event stream, consumed as a git dependency pinned to a tag. Nothing derived is ever written back into an immutable snapshot — improve a rule, resync, re-derive.
 
 ## Application commands (the read-side suite)
 
 ADR 0012 anticipated qanungo carrying "application commands such as a prompt-corpus exporter or a session chronicle." The suite:
 
-- **coach** — deterministic anti-pattern detection + five practice scores (Prompt Quality, Session Hygiene, Code Review, Tool Mastery, Context Management), with WoW/MoM trends. Rules are Markdown files with a small `scan → match → aggregate → check` DSL (learned from Microsoft's AI-Engineering-Coach, ported to Rust). Every finding carries the Patwari `source_hash` as evidence, not a snippet.
+- **coach** — deterministic anti-pattern detection + five practice scores (Prompt Quality, Session Hygiene, Code Review, Tool Mastery, Context Management), with WoW/MoM trends. Rules are hardcoded in Rust — the `scan → match → aggregate → check` shape is learned from Microsoft's AI-Engineering-Coach, but a rule DSL was considered and declined (hardcoded rules until a second rule-author exists). Every finding carries the Patwari `source_hash` as evidence, not a snippet.
 - **chronicle / standup** — a time-boxed narrative of what you shipped, aggregated from munshi's per-session summaries across machines and repos. (GitHub Copilot CLI's `/chronicle standup`, generalized cross-harness and grounded in curated summaries.)
-- **ask** — plain-language questions over your history ("have I touched the payments API?"), backed by the `session-recall` funnel: Notesmith search → hash → verbatim grep in Patwari.
+- **ask** — plain-language questions over your history ("have I touched the payments API?"): a deterministic ranked search over the session summaries qanungo has mirrored into its own cache (Patwari-only, no third service), each hit citing a `source_hash`. `--verbatim` escalates into the transcripts of those same hits — the funnel is bounded to what the summary search already surfaced, never an archive-wide grep.
 - **instructions-doctor** — mines sessions for instructions you have had to give more than once in one repository, quotes each repetition and cites the transcript moments it happened at, and leaves the `CLAUDE.md` / `AGENTS.md` edit to a harness skill. It reports repetition; it never claims a missing instruction *caused* anything, because nothing it reads could support that.
-- **cost** — token/cost breakdown by model/repo/machine, and premium-waste flags.
+- **cost** — token/cost breakdown by model and repo (by-machine deferred — the cost fold has no by-device slice yet), and premium-waste flags.
 - **skill & agent finder** — detects repeated requests and the multi-step flows they fall into, pooled across the whole archive rather than per repository, and leaves drafting the reusable skill or custom subagent to a harness skill. It reports requests, never outcomes: an ordering in a transcript is not a cause, and whether a repetition is worth tooling is yours to decide.
 
 ## The dashboard
@@ -52,21 +52,24 @@ Thin read-only clients that call qanungo's commands or the recall funnel ship in
 
 The **P0 vertical slice** ([#7](https://github.com/surdy/qanungo/issues/7)) exists: a `qanungo` CLI
 that syncs a minimal content-addressed mirror of the recent archive, folds four metrics over
-`munshi-transcript`'s typed events, evaluates six hardcoded rules, and emits a Markdown coaching
+`munshi-transcript`'s typed events, evaluates eight hardcoded rules, and emits a Markdown coaching
 report — findings as Problem / Action / `source_hash` evidence, with an instrumentation footer on
 every run.
 
 **Scores and trends** ([#4](https://github.com/surdy/qanungo/issues/4)) sit on top of it: the five
 practice lanes, scored 0–100 **per harness** from the window's own readings, with window-over-window
-arrows against the equal-length window immediately before it. Four lanes are fed by signals the fold
-types today (Prompt Quality, Session Hygiene, Tool Mastery, and — since munshi#77 typed the
-compaction markers — Context Management, off a session compacting its window over and over); Code
-Review renders as *not scored* rather than taking a default — no signal, no claim. Every run recomputes all
+arrows against the equal-length window immediately before it. All five lanes are now fed by signals
+the fold types — Prompt Quality, Session Hygiene, and Tool Mastery from the start, and, since
+munshi#77 typed the compaction markers and the review signals, Context Management (off a session
+compacting its window over and over) and Code Review (off shipping without a review step). A lane a
+harness gives no signal for still renders as *not scored* rather than taking a default — no signal,
+no claim. Every run recomputes all
 of it with the current rule pack
 ([ADR 0001](docs/adr/0001-recompute-all-history-with-the-current-rule-pack.md)) and stamps the pack's
-digest into the footer, so two reports compare only when that stamp matches. Every timestamp is UTC:
-nothing in munshi types the capture machine's local offset yet, so the report says UTC rather than
-guessing one.
+digest into the footer, so two reports compare only when that stamp matches. Every timestamp in the
+report is UTC: munshi now types the capture machine's local offset (munshi#77), but the report
+presents UTC rather than re-basing its cadence — that offset is consumed only by the dashboard's
+heatmap.
 
 **The cost lane** ([#12](https://github.com/surdy/qanungo/issues/12)) is the second lane over the
 same slice: `qanungo cost` folds the per-message model and token usage `munshi-transcript` types
@@ -83,8 +86,9 @@ no row, an unrecognized billing modifier, a cache write with no tier, and Claude
 Dollars are Anthropic API **list** prices for claude-code sessions only — the archive does not know
 the account's billing plan — and Copilot sessions get output-token volumes and no money at all,
 because a transcript cannot say which of Copilot's two billing regimes the account was on. The
-by-machine cut the issue asks for is deferred rather than faked: Patwari's session projection
-carries `repository` and no hostname.
+by-machine cut the issue asks for is deferred rather than faked: the cost lane folds by repository,
+and a by-device slice waits on a `by_device` fold it does not yet have — the session projection does
+now carry a hostname (the dashboard's device scope uses it), but the cost fold does not group on it.
 
 **The redaction layer** ([#8](https://github.com/surdy/qanungo/issues/8)) shipped ahead of the first
 surface that needed it: a scrub with two independently switched passes — secrets **on** by default,
@@ -130,9 +134,10 @@ a score wants a month, a bill wants a quarter, and a standup wants a week you ca
 One refresh folds all three and publishes **one** payload, so a reader can never see a bill from one
 refresh beside a standup from another. A long-lived process re-folds every `--refresh`, swaps the
 served payload atomically, and pushes an SSE event so open pages re-fetch; a request is then a
-memcpy. Per the issue's 2026-08-24 grilling the persistent event store stays **deferred** — sync
-dominates the fold, and a store would fix the smaller half — so process memory is the disposable
-materialization.
+memcpy. Per the issue's 2026-08-24 grilling the persistent event store stays **deferred**: a request
+is already a memcpy against the last-published payload, so the interactive guideline holds without
+one, and process memory is the disposable materialization. (What used to dominate the refresh was
+sync, not the fold; a snapshot index — not a store — cut it, and the refresh is now fold-bound.)
 
 **What the served surface renders is three different claims, and it says which is which.** The
 coaching and cost sections carry aggregates and hashes: scores, rule ids, counts, dollars, token
@@ -174,8 +179,9 @@ three of the dashboard's windows share that grammar — `--last` (default `30d`)
 to — and they move independently, because narrowing the coaching window says nothing about what the
 bill should cover. The dashboard's `--refresh` is a *disjoint* grammar — `s`, `m`, `h` — so neither
 parser accepts the other's units, and an interval faster than a minute is refused rather than
-clamped: a warm three-lane refresh measures about **45 s** against the production archive, and
-polling near that is load on a LAN archive rather than a fresher page.
+clamped: a warm three-lane refresh measures about **13 s** against the production archive (the
+snapshot index cut it from ~45 s), and polling near that is load on a LAN archive rather than a
+fresher page.
 
 `--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the cache root — the blob cache
 plus the snapshot index beside it — which otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling
@@ -194,8 +200,11 @@ until the footer's fold-cost and rule-firing data say otherwise. The prices in
 figure with a date, changed only by adding a row.
 
 The dashboard also carries a **scope control**: one select for the repository the archive listed a
-session under, one for the harness, narrowing the scores, the findings, and — for a repository —
-the bill and the narrative together. Every scope is folded server-side and shipped with the payload
+session under, one for the device (its capture hostname, a second primary axis mutually exclusive
+with the repository), and one for the harness, narrowing the scores, the findings, and — for a
+repository — the bill and the narrative together (a device narrows the scores, findings, and
+timeline, while the bill, the narrative, and the heatmap stay whole-window — none of those is cut by
+hostname). Every scope is folded server-side and shipped with the payload
 (there is no query string on that route, and a scope is never a per-request fold), so switching one
 re-renders what the browser already holds. A scope's lanes are the same arithmetic over fewer
 sessions: its fleet blend is the unweighted mean over the harnesses present *in that scope*, a
@@ -211,10 +220,12 @@ not the transcript's own clock and it is not local time. The chart narrows with 
 carries a legend and the table of its own numbers, and the whole section on the wire is integers and
 ISO dates with no string in it at all.
 
-That is also why there is still **no hour-of-day or day-of-week heatmap**: a per-day volume survives
-a missing local offset — a day is a day wherever you stand — while "worked at 1 a.m." and "worked on
-a Sunday" are exactly the claims UTC misplaces, and they are the only claims that view exists to
-make.
+Beside it now sits a **heatmap** — a "Habits" grid of hour-of-day against day-of-week — which waited
+on exactly what the timeline did not need: each session's own local offset, since "worked at 1 a.m."
+and "worked on a Sunday" are the claims UTC misplaces and the only ones that view exists to make.
+munshi#77 typed that offset per capture, so each session is placed at its transcript's first-activity
+hour shifted into its own local time; a session with no recorded offset is counted but left unplaced
+in the footer rather than mislocated.
 
 And it carries an **instructions doctor** ([#11](https://github.com/surdy/qanungo/issues/11)):
 `qanungo doctor` reads the text a *person* typed across the archive and reports the instructions
@@ -248,9 +259,12 @@ clusters with itself in every repository at once, which can genuinely make it th
 in the corpus and still worth nothing. Triaging that, and drafting anything, is
 `contrib/skills/skill-finder`'s half.
 
-Everything else is still ahead: mirror hardening (#1), the rule DSL (#3), the narrator (#6), and the
-dashboard's own remaining slices — per-*device* scope once a hostname has accrued in the archive,
-and the heatmap once munshi#77's local offsets have accrued on real sessions. Full
+What remains is pulled by friction, not scheduled: mirror hardening ([#1](https://github.com/surdy/qanungo/issues/1))
+and later metrics ([#2](https://github.com/surdy/qanungo/issues/2)), each waiting on a real need. The
+instructions doctor's V1 shipped ([#11](https://github.com/surdy/qanungo/issues/11)); its V2
+measured-outcomes half is deferred until edits and post-deploy captures accrue. The narrator (#6) is
+likely mooted by the shipped `/coach` skill. The rule DSL (#3) was **declined**, not deferred —
+hardcoded Rust rules stand until a second rule-author exists. Full
 research + rationale:
 `~/repos/research/ai-coach/`. See
 issues for the phased plan.
