@@ -1,9 +1,10 @@
 //! The price table: a static, date-versioned statement of what a token cost, and when.
 //!
-//! Every figure here comes from `docs/pricing-sources-2026-08-23.md`, which is committed beside
-//! the code precisely so that a dollar in a report can be traced to a published page and a
-//! retrieval date rather than to somebody's recollection of one. A row's doc comment names the
-//! section of that file it came from; a row with no source does not belong in the table.
+//! Every figure here comes from `docs/pricing-sources-2026-08-23.md` and its amendment
+//! `docs/pricing-sources-2026-09-05.md`, which are committed beside the code precisely so that a
+//! dollar in a report can be traced to a published page and a retrieval date rather than to
+//! somebody's recollection of one. A row's doc comment names the file and section it came from; a
+//! row with no source does not belong in the table.
 //!
 //! # Dollars are claimed for Anthropic API usage only
 //!
@@ -53,10 +54,15 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
 /// The revision of this table, stamped into the cost report's footer.
 ///
-/// It is the retrieval date of the research file the rows came from, not a build date: two cost
-/// reports are comparable in dollars only when this matches, exactly as two coaching reports are
-/// comparable in scores only when the rule-pack stamp does.
-pub const PRICE_TABLE_REVISION: &str = "2026-08-23";
+/// It is the retrieval date of the newest research file the rows came from, not a build date: two
+/// cost reports are comparable in dollars only when this matches, exactly as two coaching reports
+/// are comparable in scores only when the rule-pack stamp does.
+///
+/// It moved from `2026-08-23` to `2026-09-05` because the table **gained a row**
+/// (`claude-fable-5-1`, `docs/pricing-sources-2026-09-05.md`). Usage that a `2026-08-23` report
+/// reported as unpriced tokens a `2026-09-05` report bills in dollars, so the two are not claiming
+/// the same spend — which is the whole reason the constant is stamped in a footer.
+pub const PRICE_TABLE_REVISION: &str = "2026-09-05";
 
 /// Claude Code's placeholder `model` for messages it generated locally — an interrupt notice, an
 /// error stub — which no vendor ever billed. Its tokens are real and are reported; its dollars
@@ -106,11 +112,16 @@ pub const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
 
 /// What one million tokens cost, per category, in US dollars.
 ///
-/// The three cache figures are stored rather than derived from `input`, even though the research
-/// file records them as fixed multiples of it (5m write 1.25x, 1h write 2x, read 0.1x). Deriving
-/// them would bake today's multipliers into every past row, and a multiplier change would then
-/// silently re-price history — which is the same failure the `effective_from` column exists to
+/// The three cache figures are stored rather than derived from `input`, even though the 2026-08-23
+/// research file records them as fixed multiples of it (5m write 1.25x, 1h write 2x, read 0.1x).
+/// Deriving them would bake one set of multipliers into every row, and a multiplier change would
+/// then silently re-price history — which is the same failure the `effective_from` column exists to
 /// prevent. Stored figures make a multiplier change a new row like any other.
+///
+/// **That has already been collected on.** Fable 5.1 reads its cache at 0.025x input — $0.25
+/// against $10, a quarter of Fable 5's rate at the same input price (2026-09-05 amendment §1). A
+/// derived read column would have billed it four times over, and on claude-code sessions, which are
+/// overwhelmingly cache reads, that is most of the bill.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rates {
     pub input: f64,
@@ -195,8 +206,8 @@ const OPUS_FAST: Rates = Rates {
 /// selects on `effective_from` — and is kept as the research file lists them so the two read the
 /// same way side by side.
 ///
-/// All five rows are launch prices: the research file found no post-launch change for any of
-/// them, and records the one price event in the window (Sonnet 5's scheduled 2026-09-01 rise,
+/// All six rows are launch prices: the research files found no post-launch change for any of
+/// them, and record the one price event in the window (Sonnet 5's scheduled 2026-09-01 rise,
 /// cancelled on 2026-08-10) as a change that will not happen. `<synthetic>` is deliberately
 /// absent — it is not a model and is excluded from dollars by [`SYNTHETIC_MODEL`], not priced at
 /// zero, so that a genuinely unpriced model can never be mistaken for a free one.
@@ -275,6 +286,24 @@ pub const PRICES: &[PriceRow] = &[
             cache_read: 0.50,
         },
         fast: Some(OPUS_FAST),
+        us_geo_multiplier: Some(US_GEO_MULTIPLIER),
+    },
+    // Claude Fable 5.1, launched 2026-09-01 at $10/$50 — Fable 5's per-token price, with cache
+    // reads at a quarter of it (2026-09-05 amendment §1). The cheap cache read is the reason this
+    // is a row and not a footnote: at $0.25 rather than $1.00 it is the first model in this table
+    // whose read rate is not 0.1x its input, so pricing it by the family multiplier would
+    // over-bill a cache-heavy session fourfold.
+    PriceRow {
+        model: "claude-fable-5-1",
+        effective_from: (2026, 9, 1),
+        rates: Rates {
+            input: 10.00,
+            output: 50.00,
+            cache_write_5m: 12.50,
+            cache_write_1h: 20.00,
+            cache_read: 0.25,
+        },
+        fast: None,
         us_geo_multiplier: Some(US_GEO_MULTIPLIER),
     },
 ];
@@ -459,11 +488,14 @@ pub fn top_tier_output_rate(at: DateTime<Utc>) -> Option<f64> {
 /// Whether `model` was one of the table's dearest models on `at`.
 ///
 /// Ties are exact and are all top tier: two models published at the same output rate are the same
-/// tier. The machinery exists for a future tie; **today's table has none** — the Opus fast schedule
-/// equals Fable 5's base rates, but fast tiers do not rank ([`top_tier_output_rate`]), so no two
-/// *models* share the top. A rate that is merely *close* to the top is not a tie and is not top
-/// tier either — a near-miss band would be this build inventing a threshold the pricing page does
-/// not state, which is the one thing [`crate::pricing`] exists not to do.
+/// tier. **From 2026-09-01 the shipped table holds one**: Fable 5.1 succeeded Fable 5 at the same
+/// $50 of output, and both are top tier for as long as both are published — a successor does not
+/// demote the model it succeeds, because the ranking reads the pricing page and the pricing page
+/// still lists them at the same rate. (The Opus fast schedule also equals those base rates, but
+/// fast tiers do not rank — [`top_tier_output_rate`] — so it adds no third member.) A rate that is
+/// merely *close* to the top is not a tie and is not top tier either — a near-miss band would be
+/// this build inventing a threshold the pricing page does not state, which is the one thing
+/// [`crate::pricing`] exists not to do.
 ///
 /// A model with no row effective on `at` — unknown, or older than its first price — is not top
 /// tier, because it has no published rate to compare at all.
@@ -845,10 +877,11 @@ mod tests {
         assert!(!is_top_tier_model("claude-sonnet-5", now));
     }
 
-    /// Ties are exact and are shared. Today's table holds no second model at $50 of output, so the
-    /// case is built here rather than asserted against the shipped rows — and the near-miss beside
-    /// it is the point: $49.99 is not a tie, because a band around the top would be this build
-    /// inventing a rate relationship the pricing page never published.
+    /// Ties are exact and are shared. The near-miss beside the tie is the point: $49.99 is not a
+    /// tie, because a band around the top would be this build inventing a rate relationship the
+    /// pricing page never published. The arithmetic is built here rather than read off the shipped
+    /// rows; that the shipped rows now *have* a tie is asserted in
+    /// [`tests::fable_5_1_joins_fable_5_at_the_top_tier_rather_than_replacing_it`].
     #[test]
     fn an_exact_tie_shares_the_top_tier_and_a_near_miss_does_not() {
         let top = |rates: &[f64]| {
@@ -886,6 +919,92 @@ mod tests {
                     left.model, right.model,
                 );
             }
+        }
+    }
+
+    /// Fable 5.1's row is selected from its launch instant and not a second before it, and the
+    /// figure that makes the row worth having is its cache read: $0.25, a quarter of Fable 5's
+    /// $1.00 and 0.025x its own input, the first read rate in this table that is not 0.1x input.
+    /// Pricing 5.1's reads off 5's row would over-bill a cache-heavy session fourfold, which is
+    /// exactly the shape of the sessions that reach this build.
+    #[test]
+    fn fable_5_1_is_priced_from_its_launch_at_its_own_cheaper_cache_read() {
+        let launch = at("2026-09-01T00:00:00Z");
+        let row = rate_for("claude-fable-5-1", launch).expect("a row at the launch instant");
+        assert_eq!(row.rates.input, 10.00);
+        assert_eq!(row.rates.output, 50.00);
+        assert_eq!(row.rates.cache_write_5m, 12.50);
+        assert_eq!(row.rates.cache_write_1h, 20.00);
+        assert_eq!(row.rates.cache_read, 0.25);
+
+        assert!(
+            rate_for("claude-fable-5-1", launch - chrono::TimeDelta::seconds(1)).is_none(),
+            "a second before the model existed there is no rate to charge",
+        );
+        assert_eq!(
+            price_for(
+                Some("claude-fable-5-1"),
+                None,
+                None,
+                None,
+                Some(launch - chrono::TimeDelta::seconds(1)),
+            ),
+            Price::Unpriced(Unpriced::NoRateYet("claude-fable-5-1".to_owned())),
+            "and it is flagged as too early, not as an unknown model",
+        );
+
+        // It is its predecessor's price everywhere except the read column, which is the whole
+        // reason it is a row rather than an alias.
+        let fable_5 = rate_for("claude-fable-5", launch).expect("Fable 5 is still published");
+        assert_eq!(row.rates.input, fable_5.rates.input);
+        assert_eq!(row.rates.output, fable_5.rates.output);
+        assert_eq!(row.rates.cache_write_5m, fable_5.rates.cache_write_5m);
+        assert_eq!(row.rates.cache_write_1h, fable_5.rates.cache_write_1h);
+        assert_eq!(fable_5.rates.cache_read, 1.00);
+        assert!((row.rates.cache_read - row.rates.input * 0.025).abs() < 1e-12);
+
+        // No fast tier is published for it, so `speed = "fast"` is unpriced rather than billed at
+        // the base rate — the same refusal Sonnet 5 gets.
+        assert_eq!(
+            price_for(
+                Some("claude-fable-5-1"),
+                Some(FAST_SPEED),
+                None,
+                None,
+                Some(launch),
+            ),
+            Price::Unpriced(Unpriced::Speed(FAST_SPEED.to_owned())),
+        );
+    }
+
+    /// A successor at the same published output rate *joins* the top tier; it does not evict the
+    /// model it succeeds, because the ranking reads the pricing page and the pricing page still
+    /// lists both at $50. This is the shipped table's first real tie, so it is asserted against
+    /// the real rows rather than a constructed pair.
+    #[test]
+    fn fable_5_1_joins_fable_5_at_the_top_tier_rather_than_replacing_it() {
+        let launch = at("2026-09-01T00:00:00Z");
+        let before = launch - chrono::TimeDelta::seconds(1);
+
+        assert_eq!(top_tier_output_rate(before), Some(50.00));
+        assert!(is_top_tier_model("claude-fable-5", before));
+        assert!(
+            !is_top_tier_model("claude-fable-5-1", before),
+            "not yet priced"
+        );
+
+        assert_eq!(top_tier_output_rate(launch), Some(50.00));
+        assert!(is_top_tier_model("claude-fable-5-1", launch));
+        assert!(
+            is_top_tier_model("claude-fable-5", launch),
+            "an exact tie is shared, so the predecessor stays top tier",
+        );
+        assert!(!is_top_tier_model("claude-opus-5", launch));
+
+        // And still both, well after the launch day.
+        let later = at("2026-12-01T00:00:00Z");
+        for model in ["claude-fable-5", "claude-fable-5-1"] {
+            assert!(is_top_tier_model(model, later), "{model}");
         }
     }
 

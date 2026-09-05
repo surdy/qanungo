@@ -2028,7 +2028,7 @@ fn the_cost_command_runs_end_to_end_against_the_archive() {
         "{markdown}"
     );
     assert!(markdown.contains("_Instrumentation —"), "{markdown}");
-    assert!(markdown.contains("price table 2026-08-23"), "{markdown}");
+    assert!(markdown.contains("price table 2026-09-05"), "{markdown}");
     assert!(markdown.contains("cache 0 hits / 1 misses"), "{markdown}");
     // Nothing in this session is unpriceable, so the flagged section is elided rather than
     // printed as a row of zeroes.

@@ -2,8 +2,17 @@
 
 Input for qanungo#12 (cost lane). Every figure sourced; unknowns explicitly listed. Do not invent prices.
 
-**This file is the provenance of `crates/qanungo/src/pricing.rs`.** Every row of that table came
-from here and from nowhere else, and each one's doc comment names the section it came from. It is
+> **Superseded as the current revision.** This file has been amended once:
+> [`pricing-sources-2026-09-05.md`](pricing-sources-2026-09-05.md) adds the `claude-fable-5-1` row,
+> whose cache read is priced at 0.025x base input rather than the 0.1x §1 below states for every
+> other model. **`PRICE_TABLE_REVISION` is now `2026-09-05`** (`crates/qanungo/src/pricing.rs`), not
+> the date in this file's title. No figure below changed — the five rows here were re-read on
+> 2026-09-05 and all still stand — and this file remains the provenance of every one of them. Read
+> both, newest last.
+
+**This file is the provenance of the original five rows of `crates/qanungo/src/pricing.rs`.** Every
+row of that table came from here or from a dated amendment beside it and from nowhere else, and each
+one's doc comment names the file and section it came from. It is
 committed as it was researched so that a number in the binary can always be traced to a source and a
 retrieval date rather than to somebody's memory of a pricing page. Changing a price means adding a
 row with a new `effective_from` **and** amending this file with the source that says so — never
@@ -14,7 +23,9 @@ quarter at last quarter's rates.
 
 Primary source: https://platform.claude.com/docs/en/about-claude/pricing (retrieved 2026-08-23).
 Cache prices are fixed multipliers of base input: 5m write = 1.25x, 1h write = 2x, cache read = 0.1x.
-No documented change to these multipliers during the archive window (Oct 2025 → today).
+No documented change to these multipliers during the archive window (Oct 2025 → today). (The read
+multiplier is no longer universal: Claude Fable 5.1 reads at 0.025x — see the 2026-09-05 amendment.
+The write multipliers still hold for every row in the table.)
 
 | Archive model id | Official model | Effective from | Input | Output | 5m cache write | 1h cache write | Cache read |
 |---|---|---|---|---|---|---|---|

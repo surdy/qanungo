@@ -2187,7 +2187,7 @@ fn the_cost_section_prices_the_billing_fixture_to_the_cent() {
 
     // Deduplication did something, and the number that proves it is served rather than assumed.
     assert_eq!(cost["duplicate_records"], 2);
-    assert_eq!(cost["price_table_revision"], "2026-08-23");
+    assert_eq!(cost["price_table_revision"], "2026-09-05");
 }
 
 /// The lane's honesty rule, over the wire: copilot rows are token volumes and the payload carries

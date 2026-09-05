@@ -174,7 +174,8 @@ scope leaves the panel whole, which the note on the panel says out loud.
 | --- | --- |
 | [RULES.md](RULES.md) | **Generated** by `qanungo rules`: the eight rules and what fires each, every threshold with the measurement behind it, the five lanes and the scoring formula, the folds, the price table, the ask rubric, the repetition constants, and the redaction pattern names — pinned to the build by an equality test |
 | [ADR 0001 — Recompute all history with the current rule pack](docs/adr/0001-recompute-all-history-with-the-current-rule-pack.md) | Why no score is ever frozen per session, and what the rule-pack digest in every footer is for |
-| [Pricing sources (2026-08-23)](docs/pricing-sources-2026-08-23.md) | The sourced provenance of every row in the cost lane's date-versioned price table, and every figure it refuses to invent |
+| [Pricing sources (2026-08-23)](docs/pricing-sources-2026-08-23.md) | The sourced provenance of the price table's original five rows, and every figure it refuses to invent |
+| [Pricing sources — amendment 2026-09-05](docs/pricing-sources-2026-09-05.md) | The `claude-fable-5-1` row, whose cache read is 0.025x base input rather than the family's 0.1x; this is the **current** `PRICE_TABLE_REVISION` |
 | [Redaction patterns (2026-08-24)](docs/redaction-patterns-2026-08-24.md) | The original pattern research: every prefix, length class, and charset the scrub anchors on, and every deliberate gap |
 | [Redaction patterns — amendment 2026-08-31](docs/redaction-patterns-2026-08-31.md) | `prose-credential` and `paired-username` ([#15](https://github.com/surdy/qanungo/issues/15)) — patterns whose evidence is adjacency, not a separator |
 | [Redaction patterns — amendment 2026-09-04](docs/redaction-patterns-2026-09-04.md) | `prose-paired-username` ([#17](https://github.com/surdy/qanungo/issues/17)); this is the **current** `PATTERN_REVISION` |
@@ -245,7 +246,10 @@ types (munshi#77) into a token/cost breakdown by model and by repository. Three 
 honest. It **deduplicates by `message_id` before summing** — one API message reaches a transcript as
 several records repeating its `usage` verbatim, and summing records over-counts output tokens
 2.6-fold. It prices from a **static, date-versioned table** whose provenance is committed beside it
-([`docs/pricing-sources-2026-08-23.md`](docs/pricing-sources-2026-08-23.md)), selecting the row
+([`docs/pricing-sources-2026-08-23.md`](docs/pricing-sources-2026-08-23.md), amended by
+[`docs/pricing-sources-2026-09-05.md`](docs/pricing-sources-2026-09-05.md) for the
+`claude-fable-5-1` row, whose cache read is a quarter of its predecessor's rather than the family's
+usual tenth of input), selecting the row
 effective at each session's archive time, with cache writes priced from the per-tier buckets
 rather than from the undifferentiated total (the two TTLs bill at different multiples, and
 claude-code uses the 1-hour cache exclusively). And it **says what it cannot price**: a model with

@@ -738,7 +738,7 @@ mod tests {
         assert!(markdown.starts_with("# Cost report — last 12w"));
         assert!(markdown.contains("nothing to price yet"));
         assert!(markdown.contains("_Instrumentation —"));
-        assert!(markdown.contains("price table 2026-08-23"));
+        assert!(markdown.contains("price table 2026-09-05"));
         assert!(!markdown.contains("## Unpriced / flagged"));
         assert!(!markdown.contains("## Token volumes"));
     }
@@ -937,7 +937,7 @@ mod tests {
         assert!(footer.contains("12 records"), "{footer}");
         assert!(footer.contains("4.0 KiB folded"), "{footer}");
         assert!(footer.contains("cache 1 hits / 0 misses"), "{footer}");
-        assert!(footer.contains("price table 2026-08-23"), "{footer}");
+        assert!(footer.contains("price table 2026-09-05"), "{footer}");
     }
 
     /// "No billing signal at all" is a claim about the whole document. A window of copilot
@@ -1057,7 +1057,7 @@ mod tests {
         assert!(
             markdown.contains(
                 "highest published output rate of any row effective on each session's own archive \
-                 date (price table 2026-08-23"
+                 date (price table 2026-09-05"
             ),
             "{markdown}"
         );

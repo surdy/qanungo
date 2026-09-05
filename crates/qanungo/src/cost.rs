@@ -1135,6 +1135,45 @@ mod tests {
         assert!((totals.priced.cache_saving() - 4.50).abs() < 1e-9);
     }
 
+    /// Fable 5.1 bills its own cache read, not its predecessor's. The two models share every
+    /// other column, so a fold that resolved 5.1 through 5's row would look right in input and
+    /// output and be wrong by 4x on the one figure that dominates a claude-code session: reads.
+    /// The fixture is the real archive's shape in miniature — almost all of the tokens are cache
+    /// reads — so the divergence is a measured number rather than a claim.
+    #[test]
+    fn fable_5_1_reads_its_cache_at_its_own_rate_and_not_fable_5s() {
+        let session_on = |model: &str| SessionCost {
+            archived_at: Some(at("2026-09-05T00:00:00Z")),
+            ..session(
+                fold_claude(&claude_record("msg_1", model, &usage(0, 0, 0, 4_000_000))),
+                None,
+            )
+        };
+
+        let newer = CostTotals::fold(&[session_on("claude-fable-5-1")]);
+        assert_eq!(newer.priceable_sessions, 1);
+        assert!(
+            newer.flagged.unpriced.is_empty(),
+            "{:?}",
+            newer.flagged.unpriced,
+        );
+        // Four million tokens read back at $0.25 per million, not at $1.00.
+        assert!((newer.priced.cache_read_dollars - 1.00).abs() < 1e-9);
+        assert!((newer.priced.dollars - 1.00).abs() < 1e-9);
+        assert!((newer.by_model["claude-fable-5-1"].dollars - 1.00).abs() < 1e-9);
+        // The saving is measured against 5.1's own input rate, which it shares with Fable 5.
+        assert!((newer.priced.cache_read_at_input_rate - 40.00).abs() < 1e-9);
+        assert!((newer.priced.cache_saving() - 39.00).abs() < 1e-9);
+
+        // The same tokens on the predecessor, so the 4x is stated and not assumed.
+        let older = CostTotals::fold(&[session_on("claude-fable-5")]);
+        assert!((older.priced.cache_read_dollars - 4.00).abs() < 1e-9);
+        assert!(
+            (older.priced.cache_read_dollars - 4.0 * newer.priced.cache_read_dollars).abs() < 1e-9,
+            "reading 5.1's cache at 5's rate would have billed four times over",
+        );
+    }
+
     /// Synthetic messages are counted in tokens and excluded from dollars, and an unpriced model
     /// is a different flag from either — a report that merged the three would be unable to say
     /// whether a gap was a placeholder, a missing row, or a bug.
@@ -1452,9 +1491,9 @@ mod tests {
     }
 
     /// Only sessions this build read *whole*. A cheaper model beside the dear one, a model with no
-    /// price row, and a token-bearing `<synthetic>` placeholder each leave a session out — because
-    /// the three figures the list would print for it would be a share of that session rather than
-    /// all of it. A zero-token placeholder takes nothing away, so it does not.
+    /// rate in force on the day, and a token-bearing `<synthetic>` placeholder each leave a session
+    /// out — because the three figures the list would print for it would be a share of that session
+    /// rather than all of it. A zero-token placeholder takes nothing away, so it does not.
     #[test]
     fn a_session_this_build_could_not_read_whole_is_not_characterized() {
         let two_models = SessionCost {
@@ -1472,6 +1511,9 @@ mod tests {
         };
         assert_eq!(CostTotals::fold(&[two_models]).premium.sessions, 0);
 
+        // Fable 5.1 has a row, but not one effective on this session's archive date: a session
+        // older than its model's first price is unpriced just as squarely as an unknown model is,
+        // and it takes the reading down the same way.
         let with_unpriced = SessionCost {
             archived_at: Some(at("2026-08-01T00:00:00Z")),
             ..session(

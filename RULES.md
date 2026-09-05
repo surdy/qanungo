@@ -9,7 +9,7 @@ Every rule this build fires, every threshold it fires at, the lanes those rules 
 | Rule pack | `4137a6c61b13` | Every rule id, threshold, scoring constant, and lane mapping below. Two reports are comparable **iff this matches**. |
 | Formula | `equal-weight-mean-of-linear-penalties/1` | How the readings combine into a score. Bumped when the arithmetic changes, so a re-weighting cannot hide behind unchanged numbers. |
 | Redaction patterns | `2026-09-04` | The pattern set every rendered excerpt was scrubbed with. |
-| Price table | `2026-08-23` | The dated rates the cost lane bills at. |
+| Price table | `2026-09-05` | The dated rates the cost lane bills at. |
 
 The full rule-pack digest is `4137a6c61b13e31aa51c9ef181670d23902de391d63220ee5667f76cb50b1f5f`; the short form above is its first 12 characters and is what the footer of every report prints.
 
@@ -180,7 +180,7 @@ What the fold derives from `munshi-transcript`'s typed events, before any rule l
 
 Dollars are Anthropic API **list** prices, per million tokens, from the row effective at each session's archive time. A model with no row is unpriced rather than free, and a harness whose billing is not recoverable from a transcript gets token volumes and no money at all.
 
-Price table revision `2026-08-23`. *Top tier* below is resolved as of 2026-07-24, the newest date in the table itself, so this document says the same thing whenever it is rendered.
+Price table revision `2026-09-05`. *Top tier* below is resolved as of 2026-09-01, the newest date in the table itself, so this document says the same thing whenever it is rendered.
 
 | Model | From | Input | Output | Cache write 5m | Cache write 1h | Cache read | Fast tier | US premium | Top tier |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |
@@ -189,6 +189,7 @@ Price table revision `2026-08-23`. *Top tier* below is resolved as of 2026-07-24
 | `claude-fable-5` | 2026-06-09 | $10.00 | $50.00 | $12.50 | $20.00 | $1.00 | — | ×1.1 | yes |
 | `claude-sonnet-5` | 2026-06-30 | $2.00 | $10.00 | $2.50 | $4.00 | $0.20 | — | ×1.1 | no |
 | `claude-opus-5` | 2026-07-24 | $5.00 | $25.00 | $6.25 | $10.00 | $0.50 | $10.00 in / $50.00 out | ×1.1 | no |
+| `claude-fable-5-1` | 2026-09-01 | $10.00 | $50.00 | $12.50 | $20.00 | $0.25 | — | ×1.1 | yes |
 
 A fast-mode session bills at the fast column where the model has one; where it does not, `speed = "fast"` is **unpriced** rather than billed at the base rate. A `US premium` of ×1.1 applies to US-only inference on the rows that document one; a row with none that meets US inference is unpriced, because pricing it either way would be a claim the table's sources do not support.
 
