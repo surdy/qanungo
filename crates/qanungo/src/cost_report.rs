@@ -36,7 +36,7 @@
 //! since a transcript cannot say which of Copilot's two billing regimes the account was on.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -626,17 +626,13 @@ impl CostReport<'_> {
             instrumentation.sync.snapshots_fetched,
             PRICE_TABLE_REVISION,
             instrumentation.patwari_url,
-            display_path(&instrumentation.cache_root),
+            format::path(&instrumentation.cache_root),
         );
     }
 }
 
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 #[cfg(test)]

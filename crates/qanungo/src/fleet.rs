@@ -406,7 +406,7 @@ fn archive_field(value: Option<&str>, redactor: &Redactor) -> Value {
 fn mirror_value(mirror: &Mirror, folded: &Folded) -> Value {
     let instrumentation = &folded.instrumentation;
     json!({
-        "cache_root": mirror.cache_root.display().to_string(),
+        "cache_root": format::path(&mirror.cache_root),
         "files": mirror.usage.files,
         "bytes": mirror.usage.bytes,
         "size": format::bytes(mirror.usage.bytes),

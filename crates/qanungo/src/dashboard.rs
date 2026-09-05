@@ -2203,7 +2203,7 @@ impl Payload<'_> {
             // Text, never a link. See the module docs: Patwari serves unredacted blobs, so a browser
             // deep-link into it is a transcript disclosure wearing a convenience.
             "patwari_url": instrumentation.patwari_url,
-            "cache_root": instrumentation.cache_root.display().to_string(),
+            "cache_root": format::path(&instrumentation.cache_root),
             "refresh_interval": self.refresh.to_string(),
             "refreshed_at": stamp(self.refreshed.at),
             "generation": self.refreshed.generation,

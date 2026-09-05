@@ -25,7 +25,7 @@
 //! belongs, and it can only polish honestly if what it is handed is the archive's own words.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -181,7 +181,7 @@ impl StandupReport<'_> {
             instrumentation.sync.snapshots_fetched,
             redaction_counts(&self.standup.redaction),
             instrumentation.patwari_url,
-            display_path(&instrumentation.cache_root),
+            format::path(&instrumentation.cache_root),
         );
     }
 }
@@ -270,10 +270,6 @@ pub(crate) fn redaction_counts(report: &RedactionReport) -> String {
 
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 #[cfg(test)]

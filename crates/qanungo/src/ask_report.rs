@@ -14,7 +14,7 @@
 //! cannot check; this one shows its work.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -228,7 +228,7 @@ impl AskReport<'_> {
             instrumentation.sync.snapshots_fetched,
             redaction_counts(&self.ask.redaction),
             instrumentation.patwari_url,
-            display_path(&instrumentation.cache_root),
+            format::path(&instrumentation.cache_root),
         );
         // A second line rather than a longer first one, and only when the escalation ran: without
         // `--verbatim` this footer is byte-for-byte the one this lane has always printed.
@@ -356,10 +356,6 @@ fn quoted_terms(query: &Query) -> String {
 
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 #[cfg(test)]

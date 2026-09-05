@@ -34,7 +34,7 @@
 //! sentence about a cut that hid nothing is noise.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -313,7 +313,7 @@ impl DoctorReport<'_> {
             self.doctor.unreadable_records,
             redaction_counts(&self.doctor.redaction),
             instrumentation.patwari_url,
-            display_path(&instrumentation.cache_root),
+            format::path(&instrumentation.cache_root),
         );
     }
 }
@@ -398,10 +398,6 @@ fn render_friction_row(out: &mut String, friction: &Friction) {
 
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 #[cfg(test)]

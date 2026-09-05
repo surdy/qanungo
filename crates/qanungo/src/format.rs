@@ -11,7 +11,13 @@
 //! [`logged`] is the second such clamp, for the second rendering surface a peer's bytes can reach:
 //! the operator's terminal. The two are different functions rather than one with a flag, because a
 //! document and a log line want opposite things from a hostile value — see [`logged`].
+//!
+//! [`path`] is the third, for the one string every footer carries that is neither a number nor the
+//! archive's: this machine's own cache root. It abbreviates the operator's home directory to `~`
+//! for the reason a report is written at all — a document a person can paste somewhere should not
+//! have to be edited first (qanungo #19).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::TimeDelta;
@@ -205,6 +211,56 @@ pub fn elapsed(elapsed: Duration) -> String {
     }
 }
 
+/// A filesystem path as a footer or a payload should render it: the operator's home directory
+/// abbreviated to `~`, everything else verbatim.
+///
+/// Every document this crate writes ends in an instrumentation footer naming the cache it read,
+/// and `/api/data` publishes the same value. Rendered verbatim that is the single longest line in
+/// an otherwise clean footer, and it is the operator's home directory — so a coaching report,
+/// which is a thing people paste into a chat, had to be edited before it could be pasted
+/// (qanungo #19). `~` answers the only question the line is there to answer, *which cache did this
+/// read*, without answering one nobody asked.
+///
+/// Only a whole leading component sequence is replaced — `/home/ali-backup` is not under
+/// `/home/ali` and is left alone — and a path outside the home directory is returned untouched.
+/// With `HOME` unset, unusable, or the root directory itself, nothing is abbreviated and nothing
+/// fails: the abbreviation is a courtesy, never a guarantee, and no surface may depend on it.
+pub fn path(path: &Path) -> String {
+    abbreviate(path, home().as_deref())
+}
+
+/// The directory `~` stands for, read exactly as [`crate::cache::default_cache_root`] reads it:
+/// the `HOME` environment variable, empty treated as absent.
+///
+/// `XDG_CACHE_HOME` is deliberately not consulted. That variable says where a cache goes, not where
+/// the operator lives, and abbreviating some other prefix to `~` would make the footer say
+/// something untrue.
+fn home() -> Option<PathBuf> {
+    Some(PathBuf::from(
+        std::env::var_os("HOME").filter(|value| !value.is_empty())?,
+    ))
+}
+
+/// [`path`] with the home directory passed in, so its cases can be tested without touching the
+/// process environment — which, from edition 2024, no test may safely do beside its neighbours.
+///
+/// The usability guard is here rather than in [`home`] because it is a property of the rendering,
+/// not of the lookup: a relative or root home is not a home directory anybody has, and under `/`
+/// every absolute path is "inside the home directory" — the abbreviation would swallow the leading
+/// slash off `/etc`. Both are pathological rather than expected; the guard is here so there is no
+/// configuration in which this function lies.
+fn abbreviate(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|home| home.is_absolute() && home.parent().is_some()) else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(home) {
+        // The cache root *is* the home directory: `~`, with no trailing separator to explain.
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => Path::new("~").join(rest).display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +429,58 @@ mod tests {
     fn elapsed_switches_unit_at_a_second() {
         assert_eq!(elapsed(Duration::from_millis(340)), "340 ms");
         assert_eq!(elapsed(Duration::from_millis(1500)), "1.50 s");
+    }
+
+    /// The four cases a footer can actually be in (qanungo #19).
+    #[test]
+    fn paths_abbreviate_the_home_directory_and_nothing_else() {
+        let home = Path::new("/home/ali");
+
+        // The ordinary case: a cache under the home directory.
+        assert_eq!(
+            abbreviate(Path::new("/home/ali/.cache/qanungo"), Some(home)),
+            "~/.cache/qanungo",
+        );
+        // The home directory itself, with no trailing separator invented for it.
+        assert_eq!(abbreviate(home, Some(home)), "~");
+        // Somewhere else entirely: verbatim, because `~` would be a lie.
+        assert_eq!(
+            abbreviate(Path::new("/srv/qanungo-cache"), Some(home)),
+            "/srv/qanungo-cache",
+        );
+        // No home to abbreviate against: verbatim, and no panic. `HOME` is unset in plenty of
+        // service managers, and a footer is not a place to fail.
+        assert_eq!(
+            abbreviate(Path::new("/home/ali/.cache/qanungo"), None),
+            "/home/ali/.cache/qanungo",
+        );
+    }
+
+    /// A sibling whose name merely *starts* with the home directory's is not inside it. Textual
+    /// prefix matching would render this `~-backup/qanungo` and claim a relationship that does not
+    /// exist, so the match is on whole components.
+    #[test]
+    fn a_prefix_that_is_not_a_parent_is_left_alone() {
+        assert_eq!(
+            abbreviate(
+                Path::new("/home/ali-backup/qanungo"),
+                Some(Path::new("/home/ali"))
+            ),
+            "/home/ali-backup/qanungo",
+        );
+    }
+
+    /// `HOME` values that are not a home directory abbreviate nothing rather than eating the
+    /// leading component of every absolute path.
+    #[test]
+    fn an_unusable_home_abbreviates_nothing() {
+        assert_eq!(
+            abbreviate(Path::new("/etc/qanungo"), Some(Path::new("/"))),
+            "/etc/qanungo"
+        );
+        assert_eq!(
+            abbreviate(Path::new("/etc/qanungo"), Some(Path::new(""))),
+            "/etc/qanungo"
+        );
     }
 }

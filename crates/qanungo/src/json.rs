@@ -225,10 +225,7 @@ fn sync_provenance(sync: &SyncStats, fold_elapsed: Duration) -> Map<String, Valu
 /// thing in both places, and that is worth more than the exception would buy.
 fn locate(fields: &mut Map<String, Value>, patwari_url: &str, cache_root: &Path) {
     fields.insert("patwari_url".to_owned(), json!(patwari_url));
-    fields.insert(
-        "cache_root".to_owned(),
-        json!(cache_root.display().to_string()),
-    );
+    fields.insert("cache_root".to_owned(), json!(format::path(cache_root)));
 }
 
 /// The scrub that stood behind whatever prose this run rendered, and what it fired.

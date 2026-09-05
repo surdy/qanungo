@@ -35,7 +35,7 @@
 //! rather than quietly dropping anything it could not prove was machinery.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -349,7 +349,7 @@ impl FlowsReport<'_> {
             self.found.unreadable_records,
             redaction_counts(&self.found.redaction),
             instrumentation.patwari_url,
-            display_path(&instrumentation.cache_root),
+            format::path(&instrumentation.cache_root),
         );
     }
 }
@@ -504,10 +504,6 @@ fn open_section(out: &mut String, heading: &str) {
 
 fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@
 //! a decision unmeasurable.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -653,7 +653,7 @@ impl Report<'_> {
             instrumentation.sync.snapshots_fetched,
             instrumentation.rule_pack.stamp(),
             instrumentation.patwari_url,
-            display_path(&instrumentation.cache_root),
+            format::path(&instrumentation.cache_root),
         );
     }
 }
@@ -760,10 +760,6 @@ fn seconds(span: TimeDelta) -> f64 {
 /// The inverse, for rendering.
 fn span_of_seconds(value: f64) -> String {
     format::span(TimeDelta::try_seconds(value.round() as i64).unwrap_or_else(TimeDelta::zero))
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 #[cfg(test)]
