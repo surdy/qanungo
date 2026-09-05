@@ -69,6 +69,16 @@ const STAGE_BUFFER_BYTES: usize = 64 * 1024;
 /// like to keep paying for a dead one.
 const ORPHAN_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// What the mirror is holding on this disk: files under the cache root, and their bytes.
+///
+/// Two integers and no path: where the cache *is* is already stated in the instrumentation footer,
+/// and this is the answer to how much of the disk it has taken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub files: u64,
+    pub bytes: u64,
+}
+
 /// Whether a run served a transcript from the cache or had to fetch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lookup {
@@ -216,6 +226,48 @@ impl BlobCache {
             }
         }
         Ok(digests)
+    }
+
+    /// How much of this disk the mirror is using: every file under the cache root, and the bytes
+    /// they occupy.
+    ///
+    /// Both directories, blobs and the snapshot index, because the question this answers is "what
+    /// is qanungo costing me on this machine" and a caller who had to add two numbers could add
+    /// them wrong. Staged temporaries are counted too — they are occupying the disk whatever they
+    /// are called, and pretending otherwise would understate the only figure this function exists
+    /// to state.
+    ///
+    /// **Never fails and never partially reports a failure as a zero.** An unreadable directory is
+    /// skipped and what was walked is returned, on the same reasoning [`BlobCache::digests`] gives
+    /// for a shard: a partial inventory of a cache is still an inventory, and a health panel that
+    /// blanked itself because one directory was busy would be reporting on itself rather than on
+    /// the cache.
+    ///
+    /// It is a `stat` per file, taken once per refresh rather than once per request — a few
+    /// thousand of them on a real cache, against a refresh that already spends seconds folding.
+    pub fn usage(&self) -> CacheUsage {
+        let mut usage = CacheUsage::default();
+        for directory in [BLOB_DIR, SNAPSHOT_DIR] {
+            let Ok(shards) = fs::read_dir(self.root.join(directory)) else {
+                continue;
+            };
+            for shard in shards.filter_map(Result::ok) {
+                let Ok(entries) = fs::read_dir(shard.path()) else {
+                    continue;
+                };
+                for entry in entries.filter_map(Result::ok) {
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    if !metadata.is_file() {
+                        continue;
+                    }
+                    usage.files += 1;
+                    usage.bytes += metadata.len();
+                }
+            }
+        }
+        usage
     }
 
     /// Stores `bytes` under `digest`.

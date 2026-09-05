@@ -263,6 +263,7 @@ pub mod dashboard_server;
 pub mod doctor;
 pub mod doctor_report;
 pub mod evidence;
+pub mod fleet;
 pub mod flows;
 pub mod flows_report;
 pub mod format;

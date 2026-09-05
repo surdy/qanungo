@@ -136,10 +136,24 @@ Every rule, every threshold it fires at, the lanes those rules score into, the s
 
 A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring
 munshi-dashboard's read-only, contract-consuming posture. The page reads, in order: the **scope
-control**, the **ask box**, the **five lanes**, the **timeline**, the **habits heatmap**, the
-**findings**, the **cost** breakdown, and the **standup** narrative, over a provenance footer.
+control**, the **pipeline health** panel, the **ask box**, the **five lanes**, the **timeline**,
+the **habits heatmap**, the **findings**, the **cost** breakdown, and the **standup** narrative,
+over a provenance footer.
 Verbatim evidence is **redacted on the way to the browser** (toggleable, default on) and served by
 qanungo itself.
+
+**Pipeline health** is the one panel that is about the pipeline rather than about the practice: the
+**devices** seen in the window with their harness mix and last capture time (flagged *silent* after
+two days without one), what **landed** per day on archive time as a stacked bar per device, the
+**gaps** — sessions whose newest snapshot carried no readable transcript, how many of those a
+sibling snapshot recovered, and the report's own Gaps lines — the archive's own **totals** from
+Patwari's `/api/v1/stats` and `/api/v1/clients` (counts, byte sums, clients with their last-seen
+time; an older Patwari without those routes renders "not available on this patwari" and nothing
+else changes), and **this mirror**'s cache size, file count and last sync. It is aggregates by
+construction — counts, timestamps, byte sizes, device labels and harness names, and no transcript
+or summary text anywhere in it — so the redaction line is satisfied without a filter. A harness
+scope narrows the device rows' own numbers, a device scope highlights its row, and a repository
+scope leaves the panel whole, which the note on the panel says out loud.
 
 > The original plan had every finding, chart point, and session row deep-link into `session-recall` → the verified transcript in Patwari. The 2026-08-24 grilling on [#5](https://github.com/surdy/qanungo/issues/5) **retracted that**: Patwari serves raw blobs and never redacts, so such a link does not hand a browser a redacted transcript — it hands any tailnet device the whole unredacted one. Raw Patwari URLs therefore never appear in dashboard HTML; anything verbatim is cut from the local cache, redacted, and served by qanungo. The recall funnel stays a CLI/harness affordance, where your own shell already has raw access.
 
@@ -379,6 +393,13 @@ document says out loud in its own preamble: harness-injected prose the authored 
 clusters with itself in every repository at once, which can genuinely make it the most repeated text
 in the corpus and still worth nothing. Triaging that, and drafting anything, is
 `contrib/skills/skill-finder`'s half.
+
+**Shipped — the fleet panel** is the dashboard's *Pipeline health* section: devices reporting in
+the window, sessions landing per day by device, the munshi #78 gap class with its sibling
+recoveries, the archive's own inventory from `/api/v1/stats` and `/api/v1/clients` (tolerating an
+older Patwari that has neither), and this mirror's footprint. Everything is pre-folded per refresh
+like every other view, so a browser touching this panel makes no archive request at all — pinned by
+the same request-counting fixture the ask and excerpt routes are held to.
 
 **Declined.** The rule DSL ([#3](https://github.com/surdy/qanungo/issues/3)) — not deferred:
 hardcoded Rust rules stand until a second rule-author exists, and the design in that issue is kept

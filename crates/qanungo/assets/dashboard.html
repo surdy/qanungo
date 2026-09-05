@@ -512,6 +512,24 @@ td.name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+/* Pipeline health. Counts, times and device labels — the one section with no reading
+   that could be a score, so it is styled as a status board rather than as a lane:
+   plain tables, one flag colour, and a chart with the same marks as the timeline. */
+.fleet-block { margin: 0 0 1.25rem; }
+.fleet-block h3 {
+  font-size: 0.95rem;
+  font-weight: 650;
+  margin: 0 0 0.25rem;
+  color: var(--ink-2);
+}
+/* The row for the device the reader scoped to. A left rule and weight, never colour
+   alone: the same identity rule the chart legend is held to. */
+tr.scoped td { font-weight: 650; }
+tr.scoped td:first-child { box-shadow: inset 3px 0 0 var(--series-1); }
+/* A device nobody has heard from in a while. Weight and a word, and the exact time is
+   in the column beside it, because "silent" is a flag and not a verdict. */
+.silent { color: var(--down); font-weight: 650; }
+
 footer {
   margin-top: 3rem;
   padding-top: 1rem;
@@ -545,6 +563,39 @@ footer .archive { overflow-wrap: anywhere; }
     <button type="button" class="scope-reset" id="scope-reset">Whole window</button>
   </div>
   <p class="scope-note" id="scope-note"></p>
+
+  <!--
+    Pipeline health. Which machines are reporting, what landed on which day, what did
+    not arrive whole, how much is in the archive, and what this mirror is holding.
+
+    Aggregates only, by construction: counts, timestamps, byte sizes, device labels
+    and harness names. There is no transcript text and no summary text in this
+    section's payload at all, so there is nothing here for this file to leak — see
+    `crate::fleet`, which builds it, and the canary test that walks it.
+
+    Every number was folded server-side with the rest of the payload. This section, like
+    every other one, reads fields and scales them into pixels.
+  -->
+  <section aria-labelledby="fleet-heading">
+    <h2 id="fleet-heading">Pipeline health</h2>
+    <p class="note" id="fleet-note"></p>
+    <div class="fleet-block" id="fleet-devices"></div>
+    <div class="fleet-block">
+      <h3>Landing</h3>
+      <div class="legend" id="fleet-landing-legend"></div>
+      <div class="chart-frame">
+        <svg id="fleet-landing-chart" class="chart" role="img" aria-labelledby="fleet-landing-title fleet-landing-desc">
+          <title id="fleet-landing-title"></title>
+          <desc id="fleet-landing-desc"></desc>
+        </svg>
+      </div>
+      <p class="note" id="fleet-landing-note"></p>
+      <div id="fleet-landing-table"></div>
+    </div>
+    <div class="fleet-block" id="fleet-gaps"></div>
+    <div class="fleet-block" id="fleet-archive"></div>
+    <div class="fleet-block" id="fleet-mirror"></div>
+  </section>
 
   <!--
     The ask box. A <form> so Enter submits it the way a search box should, with the
@@ -2405,6 +2456,499 @@ function paintHeatmap(data, entry, column) {
 }
 
 /* ------------------------------------------------------------------------
+ * Pipeline health: is the fleet still reporting, and is anything stuck?
+ *
+ * Five views over one payload key. Every one of them is a field read: the device
+ * rows are the same grouping the device control is built from, the calendar is the
+ * same UTC archive day the timeline places a session on, the gap counts came off the
+ * mirror's own run, the archive totals are the archive's own integers, and the mirror
+ * block is what this disk is holding. Nothing here counts, sums, averages or rates.
+ *
+ * The scope interaction is deliberately partial, and the note says so on the page:
+ * a harness selection narrows the device table's own numbers (they are already split
+ * per harness in the payload), a device selection highlights its row, and a repository
+ * selection leaves the whole panel alone — a repository is not a machine, and cutting
+ * a fleet view by one would be answering a question nobody asked.
+ * ------------------------------------------------------------------------ */
+
+const FLEET = {
+  padLeft: 34,
+  padRight: 8,
+  padTop: 10,
+  padBottom: 26,
+  plotHeight: 90,
+  slot: 14,
+  widestSlot: 36,
+  slotAir: 3,
+  widestBar: 20,
+  leastPlot: 280,
+  gap: 2,
+  radius: 3,
+};
+
+/* The device axis the landing chart stacks by: one series per device in the payload's
+   own order, coloured by its place in that order and never by its rank among whatever
+   is drawn — the same rule the timeline's harness colours follow, so a device keeps
+   its colour when a quiet one drops out of the window. */
+function fleetSeries(fleet) {
+  return fleet.devices.map((device, index) => ({
+    label: device.device,
+    index,
+    klass: index < 3 ? "s" + index : "sx",
+  }));
+}
+
+/* How many sessions this device holds in the reader's current harness scope. With no
+   harness chosen it is the row's own total; with one chosen it is that harness's entry
+   in the split the payload already carries. A device that ran nothing with the chosen
+   harness is 0, which is a reading. */
+function fleetDeviceSessions(device, data, column) {
+  if (column < 0) return device.sessions;
+  return device.by_harness[data.scopes.harnesses[column]] || 0;
+}
+
+function fleetHarnessMix(device, data, column) {
+  if (column < 0) return device.harness_mix;
+  const harness = data.scopes.harnesses[column];
+  return harness + " " + (device.by_harness[harness] || 0);
+}
+
+/* When this device was last heard from, and whether that was long enough ago for the
+   payload to have flagged it. The threshold and the flag are both the server's — this
+   writes the word beside the time it already sent. */
+function fleetLastCapture(device) {
+  if (!device.last_capture_at) return "no dated capture";
+  if (!device.silent) return device.last_capture_at;
+  return device.last_capture_at + " — silent " + device.silent_days + "d";
+}
+
+/* The devices table. Built here rather than through `table` because one row may be the
+   scoped one and one cell may be flagged, and both are classes on elements this has to
+   make itself. */
+function fleetDevicesTable(data, entry, column) {
+  const fleet = data.fleet;
+  const scoped = entry && !scopeIsRepository(entry) ? entry.device : null;
+  const block = document.createDocumentFragment();
+  block.appendChild(el("h3", null, "Devices"));
+  if (fleet.devices.length === 0) {
+    block.appendChild(el("p", "empty", "No session in this window carries a device."));
+    return block;
+  }
+  const scroller = el("div", "scroller");
+  const node = el("table");
+  const head = el("tr");
+  for (const heading of [
+    { label: "Device" },
+    { label: "Sessions", figure: true },
+    { label: "Harness mix" },
+    { label: "Last capture" },
+  ]) {
+    head.appendChild(el("th", heading.figure ? "figure" : null, heading.label));
+  }
+  const thead = el("thead");
+  thead.appendChild(head);
+  node.appendChild(thead);
+  const body = el("tbody");
+  for (const device of fleet.devices) {
+    const row = el("tr", device.device === scoped ? "scoped" : null);
+    row.appendChild(el("td", "name", device.device));
+    row.appendChild(el("td", "figure", String(fleetDeviceSessions(device, data, column))));
+    row.appendChild(el("td", null, fleetHarnessMix(device, data, column)));
+    row.appendChild(el("td", device.silent ? "silent" : null, fleetLastCapture(device)));
+    body.appendChild(row);
+  }
+  node.appendChild(body);
+  scroller.appendChild(node);
+  block.appendChild(scroller);
+  block.appendChild(
+    el(
+      "p",
+      "note",
+      "A device is the host the capture ran on, as the snapshot manifest recorded it — the same " +
+        "labels the Device control above offers. Last capture is archive time. A device is " +
+        "called silent after " +
+        fleet.silent_after_days +
+        " days without one; the exact time is beside the word, because it is a flag and not a " +
+        "verdict. Only devices with a session in this window are here — a machine that stopped " +
+        "reporting altogether shows up in the archive's client list below, which is the one place " +
+        "that knows about it."
+    )
+  );
+  return block;
+}
+
+/* The landing chart's own columns: one per day the payload placed sessions on, each
+   split by device. */
+function fleetColumns(fleet) {
+  const series = fleetSeries(fleet);
+  return fleet.landing.days.map((day) => ({
+    date: day.date,
+    sessions: day.sessions,
+    parts: series.map((entry) => ({ series: entry, value: day.by_device[entry.index] || 0 })),
+  }));
+}
+
+function fleetSlot(count) {
+  const wanted = Math.ceil(FLEET.leastPlot / Math.max(count, 1));
+  return Math.min(Math.max(FLEET.slot, wanted), FLEET.widestSlot);
+}
+
+/* What one column says when a reader points at it. The date, the total, and the split
+   — all four numbers already in the payload. */
+function fleetColumnTitle(column) {
+  const split = column.parts
+    .filter((part) => part.value > 0)
+    .map((part) => part.series.label + " " + part.value)
+    .join(" · ");
+  return (
+    dayLabel(column.date) +
+    " — " +
+    column.sessions +
+    (column.sessions === 1 ? " session" : " sessions") +
+    (split ? " (" + split + ")" : "")
+  );
+}
+
+/* The sparkline: a small stacked column per day, in the page's own chart marks and
+   drawn into the <svg> the document already carries — so the SVG namespace is read
+   off a real node and this file still loads nothing from anywhere. */
+function drawFleetLanding(columns) {
+  const chart = document.getElementById("fleet-landing-chart");
+  const ns = chart.namespaceURI;
+  const shape = (tag, className) => {
+    const node = document.createElementNS(ns, tag);
+    if (className) node.setAttribute("class", className);
+    return node;
+  };
+  const set = (node, attributes) => {
+    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+    return node;
+  };
+
+  const slot = fleetSlot(columns.length);
+  const bar = Math.min(slot - FLEET.slotAir * 2, FLEET.widestBar);
+  const width = FLEET.padLeft + columns.length * slot + FLEET.padRight;
+  const height = FLEET.padTop + FLEET.plotHeight + FLEET.padBottom;
+  const base = FLEET.padTop + FLEET.plotHeight;
+  set(chart, { width, height, viewBox: "0 0 " + width + " " + height });
+
+  const title = document.getElementById("fleet-landing-title");
+  const desc = document.getElementById("fleet-landing-desc");
+  title.textContent = "Sessions landing per day, by device";
+  desc.textContent = columns.length
+    ? "A stacked column per day over " +
+      columns.length +
+      " days, split by the device the capture ran on, on the UTC day the archive finished each" +
+      " session's snapshot. The same numbers are in the table below."
+    : "Nothing landed on any day in this window.";
+  if (!columns.length) {
+    chart.replaceChildren(title, desc);
+    return;
+  }
+
+  const nodes = [];
+  const max = niceMax(Math.max(...columns.map((column) => column.sessions)));
+  for (const tick of [0, max]) {
+    const y = base - (tick / max) * FLEET.plotHeight;
+    nodes.push(
+      set(shape("line", "grid"), { x1: FLEET.padLeft, y1: y, x2: width - FLEET.padRight, y2: y })
+    );
+    const label = shape("text", "axis-text");
+    set(label, { x: FLEET.padLeft - 6, y: y + 3, "text-anchor": "end" });
+    label.textContent = String(tick);
+    nodes.push(label);
+  }
+
+  columns.forEach((column, index) => {
+    const slotX = FLEET.padLeft + index * slot;
+    const group = shape("g");
+    const label = shape("title");
+    label.textContent = fleetColumnTitle(column);
+    group.appendChild(label);
+    group.appendChild(
+      set(shape("rect", "hit"), {
+        x: slotX,
+        y: FLEET.padTop,
+        width: slot,
+        height: FLEET.plotHeight,
+      })
+    );
+    const drawn = column.parts.filter((part) => part.value > 0);
+    let cursor = base;
+    drawn.forEach((part, at) => {
+      const span = (part.value / max) * FLEET.plotHeight;
+      const top = at === drawn.length - 1;
+      const tall = Math.max(span - (top ? 0 : FLEET.gap), 1);
+      const y = cursor - tall;
+      const x = slotX + (slot - bar) / 2;
+      if (top) {
+        group.appendChild(
+          set(shape("path", part.series.klass), { d: barPath(x, y, bar, tall, FLEET.radius) })
+        );
+      } else {
+        group.appendChild(set(shape("rect", part.series.klass), { x, y, width: bar, height: tall }));
+      }
+      cursor -= span;
+    });
+    nodes.push(group);
+  });
+
+  nodes.push(
+    set(shape("line", "grid"), {
+      x1: FLEET.padLeft,
+      y1: base,
+      x2: width - FLEET.padRight,
+      y2: base,
+    })
+  );
+
+  const last = columns.length - 1;
+  for (const index of [...new Set([0, last])]) {
+    const text = shape("text", "axis-text");
+    const anchor = index === 0 ? "start" : "end";
+    const at = FLEET.padLeft + index * slot + (anchor === "start" ? 0 : slot);
+    set(text, { x: at, y: base + 14, "text-anchor": anchor });
+    text.textContent = dayLabel(columns[index].date);
+    nodes.push(text);
+  }
+
+  chart.replaceChildren(title, desc, ...nodes);
+}
+
+/* The device legend, on the same rule the timeline's is: present whenever more than one
+   series is drawn, because identity must never rest on colour alone. */
+function drawFleetLegend(series) {
+  const legend = document.getElementById("fleet-landing-legend");
+  if (series.length < 2) {
+    legend.replaceChildren();
+    return;
+  }
+  legend.replaceChildren(
+    ...series.map((entry) => {
+      const item = el("div", "legend-item");
+      item.appendChild(el("span", "legend-swatch " + entry.klass));
+      item.appendChild(el("span", null, entry.label));
+      return item;
+    })
+  );
+}
+
+function fleetLandingTable(columns, series) {
+  const heading = [
+    { label: "Day" },
+    ...series.map((entry) => ({ label: entry.label, figure: true })),
+    { label: "Sessions", figure: true },
+  ];
+  const rows = columns.map((column) => [
+    column.date,
+    ...column.parts.map((part) => String(part.value)),
+    String(column.sessions),
+  ]);
+  const details = el("details");
+  details.appendChild(el("summary", null, "The numbers behind the chart"));
+  details.appendChild(table(null, heading, rows));
+  return details;
+}
+
+function fleetLandingNote(fleet) {
+  const landing = fleet.landing;
+  const undated =
+    landing.undated > 0
+      ? " " +
+        landing.undated +
+        " session" +
+        (landing.undated === 1 ? " carries" : "s carry") +
+        " an archive time this build could not read, so " +
+        (landing.undated === 1 ? "it is" : "they are") +
+        " on no day and counted here instead."
+      : "";
+  return (
+    landing.sessions +
+    " sessions on " +
+    landing.days_covered +
+    " days. A day is the UTC calendar day the archive finished the session's snapshot — the same" +
+    " clock the timeline above uses and the one the window itself is cut on, never the machine's" +
+    " own local time. Every session in the window is read from exactly one snapshot, so a" +
+    " snapshot count per day would be this same series under another name; the archive's own" +
+    " snapshot total is in the totals below." +
+    undated
+  );
+}
+
+/* What did not arrive whole. Three numbers off the mirror's own run, and then the
+   report's Gaps lines verbatim — the same list the footer carries, repeated here
+   because this is where a reader comes to find out what is stuck. */
+function fleetGaps(fleet) {
+  const gaps = fleet.gaps;
+  const block = document.createDocumentFragment();
+  block.appendChild(el("h3", null, "Gaps"));
+  block.appendChild(
+    el(
+      "p",
+      "note",
+      gaps.projection_unusable +
+        " session" +
+        (gaps.projection_unusable === 1 ? "'s" : "s'") +
+        " newest snapshot carried no readable transcript — " +
+        gaps.recovered_from_sibling +
+        " recovered from an older sibling snapshot, " +
+        gaps.unrecovered +
+        " not. The mirror walks a session's other snapshots whenever the archive's projection" +
+        " cannot answer, so a recovery costs a request and loses nothing. " +
+        gaps.sessions_folded +
+        " of " +
+        gaps.sessions_listed +
+        " listed sessions were folded."
+    )
+  );
+  if (gaps.notes.length) {
+    const list = el("ul", "flags");
+    for (const note of gaps.notes) {
+      list.appendChild(el("li", null, note.count + " — " + note.reason));
+    }
+    block.appendChild(list);
+  }
+  return block;
+}
+
+/* The archive's own totals, or the sentence saying why there are none. The server
+   decides which of those two it is and writes the sentence; this switches on a
+   boolean. */
+function fleetArchive(fleet) {
+  const archive = fleet.archive;
+  const block = document.createDocumentFragment();
+  block.appendChild(el("h3", null, "Archive totals"));
+  if (!archive.available) {
+    block.appendChild(el("p", "note", archive.reason));
+    return block;
+  }
+  block.appendChild(
+    table(
+      null,
+      [{ label: "What" }, { label: "How much", figure: true }],
+      [
+        ["Sessions", String(archive.sessions)],
+        ["Snapshots", String(archive.snapshots)],
+        ["Captures", String(archive.captures)],
+        ["Artifacts", String(archive.artifacts)],
+        ["Blobs", String(archive.blobs)],
+        ["Stored", archive.stored],
+        ["Original", archive.original],
+        ["Tombstones", String(archive.tombstones)],
+      ]
+    )
+  );
+  block.appendChild(
+    table(
+      "Clients",
+      [
+        { label: "Device" },
+        { label: "Captures", figure: true },
+        { label: "First seen" },
+        { label: "Last seen" },
+      ],
+      archive.clients.map((client) => [
+        client.device,
+        String(client.captures),
+        client.first_seen_at,
+        client.last_seen_at || "never",
+      ])
+    )
+  );
+  block.appendChild(
+    el(
+      "p",
+      "note",
+      "Straight from the archive, counted by the archive: last ingest " +
+        (archive.last_ingest_at || "never") +
+        ", activity from " +
+        (archive.oldest_activity_at || "none") +
+        " to " +
+        (archive.newest_activity_at || "none") +
+        ", taken at " +
+        archive.generated_at +
+        ". These are totals over everything the archive holds, not over this page's window, and" +
+        " they are the only figures here no scope narrows."
+    )
+  );
+  return block;
+}
+
+/* This mirror: what it is holding, and what the last coaching sync cost. Every figure
+   is also in the footer — repeated because the footer answers what the page cost to
+   build and this answers whether the copy on this disk is healthy. */
+function fleetMirror(fleet) {
+  const mirror = fleet.mirror;
+  const block = document.createDocumentFragment();
+  block.appendChild(el("h3", null, "This mirror"));
+  block.appendChild(
+    el(
+      "p",
+      "note",
+      mirror.size +
+        " over " +
+        mirror.files +
+        " files at " +
+        mirror.cache_root +
+        ". Last coaching sync " +
+        mirror.sync +
+        " · fold " +
+        mirror.fold +
+        " · " +
+        mirror.sessions_folded +
+        " of " +
+        mirror.sessions_listed +
+        " listed sessions folded · cache " +
+        mirror.cache_hits +
+        " hits / " +
+        mirror.cache_misses +
+        " misses · snapshots " +
+        mirror.snapshots_indexed +
+        " indexed / " +
+        mirror.snapshots_fetched +
+        " fetched."
+    )
+  );
+  return block;
+}
+
+function fleetNote(entry) {
+  const base =
+    "Aggregates only: counts, times, device labels, harness names and byte sizes. No transcript" +
+    " or summary text reaches this section. Every figure was folded server-side with the rest of" +
+    " this payload — the panel makes no request of its own and none of it touches the archive.";
+  if (!entry) return base;
+  return (
+    base +
+    (scopeIsRepository(entry)
+      ? " A repository scope leaves this panel whole: a repository is not a machine, so nothing" +
+        " here is cut by one."
+      : " The device you scoped to is the highlighted row; the rest of the panel stays whole," +
+        " because the archive's totals and this mirror's own state are facts about the pipeline" +
+        " rather than about one machine.")
+  );
+}
+
+function paintFleet(data, entry, column) {
+  const fleet = data.fleet;
+  document.getElementById("fleet-note").textContent = fleetNote(entry);
+  document.getElementById("fleet-devices").replaceChildren(fleetDevicesTable(data, entry, column));
+
+  const series = fleetSeries(fleet);
+  const columns = fleetColumns(fleet);
+  drawFleetLegend(series);
+  drawFleetLanding(columns);
+  document.getElementById("fleet-landing-note").textContent = fleetLandingNote(fleet);
+  document
+    .getElementById("fleet-landing-table")
+    .replaceChildren(...(columns.length ? [fleetLandingTable(columns, series)] : []));
+
+  document.getElementById("fleet-gaps").replaceChildren(fleetGaps(fleet));
+  document.getElementById("fleet-archive").replaceChildren(fleetArchive(fleet));
+  document.getElementById("fleet-mirror").replaceChildren(fleetMirror(fleet));
+}
+
+/* ------------------------------------------------------------------------
  * The ask box: a ranked search over the summaries this refresh already read.
  *
  * The one control on this page whose answer is not already in the payload — and it
@@ -2814,6 +3358,7 @@ function paint() {
 
   paintTimeline(data, entry, column);
   paintHeatmap(data, entry, column);
+  paintFleet(data, entry, column);
 
   const findings = document.getElementById("findings");
   const cards = data.findings

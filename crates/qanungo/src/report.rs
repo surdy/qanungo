@@ -788,6 +788,7 @@ mod tests {
                 snapshots_fetched: 0,
                 bytes_transferred: 0,
                 elapsed: Duration::from_millis(120),
+                ..SyncStats::default()
             },
             fold_elapsed: Duration::from_millis(7),
             sessions_folded: 1,

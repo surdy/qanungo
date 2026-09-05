@@ -112,6 +112,7 @@ use crate::cli::{ArchiveArgs, DashboardArgs, Refresh};
 use crate::command::{self, CommandError, Folded};
 use crate::dashboard::{self, Payload, Refreshed, Windows};
 use crate::evidence::{self, EvidenceIndex};
+use crate::fleet::{Fleet, Inventory, Mirror};
 use crate::format;
 use crate::metrics;
 use crate::redaction::Redactor;
@@ -251,6 +252,7 @@ impl Dashboard {
         let service = Arc::new(Service::new(
             fold_and_publish(
                 &args.archive,
+                &cache,
                 &windows,
                 &args.refresh,
                 Refreshed {
@@ -523,6 +525,7 @@ impl Service {
 /// cannot silently swallow the posture statement.
 fn fold_and_publish(
     archive: &ArchiveArgs,
+    cache: &BlobCache,
     windows: &Windows,
     refresh: &Refresh,
     refreshed: Refreshed,
@@ -579,6 +582,25 @@ fn fold_and_publish(
     );
     let folds_elapsed = started.elapsed();
 
+    // The fifth thing a refresh reads, and the only one that is not a fold: the archive's own
+    // inventory, and this disk's own copy of it. Taken *after* the folds and outside the
+    // `folds_elapsed` measurement on purpose — that number answers "what does folding four lanes
+    // cost", and quietly adding two integer requests to it would make the one figure the refresh
+    // interval is argued from start drifting.
+    let fleet = Fleet {
+        archive: inventory(archive),
+        mirror: Mirror {
+            cache_root: cache.root().to_path_buf(),
+            usage: cache.usage(),
+        },
+    };
+    eprintln!(
+        "qanungo dashboard: fleet — {} · mirror {} over {} files",
+        inventory_line(&fleet.archive),
+        format::bytes(fleet.mirror.usage.bytes),
+        fleet.mirror.usage.files,
+    );
+
     let evidence = dashboard::evidence_index(&coaching);
     let body = serde_json::to_vec(
         &Payload {
@@ -587,6 +609,7 @@ fn fold_and_publish(
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
+            fleet: &fleet,
             ask: &ask,
             folds_elapsed,
             refreshed,
@@ -617,6 +640,60 @@ fn fold_and_publish(
         evidence,
         ask: Arc::new(ask),
     })
+}
+
+/// Asks the archive what it holds, and never lets the answer fail a refresh.
+///
+/// Two requests, once per refresh, both of them integers and instants
+/// ([`ReadClient::archive_stats`](crate::patwari::ReadClient::archive_stats)). Everything that can
+/// go wrong is a *state of the panel* rather than an error of the loop:
+///
+/// - a Patwari with no `/api/v1/stats` is [`Inventory::Unsupported`] and the panel says so, because
+///   an older archive must keep serving a working dashboard;
+/// - anything else — a refused connection, a `503` during a backup, a document this build cannot
+///   read — is [`Inventory::Failed`] with the reason, because "the route is not there" and "the
+///   archive is unwell" are different facts and a health panel of all places must not merge them;
+/// - and neither one stops the publish, because the four folds above already succeeded and blanking
+///   a page of good numbers over an inventory request would be the panel taking the dashboard down.
+///
+/// The clients listing is only asked for once the stats route has answered: an archive that does
+/// not have the first does not have the second, and a second request to confirm that would be a
+/// request spent learning nothing.
+fn inventory(archive: &ArchiveArgs) -> Inventory {
+    let client = match crate::patwari::ReadClient::connect(&archive.patwari_url) {
+        Ok(client) => client,
+        Err(error) => return Inventory::Failed(error.to_string()),
+    };
+    let stats = match client.archive_stats() {
+        Ok(Some(stats)) => stats,
+        Ok(None) => return Inventory::Unsupported,
+        Err(error) => return Inventory::Failed(error.to_string()),
+    };
+    match client.archive_clients() {
+        Ok(Some(clients)) => Inventory::Read { stats, clients },
+        // A server that answers `/stats` and not `/clients` is not a shape Patwari has, and the
+        // honest rendering of a half-answer is the whole panel saying it could not read the
+        // archive rather than a totals block beside an empty client table nobody could explain.
+        Ok(None) => Inventory::Unsupported,
+        Err(error) => Inventory::Failed(error.to_string()),
+    }
+}
+
+/// The inventory, on the refresh's own stderr line — the same three states the panel renders.
+fn inventory_line(inventory: &Inventory) -> String {
+    match inventory {
+        Inventory::Read { stats, clients } => format!(
+            "archive {} sessions / {} snapshots / {} blobs · {} stored of {} original · {} clients",
+            stats.sessions,
+            stats.snapshots,
+            stats.blobs,
+            format::bytes(stats.stored_bytes),
+            format::bytes(stats.original_bytes),
+            clients.len(),
+        ),
+        Inventory::Unsupported => "archive totals unavailable on this patwari".to_owned(),
+        Inventory::Failed(error) => format!("archive totals unread — {error}"),
+    }
 }
 
 /// The instrumentation footer's own quantities, in the footer's own renderings, on one stderr line.
@@ -664,6 +741,7 @@ fn refresh_loop(
         let at = Utc::now();
         match fold_and_publish(
             archive,
+            &service.cache,
             windows,
             refresh,
             Refreshed {

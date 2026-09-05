@@ -151,6 +151,16 @@ fn spawn_archive(sessions: Vec<ArchivedSession>) -> String {
     spawn_counted_archive(sessions).0
 }
 
+/// The same archive **without** the two inventory routes — a Patwari older than
+/// `/api/v1/stats`, which answers `404` for both exactly as the real one did before it grew them.
+///
+/// It exists so the fleet panel's tolerance is exercised against a server that behaves like the
+/// old one rather than against a mocked error: the dashboard must fold, publish, and serve a whole
+/// page, with the panel saying the totals are not available and every other number unaffected.
+fn spawn_archive_without_inventory(sessions: Vec<ArchivedSession>) -> String {
+    spawn_inventoried_archive(sessions, false).0
+}
+
 /// The same, plus a counter of **every request the archive is asked for** — listings, snapshot
 /// documents, and artifact content alike.
 ///
@@ -165,6 +175,14 @@ fn spawn_archive(sessions: Vec<ArchivedSession>) -> String {
 /// and passed. The invariant is that a request induces **no archive traffic of any kind**, so that
 /// is what is counted.
 fn spawn_counted_archive(sessions: Vec<ArchivedSession>) -> (String, Arc<AtomicUsize>) {
+    spawn_inventoried_archive(sessions, true)
+}
+
+/// The archive, with or without the inventory routes the fleet panel reads.
+fn spawn_inventoried_archive(
+    sessions: Vec<ArchivedSession>,
+    inventory: bool,
+) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let base = format!("http://{}", listener.local_addr().unwrap());
     let sessions = Arc::new(sessions);
@@ -175,13 +193,18 @@ fn spawn_counted_archive(sessions: Vec<ArchivedSession>) -> (String, Arc<AtomicU
             let Ok(stream) = stream else { continue };
             let sessions = Arc::clone(&sessions);
             let requests = Arc::clone(&counted);
-            std::thread::spawn(move || serve_archive(stream, &sessions, &requests));
+            std::thread::spawn(move || serve_archive(stream, &sessions, &requests, inventory));
         }
     });
     (base, requests)
 }
 
-fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], requests: &AtomicUsize) {
+fn serve_archive(
+    mut stream: TcpStream,
+    sessions: &[ArchivedSession],
+    requests: &AtomicUsize,
+    inventory: bool,
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -210,6 +233,21 @@ fn serve_archive(mut stream: TcpStream, sessions: &[ArchivedSession], requests: 
 
     let response = if path == "/api/v1/sessions" {
         json_response(&session_page(sessions))
+    } else if path == "/api/v1/stats" {
+        // The inventory routes, present or absent together: a Patwari that has one has both, and
+        // the panel's two states are "the archive answered" and "this archive is older than the
+        // route".
+        if inventory {
+            json_response(&archive_stats(sessions))
+        } else {
+            not_found()
+        }
+    } else if path == "/api/v1/clients" {
+        if inventory {
+            json_response(&archive_clients(sessions))
+        } else {
+            not_found()
+        }
     } else if let Some(id) = path
         .strip_prefix("/api/v1/sessions/")
         .and_then(|rest| rest.strip_suffix("/snapshots"))
@@ -385,6 +423,89 @@ fn summary_artifact(session: &ArchivedSession) -> String {
         session.summary_artifact_id,
         session.summary_artifact_id,
     )
+}
+
+/// The archive's own inventory over these fixtures — `GET /api/v1/stats`, in the contract's shape.
+///
+/// Every figure is *derived from the fixture sessions*, never a constant, so a test can assert the
+/// panel renders what the archive said rather than what somebody typed twice. The archive counts
+/// everything it holds, which is deliberately more than any window: the totals block is the one
+/// part of this panel no scope narrows, and a fixture whose totals happened to equal the window's
+/// could not show that.
+fn archive_stats(sessions: &[ArchivedSession]) -> String {
+    let artifacts: usize = sessions
+        .iter()
+        .map(|session| 1 + usize::from(session.summary.is_some()))
+        .sum();
+    let bytes: usize = sessions
+        .iter()
+        .map(|session| {
+            session.transcript.len() + session.summary.as_ref().map_or(0, |summary| summary.len())
+        })
+        .sum();
+    let last_ingest = sessions
+        .iter()
+        .map(|session| session.completed_at.as_str())
+        .max()
+        .unwrap_or_default();
+    let oldest = sessions
+        .iter()
+        .map(|session| session.completed_at.as_str())
+        .min()
+        .unwrap_or_default();
+    format!(
+        r#"{{"schema_version":1,"generated_at":"{last_ingest}",
+            "archive_instance_id":"fixture-archive",
+            "sessions":{sessions_count},"snapshots":{sessions_count},"captures":{sessions_count},
+            "artifacts":{artifacts},"blobs":{artifacts},
+            "stored_bytes":{bytes},"original_bytes":{bytes},
+            "clients":{clients},"tombstones":7,
+            "last_ingest_at":"{last_ingest}",
+            "oldest_activity_at":"{oldest}","newest_activity_at":"{last_ingest}"}}"#,
+        sessions_count = sessions.len(),
+        clients = archive_client_rows(sessions).len(),
+    )
+}
+
+/// One client per distinct host the fixtures name, plus one for the captures that named none —
+/// which is exactly the shape a real archive is in, and the one that exercises the null hostname.
+fn archive_client_rows(sessions: &[ArchivedSession]) -> Vec<(Option<String>, usize)> {
+    let mut hosts: Vec<Option<String>> = Vec::new();
+    for session in sessions {
+        if !hosts.contains(&session.hostname) {
+            hosts.push(session.hostname.clone());
+        }
+    }
+    hosts.sort();
+    hosts
+        .into_iter()
+        .map(|host| {
+            let count = sessions
+                .iter()
+                .filter(|session| session.hostname == host)
+                .count();
+            (host, count)
+        })
+        .collect()
+}
+
+fn archive_clients(sessions: &[ArchivedSession]) -> String {
+    let items: Vec<String> = archive_client_rows(sessions)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (host, captures))| {
+            format!(
+                r#"{{"client_id":"client-{index}","hostname":{},
+                    "first_seen_at":"2026-01-01T00:00:00Z",
+                    "last_seen_at":"2026-09-01T00:00:00Z","capture_count":{captures}}}"#,
+                match &host {
+                    Some(name) => format!("\"{name}\""),
+                    None => "null".to_owned(),
+                },
+            )
+        })
+        .collect();
+    format!(r#"{{"items":[{}],"next_cursor":null}}"#, items.join(","))
 }
 
 fn json_response(body: &str) -> Vec<u8> {
@@ -4464,5 +4585,425 @@ fn the_page_carries_one_ask_box_that_ranks_nothing_itself() {
         body.matches("fetch(").count(),
         3,
         "the payload, an excerpt and a search, and nothing the ask box adds",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The fleet panel: pipeline health, aggregates only
+// ---------------------------------------------------------------------------
+
+/// Everything the panel says about the *window* is the fold's own arithmetic, checked from the
+/// outside.
+///
+/// Three reconciliations, and each one is a different way the section could have drifted from the
+/// page it sits on. The device rows must sum to the window's folded count and must be the very same
+/// labels the device scope control offers — a panel and a control disagreeing about what a machine
+/// is called is how one machine becomes two. The landing calendar must be the timeline's own days,
+/// date for date and total for total, because both claim to be the same sessions on the same clock.
+/// And every per-day device split must sum to that day's own total, which is what makes a stacked
+/// column readable as a count.
+#[test]
+fn the_fleet_panel_reconciles_with_the_fold_it_is_built_from() {
+    let (address, _directory) = spawn_dashboard(device_archive());
+    let payload = payload_of(address);
+    let fleet = &payload["fleet"];
+    let folded = payload["sessions"]["folded"].as_u64().expect("a count");
+    assert!(folded > 0, "the fixture window folded nothing");
+
+    // The rows are the scope control's own options, in the scope control's own order.
+    let rows: Vec<&str> = fleet["devices"]
+        .as_array()
+        .expect("a device list")
+        .iter()
+        .map(|device| device["device"].as_str().expect("a label"))
+        .collect();
+    let scopes: Vec<&str> = payload["scopes"]["devices"]
+        .as_array()
+        .expect("a device scope list")
+        .iter()
+        .map(|scope| scope["device"].as_str().expect("a label"))
+        .collect();
+    assert_eq!(
+        rows, scopes,
+        "the panel and the control name the same devices"
+    );
+
+    // Every session in the window is on exactly one row, and each row's harness split is its own
+    // total — including the mix line, which is a label made of those same numbers.
+    let mut counted = 0;
+    for device in fleet["devices"].as_array().unwrap() {
+        let sessions = device["sessions"].as_u64().expect("a count");
+        counted += sessions;
+        let split: u64 = device["by_harness"]
+            .as_object()
+            .expect("a harness split")
+            .values()
+            .map(|count| count.as_u64().expect("a count"))
+            .sum();
+        assert_eq!(split, sessions, "{device}");
+        let mix = device["harness_mix"].as_str().expect("a mix line");
+        for (harness, count) in device["by_harness"].as_object().unwrap() {
+            assert!(
+                mix.contains(&format!("{harness} {count}")),
+                "the mix line omits {harness}: {mix}",
+            );
+        }
+    }
+    assert_eq!(
+        counted, folded,
+        "every folded session is on exactly one row"
+    );
+
+    // The calendar is the timeline's calendar. Same days, same totals, same clock — stated on the
+    // wire as well as asserted here.
+    assert_eq!(fleet["landing"]["basis"], "archive-completion-utc");
+    let landing = fleet["landing"]["days"].as_array().expect("landing days");
+    let timeline = payload["timeline"]["days"].as_array().expect("days");
+    assert_eq!(landing.len(), timeline.len(), "a different set of days");
+    for (day, drawn) in landing.iter().zip(timeline) {
+        assert_eq!(day["date"], drawn["date"]);
+        let by_harness: u64 = drawn["sessions"]
+            .as_array()
+            .expect("per-harness counts")
+            .iter()
+            .map(|count| count.as_u64().expect("a count"))
+            .sum();
+        assert_eq!(day["sessions"].as_u64().expect("a count"), by_harness);
+        // And the split under the column sums to the column.
+        let by_device: u64 = day["by_device"]
+            .as_array()
+            .expect("per-device counts")
+            .iter()
+            .map(|count| count.as_u64().expect("a count"))
+            .sum();
+        assert_eq!(by_device, by_harness, "{day}");
+        assert_eq!(
+            day["by_device"].as_array().unwrap().len(),
+            rows.len(),
+            "the per-day array is dense over the device axis",
+        );
+    }
+    assert_eq!(
+        fleet["landing"]["sessions"].as_u64().unwrap()
+            + fleet["landing"]["undated"].as_u64().unwrap(),
+        folded,
+        "what is drawn plus what could not be drawn is the window",
+    );
+    assert_eq!(
+        fleet["landing"]["days_covered"].as_u64().unwrap(),
+        landing.len() as u64,
+    );
+
+    // The gap counts are the mirror's own, and the three of them add up.
+    let gaps = &fleet["gaps"];
+    assert_eq!(
+        gaps["projection_unusable"].as_u64().unwrap(),
+        gaps["recovered_from_sibling"].as_u64().unwrap() + gaps["unrecovered"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        gaps["sessions_folded"],
+        payload["provenance"]["sessions_folded"]
+    );
+    assert_eq!(
+        gaps["sessions_listed"],
+        payload["provenance"]["sessions_listed"]
+    );
+
+    // The mirror block is this disk, and it agrees with the footer that describes the same run.
+    let mirror = &fleet["mirror"];
+    assert_eq!(mirror["cache_root"], payload["provenance"]["cache_root"]);
+    assert_eq!(mirror["sync"], payload["provenance"]["sync"]);
+    assert!(mirror["files"].as_u64().expect("a file count") > 0);
+    assert!(mirror["bytes"].as_u64().expect("a byte count") > 0);
+    assert!(mirror["size"].as_str().expect("a rendered size").len() > 1);
+
+    // The threshold the panel flags on is served, so the page prints the same number the server
+    // decided with.
+    assert_eq!(fleet["silent_after_days"], 2);
+    // Nothing in this fixture is two days old: the window is hours deep, so every row is current.
+    for device in fleet["devices"].as_array().unwrap() {
+        assert_eq!(device["silent"], false, "{device}");
+        assert!(device["last_capture_at"].is_string(), "{device}");
+    }
+}
+
+/// The archive's own totals, as the archive stated them — and stated about the *whole archive*,
+/// which is why they are the one block on this page no scope narrows.
+#[test]
+fn the_archive_totals_are_the_archives_own_and_name_every_client() {
+    let sessions = device_archive();
+    let count = sessions.len() as u64;
+    let (address, _directory) = spawn_dashboard(sessions);
+    let archive = payload_of(address)["fleet"]["archive"].clone();
+
+    assert_eq!(archive["available"], true);
+    assert_eq!(archive["sessions"], count);
+    assert_eq!(archive["snapshots"], count);
+    assert_eq!(archive["tombstones"], 7);
+    assert!(archive["stored"].as_str().expect("a rendered size").len() > 1);
+    assert!(archive["original"].as_str().expect("a rendered size").len() > 1);
+    assert!(archive["last_ingest_at"].is_string());
+
+    // Every client the archive names is spelled with the device scope's own label function, so a
+    // machine reads the same way here as it does in the rows above — including the one that
+    // registered no hostname, which is a sentence and never a path.
+    let clients = archive["clients"].as_array().expect("a client list");
+    assert_eq!(
+        clients.len() as u64,
+        archive["client_count"].as_u64().unwrap()
+    );
+    let devices: Vec<&str> = clients
+        .iter()
+        .map(|client| client["device"].as_str().expect("a label"))
+        .collect();
+    assert!(devices.contains(&"macbookpro"), "{devices:?}");
+    assert!(devices.contains(&"no device recorded"), "{devices:?}");
+    for client in clients {
+        let device = client["device"].as_str().unwrap();
+        assert!(
+            !device.contains('/'),
+            "a client label is never a path: {device}"
+        );
+        assert!(client["captures"].is_u64(), "{client}");
+    }
+}
+
+/// An archive older than the inventory routes is a *state of the panel*, never a refresh that
+/// failed.
+///
+/// The whole page must come up: five lanes, a folded window, a timeline, a footer — everything
+/// exactly as it is against a current archive — with one block saying it has no totals to show. A
+/// dashboard that refused to start, or served a blank section, would have made a new route a
+/// requirement of an old one.
+#[test]
+fn an_archive_without_the_inventory_routes_still_serves_the_whole_page() {
+    let base = spawn_archive_without_inventory(device_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let dashboard = Dashboard::start(&args(&base, &directory.path().join("qanungo")))
+        .expect("the first fold survives an archive with no inventory route");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let payload = payload_of(address);
+    assert_eq!(payload["fleet"]["archive"]["available"], false);
+    assert_eq!(
+        payload["fleet"]["archive"]["reason"],
+        "archive totals: not available on this patwari",
+    );
+    // No totals, and no ghost of them either.
+    assert!(payload["fleet"]["archive"]["sessions"].is_null());
+    assert!(payload["fleet"]["archive"]["clients"].is_null());
+
+    // Everything else is untouched: the panel's other four views are folds, not requests.
+    assert!(payload["sessions"]["folded"].as_u64().expect("a count") > 0);
+    assert_eq!(payload["lanes"].as_array().expect("the lanes").len(), 5);
+    assert!(!payload["fleet"]["devices"].as_array().unwrap().is_empty());
+    assert!(
+        !payload["fleet"]["landing"]["days"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(payload["fleet"]["mirror"]["files"].as_u64().unwrap() > 0);
+    let (head, body) = request(address, "/");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(body.contains(r#"id="fleet-heading""#));
+}
+
+/// The invariant every request path on this server holds, restated over the section that is the
+/// most obviously about the archive: **a browser cannot make this process talk to Patwari.**
+///
+/// The panel's archive totals are read once per *refresh*, beside the folds, and served from the
+/// same published payload as everything else. A page load, a scope change, and a re-fetch of the
+/// data route must all cost the archive nothing — the counter is every request of any kind, so a
+/// section that reached for fresh totals when a reader arrived would fail here.
+#[test]
+fn the_fleet_panel_induces_no_archive_traffic_when_a_browser_asks() {
+    let (base, requests) = spawn_counted_archive(device_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let dashboard =
+        Dashboard::start(&args(&base, &directory.path().join("qanungo"))).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let refreshed = requests.load(Ordering::Relaxed);
+    assert!(refreshed > 0, "the refresh mirrored the archive");
+    // The inventory is part of that refresh, not extra to it — and it was read, which is what makes
+    // the assertion below a statement about serving rather than about a route nobody called.
+    assert_eq!(payload_of(address)["fleet"]["archive"]["available"], true);
+
+    for target in ["/", "/api/data", "/", "/api/data"] {
+        let (head, _body) = request(address, target);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{target}: {head}");
+    }
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        refreshed,
+        "serving the fleet panel reached for the archive",
+    );
+}
+
+/// The redaction line, over the one section whose whole content is other people's machine names.
+///
+/// It is asserted twice over, because the two failures look different. **Nothing planted in a
+/// transcript or a summary may appear anywhere in this section** — not a credential, not a prefix
+/// of one, and not the prose around it. And **no string the standup section renders may appear
+/// here either**: a title or a goal is somebody's own words, and a fleet panel that had picked one
+/// up would have crossed the line without a secret being involved at all.
+#[test]
+fn the_fleet_section_carries_no_planted_secret_and_no_summary_prose() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let payload = payload_of(address);
+    let fleet = serde_json::to_string(&payload["fleet"]).expect("the section serializes");
+
+    for planted in PLANTED_IN_A_SUMMARY {
+        assert!(
+            !fleet.contains(planted),
+            "{planted} reached the fleet section"
+        );
+    }
+    for prefix in ["ghp_CANARY", "sk-ant-api03-CANARY", "AKIACANARY", "CANARY"] {
+        assert!(
+            !fleet.contains(prefix),
+            "{prefix} reached the fleet section"
+        );
+    }
+
+    // Every string the narrative renders, taken from the served payload itself rather than from a
+    // list a fixture change could leave stale.
+    let mut prose = Vec::new();
+    collect_prose(&payload["standup"], &mut prose);
+    assert!(
+        prose.len() > 5,
+        "the fixture narrates too little to prove anything"
+    );
+    for line in &prose {
+        assert!(
+            !fleet.contains(line.as_str()),
+            "the fleet section carries summary prose: {line}",
+        );
+    }
+
+    // And the section is made of what it claims to be made of: no key anywhere under it holds a
+    // string long enough to be prose that is not a label, a timestamp, a path this process itself
+    // wrote, or a rendered size.
+    assert!(
+        !payload["fleet"]["devices"].as_array().unwrap().is_empty(),
+        "the walk needs rows to walk",
+    );
+}
+
+/// Every free-text string the standup section renders — titles, goals, and the narrative lines
+/// under them. Short ones are skipped: a one-word goal is not a claim about leakage, and a
+/// substring check on it would fire on any label that happened to contain it.
+fn collect_prose(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields {
+                if matches!(
+                    key.as_str(),
+                    "title" | "goal" | "work_completed" | "decisions" | "open_items" | "text"
+                ) {
+                    collect_strings(field, into);
+                } else {
+                    collect_prose(field, into);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_prose(item, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_strings(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) if text.len() > 12 => into.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_strings(item, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The page renders the panel from the payload's own keys and works nothing out for itself.
+#[test]
+fn the_page_renders_the_fleet_panel_and_computes_nothing() {
+    let (address, _directory) = spawn_dashboard(device_archive());
+    let (head, body) = request(address, "/");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+
+    for anchor in [
+        r#"id="fleet-heading""#,
+        r#"id="fleet-note""#,
+        r#"id="fleet-devices""#,
+        r#"id="fleet-landing-chart""#,
+        r#"id="fleet-landing-legend""#,
+        r#"id="fleet-landing-note""#,
+        r#"id="fleet-landing-table""#,
+        r#"id="fleet-gaps""#,
+        r#"id="fleet-archive""#,
+        r#"id="fleet-mirror""#,
+        "paintFleet(data, entry, column)",
+        "data.fleet",
+        "fleet.silent_after_days",
+        "device.by_harness[data.scopes.harnesses[column]]",
+    ] {
+        assert!(body.contains(anchor), "the page has no {anchor}");
+    }
+
+    // The chart is drawn into the element the document already carries, so the SVG namespace is
+    // read off a real node rather than written here as a URL.
+    assert!(
+        body.contains("const ns = chart.namespaceURI;"),
+        "the namespace is taken from the document",
+    );
+
+    // The scope interaction is the payload's, stated on the page: a harness narrows the rows'
+    // numbers, a device highlights its row, a repository leaves the panel whole.
+    assert!(
+        body.contains("A repository scope leaves this panel whole"),
+        "the note says what a repository scope does here",
+    );
+    assert!(
+        body.contains(r#"device.device === scoped ? "scoped" : null"#),
+        "the scoped row is marked from the payload's own label",
+    );
+
+    // The one flag on this panel is the server's decision, printed rather than re-derived: the
+    // page never compares a timestamp to a threshold.
+    assert!(
+        body.contains("if (!device.silent) return device.last_capture_at;"),
+        "the page reads the flag rather than computing it",
+    );
+    assert!(
+        !body.contains("Date.now()"),
+        "the page reads no clock of its own"
+    );
+
+    // Every invariant the page already held, restated over the grown file.
+    assert!(!body.contains("href"), "the page carries no links at all");
+    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert!(
+        !body.contains("innerHTML"),
+        "every value is set as text, never parsed as markup",
+    );
+    assert!(
+        !body.contains("http://") && !body.contains("https://") && !body.contains("//fonts."),
+        "the page loads nothing from anywhere",
+    );
+    assert_eq!(
+        body.matches("fetch(").count(),
+        3,
+        "the payload, an excerpt and a search, and nothing the panel adds",
+    );
+    assert!(
+        !body.contains("/api/v1/stats") && !body.contains("/api/v1/clients"),
+        "the archive's own routes are the server's to call, never the page's",
     );
 }

@@ -308,6 +308,57 @@ pub struct ListedArtifact {
     pub content_url: String,
 }
 
+/// The whole archive in integers and timestamps — `GET /api/v1/stats`.
+///
+/// The inventory route Patwari grew for exactly one reader (the fleet panel's "how much is in the
+/// archive"), and deliberately the shape it is: counts, byte sums, and instants. Nothing here is
+/// derived, interpreted, or per-object, which is what keeps a read-side client asking for it from
+/// asking the archive to become an analysis tool — see [`crate::fleet`].
+///
+/// **Every field is the archive's own statement**, kept as it was stated. The timestamps stay
+/// strings because this client never sorts, subtracts or windows them: they are printed under a
+/// heading that says where they came from, and parsing them here would be inventing a second
+/// clock to be wrong about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveStats {
+    pub schema_version: u64,
+    pub generated_at: String,
+    pub archive_instance_id: String,
+    pub sessions: u64,
+    pub snapshots: u64,
+    pub captures: u64,
+    pub artifacts: u64,
+    pub blobs: u64,
+    /// What the blobs occupy on the archive's disk — compressed.
+    pub stored_bytes: u64,
+    /// What those blobs decompress to. The pair is the compression the archive is getting, which
+    /// is why neither is served without the other.
+    pub original_bytes: u64,
+    pub clients: u64,
+    pub tombstones: u64,
+    /// `None` on an archive nothing has ever been ingested into — a real state on a fresh one.
+    pub last_ingest_at: Option<String>,
+    pub oldest_activity_at: Option<String>,
+    pub newest_activity_at: Option<String>,
+}
+
+/// One capturing client the archive has heard from — `GET /api/v1/clients`.
+///
+/// The other half of the fleet answer, and the half a *mirror* cannot give: a machine that stopped
+/// reporting has no sessions in the window, so it is invisible to every fold qanungo takes. Only
+/// the archive knows it exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveClient {
+    pub client_id: String,
+    /// The device label this client registered under, when it registered one. `None` is a real
+    /// archive state and is rendered as the same "no device recorded" bucket the device scope uses
+    /// — never as a path.
+    pub hostname: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: Option<String>,
+    pub capture_count: u64,
+}
+
 /// A synchronous Patwari read client bound to one archive server.
 #[derive(Debug, Clone)]
 pub struct ReadClient {
@@ -394,6 +445,97 @@ impl ReadClient {
                 })
             })
             .collect()
+    }
+
+    /// Reads the archive's own inventory, or `None` when this Patwari has no such route.
+    ///
+    /// # A 404 is an answer, not a failure
+    ///
+    /// `/api/v1/stats` is newer than the four routes the mirror walks, and a qanungo pointed at an
+    /// archive that predates it must keep working exactly as it did: the fleet panel renders "not
+    /// available on this patwari" and every other number on the page is unaffected. That is why the
+    /// `404` is mapped here, at the client, rather than left for each caller to recognize — a
+    /// caller that forgot would turn an old archive into a failed refresh.
+    ///
+    /// Every *other* status is still an error. "The route is not there" and "the route is there
+    /// and something went wrong" are different facts, and collapsing them would hide an archive
+    /// that had started refusing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the archive answers any non-404 error status, or
+    /// the response omits a documented field.
+    pub fn archive_stats(&self) -> Result<Option<ArchiveStats>, PatwariError> {
+        let Some(document) = self.get_json_optional(&format!("{API_BASE}/stats"))? else {
+            return Ok(None);
+        };
+        Ok(Some(ArchiveStats {
+            schema_version: required_u64(&document, "schema_version")?,
+            generated_at: required_str(&document, "generated_at")?,
+            archive_instance_id: required_str(&document, "archive_instance_id")?,
+            sessions: required_u64(&document, "sessions")?,
+            snapshots: required_u64(&document, "snapshots")?,
+            captures: required_u64(&document, "captures")?,
+            artifacts: required_u64(&document, "artifacts")?,
+            blobs: required_u64(&document, "blobs")?,
+            stored_bytes: required_u64(&document, "stored_bytes")?,
+            original_bytes: required_u64(&document, "original_bytes")?,
+            clients: required_u64(&document, "clients")?,
+            tombstones: required_u64(&document, "tombstones")?,
+            last_ingest_at: optional_str(&document, "last_ingest_at"),
+            oldest_activity_at: optional_str(&document, "oldest_activity_at"),
+            newest_activity_at: optional_str(&document, "newest_activity_at"),
+        }))
+    }
+
+    /// Lists every capturing client the archive knows, or `None` when this Patwari has no such
+    /// route — the same 404 contract [`ReadClient::archive_stats`] argues.
+    ///
+    /// Cursors are followed as far as [`MAX_LISTING_PAGES`], the bound every listing on this client
+    /// is held to. A personal archive has a handful of clients and today's server states
+    /// `next_cursor: null`; the loop is here so a server that grows one is walked rather than
+    /// silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a page cannot be fetched, the archive answers any non-404 error
+    /// status, the response omits a documented field, or the cursors never stop.
+    pub fn archive_clients(&self) -> Result<Option<Vec<ArchiveClient>>, PatwariError> {
+        let mut clients = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LISTING_PAGES {
+            let mut target = format!("{API_BASE}/clients");
+            if let Some(cursor) = &cursor {
+                target.push_str("?cursor=");
+                target.push_str(&http::encode_value(cursor));
+            }
+            let Some(page) = self.get_json_optional(&target)? else {
+                return Ok(None);
+            };
+            let items = page
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| PatwariError::Protocol("client listing missing items".to_owned()))?;
+            for item in items {
+                clients.push(ArchiveClient {
+                    client_id: required_str(item, "client_id")?,
+                    hostname: optional_str(item, "hostname"),
+                    first_seen_at: required_str(item, "first_seen_at")?,
+                    last_seen_at: optional_str(item, "last_seen_at"),
+                    capture_count: required_u64(item, "capture_count")?,
+                });
+            }
+            cursor = page
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                return Ok(Some(clients));
+            }
+        }
+        Err(PatwariError::Protocol(
+            "client listing never stopped returning cursors".to_owned(),
+        ))
     }
 
     /// Reads one snapshot's provenance and complete artifact list.
@@ -584,6 +726,17 @@ impl ReadClient {
             stored_bytes: stored.count,
             original_bytes: original.meter.count,
         })
+    }
+
+    /// [`ReadClient::get_json`], with a `404` reported as "this archive has no such route" rather
+    /// than as a failure. See [`ReadClient::archive_stats`] for why exactly one status is treated
+    /// this way and every other one is not.
+    fn get_json_optional(&self, target: &str) -> Result<Option<Value>, PatwariError> {
+        match self.get_json(target) {
+            Ok(document) => Ok(Some(document)),
+            Err(PatwariError::Status { status: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn get_json(&self, target: &str) -> Result<Value, PatwariError> {
@@ -788,6 +941,12 @@ fn required_u64(value: &Value, key: &str) -> Result<u64, PatwariError> {
         .get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| PatwariError::Protocol(format!("response item missing {key}")))
+}
+
+/// A field the contract states as "string or null". Absent and null read the same way, which is
+/// what the archive's own document says they mean.
+fn optional_str(value: &Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(ToOwned::to_owned)
 }
 
 fn nested_str(value: &Value, path: &[&str]) -> Option<String> {

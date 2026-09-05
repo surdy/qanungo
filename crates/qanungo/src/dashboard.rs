@@ -16,6 +16,10 @@
 //!   there is no string in either to filter.
 //! - The **standup** section carries prose somebody typed into a terminal — and carries it
 //!   *scrubbed*, which is a different claim from carrying none. See below.
+//! - The **fleet** section carries counts, timestamps, byte sums, device labels and harness names,
+//!   and holds that the way the first two do — by being built from folds and integer routes that
+//!   have no prose in them to reach. The argument is made where the section is built, beside the
+//!   code that makes it: [`crate::fleet`].
 //!
 //! ## The standup section, and why it is not an exception
 //!
@@ -250,6 +254,7 @@ use crate::cost::{
 };
 use crate::cost_report::PREMIUM_SESSIONS_LISTED;
 use crate::evidence::{self, EventAnchor, EvidenceIndex};
+use crate::fleet::Fleet;
 use crate::format;
 use crate::heatmap::Heatmap;
 use crate::metrics::{SessionMetrics, Totals};
@@ -345,6 +350,14 @@ pub struct Payload<'a> {
     pub coaching: &'a Folded,
     pub cost: &'a FoldedCost,
     pub standup: &'a FoldedStandup,
+    /// What only the refresh loop can know about the pipeline itself: the archive's own inventory
+    /// (or why there is none) and what this mirror is holding on this disk.
+    ///
+    /// It rides on the [`Payload`] rather than being fetched inside it for the reason the corpus
+    /// above does — it belongs to this generation — and because a section that opened a socket
+    /// during serialization could fail a refresh whose four folds had already succeeded. See
+    /// [`crate::fleet`].
+    pub fleet: &'a Fleet,
     /// The searchable corpus this refresh read. **No section of this document is built from it** —
     /// it answers `/api/ask` on request ([`AskAnswer`]) and appears here only in the provenance
     /// block, so a reader of the footer can see what the fourth lane cost. It rides on the
@@ -406,6 +419,7 @@ impl Payload<'_> {
         );
         fields.insert("timeline".to_owned(), timeline);
         fields.insert("heatmap".to_owned(), heatmap);
+        fields.insert("fleet".to_owned(), self.fleet_section());
         document
     }
 
@@ -2082,6 +2096,19 @@ impl Payload<'_> {
     }
 }
 
+/// The fleet panel, over this payload's own coaching fold and the refresh's inventory.
+///
+/// A one-line delegation in its own block, and the whole of this section's presence in this module:
+/// what it renders, which strings it scrubs, and why none of them is content is argued where it is
+/// built ([`crate::fleet`]). The *window* is the coaching one, because the devices, the calendar,
+/// and the gap counts are all statements about the sessions the coaching lane mirrored — three
+/// views of one fold rather than a fourth lane.
+impl Payload<'_> {
+    fn fleet_section(&self) -> Value {
+        crate::fleet::section(self.coaching, self.fleet, self.redactor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2205,6 +2232,7 @@ mod tests {
                     snapshots_fetched: 1,
                     bytes_transferred: 4096,
                     elapsed: Duration::from_millis(120),
+                    ..SyncStats::default()
                 },
                 fold_elapsed: Duration::from_millis(7),
                 sessions_folded: sessions.len(),
@@ -2307,6 +2335,7 @@ mod tests {
                 snapshots_fetched: 0,
                 bytes_transferred: 0,
                 elapsed: Duration::from_millis(240),
+                ..SyncStats::default()
             },
             fold_elapsed: Duration::from_millis(11),
             sessions_folded: 1,
@@ -2367,6 +2396,7 @@ mod tests {
                     snapshots_fetched: 1,
                     bytes_transferred: 2048,
                     elapsed: Duration::from_millis(45),
+                    ..SyncStats::default()
                 },
                 fold_elapsed: Duration::from_millis(2),
                 redactor: Redactor::new(),
@@ -2405,6 +2435,22 @@ mod tests {
         }
     }
 
+    /// The pipeline facts a payload needs to build its fleet section, in the state a Patwari with
+    /// no inventory route leaves them: the section still renders, and `tests/dashboard.rs` drives
+    /// the other two states over a real socket.
+    fn fleet() -> crate::fleet::Fleet {
+        crate::fleet::Fleet {
+            archive: crate::fleet::Inventory::Unsupported,
+            mirror: crate::fleet::Mirror {
+                cache_root: PathBuf::from("/tmp/qanungo"),
+                usage: crate::cache::CacheUsage {
+                    files: 3,
+                    bytes: 4096,
+                },
+            },
+        }
+    }
+
     /// The payload, from the four lanes a test chose — three folds and the search corpus, which
     /// feeds no section and appears only in the provenance block.
     fn build(coaching: Folded, cost: FoldedCost, standup: Standup, redactor: Redactor) -> Value {
@@ -2414,6 +2460,7 @@ mod tests {
             coaching: &coaching,
             cost: &cost,
             standup: &folded_standup(standup),
+            fleet: &fleet(),
             ask: &corpus(Vec::new(), 0),
             folds_elapsed: Duration::from_millis(370),
             refreshed: refreshed(),
@@ -3675,6 +3722,7 @@ mod tests {
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
+            fleet: &fleet(),
             ask: &corpus,
             folds_elapsed: Duration::from_millis(370),
             refreshed: refreshed(),
@@ -3762,6 +3810,7 @@ mod tests {
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
+            fleet: &fleet(),
             ask: &corpus(Vec::new(), 0),
             folds_elapsed: Duration::from_millis(370),
             refreshed: Refreshed {

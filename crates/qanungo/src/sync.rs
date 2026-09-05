@@ -228,6 +228,19 @@ pub struct SyncStats {
     /// index could not settle, plus one per sibling probed by a fallback. This is the number
     /// qanungo #1 exists to drive to zero on a warm run.
     pub snapshots_fetched: u64,
+    /// Sessions whose **projected** snapshot did not carry this run's artifact in a form this
+    /// build can read — the munshi #78 class, counted rather than merely survived.
+    ///
+    /// Exactly the sessions [`usable_snapshot`] had to walk siblings for, whatever that walk then
+    /// concluded. It is a *health* number and not a failure count: the mirror recovers most of
+    /// them, and the field below says how many.
+    pub projection_unusable: u64,
+    /// How many of [`SyncStats::projection_unusable`] were resolved from a sibling snapshot.
+    ///
+    /// The difference between the two is the sessions this run could read nothing for — the ones
+    /// the skip list already names a sentence each, here as one number a health panel can state
+    /// without parsing sentences.
+    pub recovered_from_sibling: u64,
     pub elapsed: Duration,
 }
 
@@ -236,6 +249,12 @@ pub struct SyncStats {
 struct Requests {
     snapshots_indexed: AtomicU64,
     snapshots_fetched: AtomicU64,
+    /// Sessions whose projected snapshot sent [`usable_snapshot`] looking at siblings, and how
+    /// many of those a sibling answered. Counted here rather than derived from the outcome
+    /// afterwards, because a *recovery* leaves no skip behind at all and is therefore invisible to
+    /// anything reading the skip list.
+    projection_unusable: AtomicU64,
+    recovered_from_sibling: AtomicU64,
 }
 
 /// The mirror's result: what can be read, and what could not be.
@@ -293,6 +312,8 @@ pub fn sync(
     });
     mirror.stats.snapshots_indexed = requests.snapshots_indexed.load(Ordering::Relaxed);
     mirror.stats.snapshots_fetched = requests.snapshots_fetched.load(Ordering::Relaxed);
+    mirror.stats.projection_unusable = requests.projection_unusable.load(Ordering::Relaxed);
+    mirror.stats.recovered_from_sibling = requests.recovered_from_sibling.load(Ordering::Relaxed);
 
     let mut outcomes = outcomes
         .into_inner()
@@ -664,6 +685,11 @@ fn usable_snapshot(
     if artifact.usable(&projected) {
         return Ok(Resolution::Usable(projected));
     }
+    // Past this line is the munshi #78 class: this session's newest snapshot cannot answer for the
+    // artifact. Counted here — the one place that knows — because a walk that *succeeds* leaves
+    // nothing behind for a later reader to count, and "how often is the projection wrong" is a
+    // different question from "what did this run fail to read".
+    requests.projection_unusable.fetch_add(1, Ordering::Relaxed);
     // Remembered across the probes so the eventual gap describes the whole session rather than
     // whichever snapshot happened to be examined last.
     let mut uninterpretable = artifact
@@ -681,6 +707,9 @@ fn usable_snapshot(
     {
         let detail = fetch_snapshot(client, cache, &sibling.snapshot_id, requests)?;
         if artifact.usable(&detail) {
+            requests
+                .recovered_from_sibling
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(Resolution::Usable(detail));
         }
         if artifact.of(&detail).is_some() {
