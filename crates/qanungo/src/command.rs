@@ -270,6 +270,123 @@ pub struct FoldedCost {
     pub instrumentation: CostInstrumentation,
 }
 
+/// Runs the coaching lane once and cuts the result into several windows (qanungo #X3).
+///
+/// What the dashboard's window trio needs, and the only honest way to get it: **one listing, one
+/// mirror, one pass over each transcript**, then one placement and one rule evaluation per window.
+/// Folding a transcript is the expensive half of a refresh, and a session inside `7d` is also
+/// inside `30d` and `90d` — three calls to [`fold_coaching`] would read the same bytes up to three
+/// times to produce numbers that are already implied by the widest read.
+///
+/// # How a window is cut out of a wider one
+///
+/// The mirror reaches over the **widest** window's pair, which is a superset of every narrower
+/// one's, and each window is then cut from the folded metrics on the same field the mirror was cut
+/// on — [`SessionMetrics::archived_at`](crate::metrics::SessionMetrics::archived_at), the archive
+/// time [`Placement`] already places by — relative to one shared `generated_at`. So every window in
+/// the returned list is cut on the same instant, which is what lets a page put three of them beside
+/// each other and have them mean the same "now".
+///
+/// A session that falls outside a narrow window is simply **not in it**. That is a different fact
+/// from the `unplaceable` gap [`Placement`] reports, which means *the archive gave a time this
+/// build could not read* — the only sessions counted as a gap here, exactly as in a standalone run,
+/// where the listing had already excluded everything older than the pair.
+///
+/// # What the instrumentation says, and why
+///
+/// Each window carries the shared mirror's [`SyncStats`](crate::sync::SyncStats) and a
+/// `fold_elapsed` that is the shared transcript pass plus that window's own rule evaluation. The
+/// transcript pass is therefore reported once *per window* rather than divided between them: it is
+/// the fold that produced that window's sessions, and splitting a shared cost into thirds would
+/// make each footer understate what the refresh actually did. Summing the three would overstate it
+/// by the same amount, which is why nothing sums them.
+///
+/// # Errors
+///
+/// Returns an error when the cache is unusable or the archive window cannot be listed. A single
+/// unreadable session is a reported gap, not a failure. An empty `windows` is an empty result.
+pub fn fold_coaching_windows(
+    archive: &ArchiveArgs,
+    windows: &[Window],
+    redactor: &Redactor,
+) -> Result<Vec<Folded>, CommandError> {
+    let Some(widest) = windows.iter().max_by_key(|window| window.delta()) else {
+        return Ok(Vec::new());
+    };
+    let prepared = Prepared::mirror(archive, widest, Artifact::Transcript, Reach::WindowPair)?;
+
+    let fold_started = Instant::now();
+    let placed = prepared.placement();
+    // One pass over every transcript the widest pair reaches. The halves are folded together
+    // because the narrower windows cut across the widest one's boundary: a session in the widest
+    // window's *comparison* half is in `90d`'s previous list and in nothing else, while a session
+    // near the widest window's opening instant is reported for `90d` and comparison for `30d`.
+    let mut skipped = prepared.mirror.skipped.clone();
+    let mut folded = Vec::with_capacity(placed.reported.len() + placed.comparison.len());
+    for session in placed.reported.iter().chain(&placed.comparison) {
+        match fold_one(&prepared.cache, session) {
+            Ok(metrics) => folded.push(metrics),
+            Err(reason) => skipped.push(Skip {
+                source_agent: session.source_agent.clone(),
+                reason,
+            }),
+        }
+    }
+    let fold_elapsed = fold_started.elapsed();
+
+    let mut cut = Vec::with_capacity(windows.len());
+    for window in windows {
+        let evaluate_started = Instant::now();
+        let opens_at = window.opens_at(prepared.generated_at);
+        let comparison_opens_at = window.comparison_opens_at(prepared.generated_at);
+        let mut sessions = Vec::new();
+        let mut previous = Vec::new();
+        for metrics in &folded {
+            match metrics.archived_at {
+                Some(at) if at >= opens_at => sessions.push(metrics.clone()),
+                Some(at) if comparison_opens_at.is_some_and(|from| at >= from) => {
+                    previous.push(metrics.clone());
+                }
+                // Older than both halves of *this* window: not this window's session, and not a
+                // gap either — it is a session of a wider window on the same page. A session with
+                // no readable archive time never reaches here at all: [`Placement`] already
+                // refused to place it, and it is counted in `unplaceable` below exactly once.
+                Some(_) | None => {}
+            }
+        }
+        let findings = rules::evaluate(&sessions);
+        let instrumentation = Instrumentation {
+            sync: prepared.mirror.stats.clone(),
+            fold_elapsed: fold_elapsed + evaluate_started.elapsed(),
+            sessions_folded: sessions.len(),
+            comparison_sessions_folded: previous.len(),
+            bytes_folded: sessions
+                .iter()
+                .chain(&previous)
+                .map(|session| session.bytes_folded)
+                .sum(),
+            rule_pack: RulePack::current(),
+            patwari_url: prepared.patwari_url.clone(),
+            cache_root: prepared.cache.root().to_path_buf(),
+        };
+        cut.push(Folded {
+            generated_at: prepared.generated_at,
+            compared: comparison_opens_at.is_some(),
+            skipped: summarize(
+                &skipped,
+                placed.unplaceable,
+                redactor,
+                &mut RedactionReport::default(),
+            ),
+            sessions,
+            previous,
+            findings,
+            instrumentation,
+        });
+    }
+    Ok(cut)
+}
+
 /// Runs the cost lane's `sync → fold → price` over the window pair.
 ///
 /// The same mirror and the same window pair the coaching lane uses, a different fold:

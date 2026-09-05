@@ -83,6 +83,24 @@ pub const DEFAULT_COST_WINDOW: &str = "12w";
 /// tenth line is the tenth-*best* match and not merely the tenth one the fold happened to read.
 pub const DEFAULT_ASK_LIMIT: usize = 10;
 
+/// The windows `qanungo dashboard` pre-folds, shortest first.
+///
+/// **A fixed trio, not a grammar.** Every one of these is folded for every scope on every refresh
+/// and shipped inside one payload, because decision 11 puts the drill-down on the served document
+/// rather than behind a query string: a window a reader picks must already be in their hands, or
+/// picking it becomes a fold behind a request an unauthenticated peer controls. That is what makes
+/// the set closed — a fourth spelling is a fourth fold on every refresh and a fourth copy of the
+/// largest section on the wire, and neither is bought by a reader typing `14d`.
+///
+/// A week, a month, and a quarter: the three spans a practice question is actually asked over.
+/// `--last` selects which of them the page opens on and nothing else; the other two are already
+/// there.
+pub const DASHBOARD_WINDOWS: [&str; 3] = ["7d", "30d", "90d"];
+
+/// Which of [`DASHBOARD_WINDOWS`] the dashboard opens on when nobody says otherwise. The same
+/// month `qanungo report` scores, so the page and the terminal answer the same question.
+pub const DEFAULT_DASHBOARD_WINDOW: &str = "30d";
+
 /// Where `qanungo dashboard` listens when nobody says otherwise.
 ///
 /// **Loopback**, because a surface with no authentication has to be opt-in to being reachable at
@@ -522,9 +540,19 @@ pub struct FlowsArgs {
 /// two would be the page inventing an intent.
 #[derive(Debug, Args)]
 pub struct DashboardArgs {
-    /// How far back to score, as `<count><unit>` with unit `h`, `d`, or `w`. The comparison window
-    /// the trend arrows are drawn against is the equal-length one before it, as in `report`.
-    #[arg(long = "last", default_value = "30d", value_parser = parse_window)]
+    /// Which of the pre-folded windows the page opens on: `7d`, `30d`, or `90d`. The comparison
+    /// window the trend arrows are drawn against is the equal-length one before it, as in `report`.
+    ///
+    /// **Not a free window.** All three of [`DASHBOARD_WINDOWS`] are folded for every scope on
+    /// every refresh and shipped in one payload, so this flag chooses which one the page opens on
+    /// and the reader's own selector chooses the rest. A spelling outside the trio is refused
+    /// rather than quietly folded, because folding it would mean the payload carried a window the
+    /// selector cannot get back to.
+    #[arg(
+        long = "last",
+        default_value = DEFAULT_DASHBOARD_WINDOW,
+        value_parser = parse_dashboard_window
+    )]
     pub last: Window,
 
     /// How far back the cost section prices, as `<count><unit>` with unit `h`, `d`, or `w`.
@@ -554,6 +582,21 @@ pub struct DashboardArgs {
 
     #[command(flatten)]
     pub redaction: RedactionArgs,
+}
+
+impl DashboardArgs {
+    /// Every window this dashboard pre-folds, shortest first — [`DASHBOARD_WINDOWS`] parsed.
+    ///
+    /// Built here rather than at the call site so the set the refresh folds and the set
+    /// [`parse_dashboard_window`] accepts are the same list read twice, and a window the page
+    /// could select but no refresh folded is not a state this crate can reach.
+    #[must_use]
+    pub fn window_trio(&self) -> Vec<Window> {
+        DASHBOARD_WINDOWS
+            .iter()
+            .map(|spelling| parse_window(spelling).expect("the trio is a valid window spelling"))
+            .collect()
+    }
 }
 
 /// A background refresh interval, kept in the spelling the operator typed so the provenance footer
@@ -715,6 +758,26 @@ fn parse_window(value: &str) -> Result<Window, String> {
         text: value.to_owned(),
         delta,
     })
+}
+
+/// Parses one of [`DASHBOARD_WINDOWS`] and refuses everything else.
+///
+/// A *narrower* parser than [`parse_window`] rather than a check after it, so that a refused
+/// spelling never becomes a [`Window`] at all. The refusal names the three and says why there are
+/// three, because "14d is not a window" would be a lie — it is a perfectly good window everywhere
+/// else in this tool, and the reason it is not one here is that this surface ships every window it
+/// offers.
+fn parse_dashboard_window(value: &str) -> Result<Window, String> {
+    let window = parse_window(value)?;
+    if !DASHBOARD_WINDOWS.contains(&value) {
+        return Err(format!(
+            "`{value}` is not one of the dashboard's pre-folded windows; use {} — every \
+             scope is folded for each of them on every refresh and shipped in one payload, so a \
+             fourth window would be a fourth fold and a fourth copy of the page on the wire",
+            DASHBOARD_WINDOWS.join(", "),
+        ));
+    }
+    Ok(window)
 }
 
 #[cfg(test)]
@@ -1614,6 +1677,91 @@ mod tests {
     /// The two new flags share `--last`'s grammar exactly: the same units accepted, the same units
     /// refused, and the same refusal of a window that covers nothing. A second grammar would be a
     /// second definition of what `12w` means on one command line.
+    /// `--last` on the dashboard is a *selection out of a fixed trio*, not a window grammar: every
+    /// one of the three is folded for every scope on every refresh and shipped in one payload, so
+    /// a fourth spelling would be a window the page could show and its own selector could never
+    /// get back to.
+    ///
+    /// The refusal has to be a refusal and not a clamp. Somebody who typed `--last 14d` has a
+    /// belief about what the page will score, and silently rounding it to a month would be the
+    /// page answering a different question under the number they asked for.
+    #[test]
+    fn the_dashboards_last_is_one_of_the_pre_folded_trio_and_nothing_else() {
+        let last = |spelling: &str| {
+            Cli::try_parse_from([
+                "qanungo",
+                "dashboard",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--last",
+                spelling,
+            ])
+            .map(|cli| {
+                let Command::Dashboard(args) = cli.command else {
+                    panic!("`dashboard` parses as the dashboard command");
+                };
+                args.last.to_string()
+            })
+        };
+
+        for spelling in DASHBOARD_WINDOWS {
+            assert_eq!(
+                last(spelling).ok().as_deref(),
+                Some(spelling),
+                "{spelling} is one of the trio",
+            );
+        }
+
+        // Perfectly good windows everywhere else in this tool, and not windows here. The message
+        // says which three there are, so a refused run reads as a menu rather than as a syntax
+        // error about a spelling that has no syntax problem.
+        for spelling in ["14d", "1w", "4w", "720h", "3d", "12w", "007d", "31d"] {
+            let refused = last(spelling).expect_err(&format!("{spelling} is not in the trio"));
+            let message = refused.to_string();
+            assert!(
+                message.contains("pre-folded windows") && message.contains("7d, 30d, 90d"),
+                "{spelling}: {message}",
+            );
+        }
+
+        // A spelling the *window grammar* refuses is still refused by the grammar, and says so:
+        // this parser narrows `parse_window`, it does not replace it, so "D is not a window unit"
+        // stays the answer to a bad unit rather than being flattened into the menu above.
+        for spelling in ["30D", "", "d", "30", "0d", "30days"] {
+            let message = last(spelling)
+                .expect_err(&format!("{spelling} is not a window"))
+                .to_string();
+            assert!(
+                !message.contains("pre-folded windows"),
+                "{spelling}: {message}",
+            );
+        }
+
+        // And the set the refusal names is the set the refresh folds, read from one list.
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
+        else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        assert_eq!(args.last.to_string(), DEFAULT_DASHBOARD_WINDOW);
+        assert_eq!(
+            args.window_trio()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            DASHBOARD_WINDOWS,
+        );
+        assert!(
+            args.window_trio().contains(&args.last),
+            "the window the page opens on is one the refresh folds",
+        );
+    }
+
     #[test]
     fn the_extra_window_flags_share_the_window_grammar() {
         let windows = |flags: &[&str]| {
@@ -1647,9 +1795,11 @@ mod tests {
         assert_eq!(cost.to_string(), DEFAULT_COST_WINDOW);
 
         // All three at once, each keeping the spelling it was typed in so provenance can echo it.
+        // `--last` is the one of the three that is *not* a free window: the two extra flags share
+        // the window grammar, and it shares only the trio.
         let (last, cost, standup) =
-            windows(&["--last", "14d", "--cost-last", "2w", "--standup-last", "3d"]);
-        assert_eq!(last.to_string(), "14d");
+            windows(&["--last", "7d", "--cost-last", "2w", "--standup-last", "3d"]);
+        assert_eq!(last.to_string(), "7d");
         assert_eq!(cost.to_string(), "2w");
         assert_eq!(standup.to_string(), "3d");
 

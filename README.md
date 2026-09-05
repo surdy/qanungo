@@ -65,10 +65,20 @@ cargo run -- report --last 30d --json | jq '.data.lanes'   # the same fold, for 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
 minutes or months; `12w` is the honest spelling of a quarter, and is the cost lane's default. `ask`
 is the one lane with **no** default window — a query with no `--last` searches the whole archive,
-because "have I ever done this" is a question about all of it. All three of the dashboard's windows
-share that grammar — `--last` (default `30d`), `--cost-last` (default `12w`), `--standup-last`
-(default `7d`), each defaulting to what its own command defaults to — and they move independently,
-because narrowing the coaching window says nothing about what the bill should cover. The dashboard's
+because "have I ever done this" is a question about all of it. The dashboard's cost and standup
+windows share that grammar — `--cost-last` (default `12w`) and `--standup-last` (default `7d`), each
+defaulting to what its own command defaults to — and they move independently, because narrowing the
+coaching window says nothing about what the bill should cover.
+
+The dashboard's `--last` is the exception, and it is a **selection rather than a window**: the page
+pre-folds a fixed trio — `7d`, `30d`, `90d` — for every scope on every refresh and ships all three
+in one payload, so `--last` chooses which of them the page *opens* on (default `30d`) and the
+reader's own Window control chooses the rest without a fetch. A spelling outside the trio is refused
+with a message naming the three, not clamped to the nearest: a fourth window would be a fourth fold
+on every refresh and a fourth copy of the page on the wire, and somebody who typed `--last 14d` has
+a belief about what the page will score that rounding it would quietly break. Everywhere else in the
+tool — `report`, `cost`, `standup`, `ask`, `doctor`, `flows` — `--last` is the free window grammar it
+has always been. The dashboard's
 `--refresh` is a *disjoint* grammar — `s`, `m`, `h` — so neither parser accepts the other's units,
 and an interval faster than a minute is refused rather than clamped: a warm three-lane refresh
 measures about **13 s** against the production archive (the snapshot index cut it from ~45 s), and
@@ -135,11 +145,12 @@ Every rule, every threshold it fires at, the lanes those rules score into, the s
 ## The dashboard
 
 A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring
-munshi-dashboard's read-only, contract-consuming posture. The page reads, in order: the **scope
-control**, the **ask box**, the **five lanes**, the **timeline**, the **habits heatmap**, the
+munshi-dashboard's read-only, contract-consuming posture. The page reads, in order: the **scope and
+window controls**, the **ask box**, the **five lanes**, the **timeline**, the **habits heatmap**, the
 **findings**, the **cost** breakdown, and the **standup** narrative, over a provenance footer.
 Verbatim evidence is **redacted on the way to the browser** (toggleable, default on) and served by
-qanungo itself.
+qanungo itself. A second page sits behind it at **`/rules`**: the generated catalogue, served as
+HTML by the same process, which every rule id on the dashboard links straight into.
 
 > The original plan had every finding, chart point, and session row deep-link into `session-recall` → the verified transcript in Patwari. The 2026-08-24 grilling on [#5](https://github.com/surdy/qanungo/issues/5) **retracted that**: Patwari serves raw blobs and never redacts, so such a link does not hand a browser a redacted transcript — it hands any tailnet device the whole unredacted one. Raw Patwari URLs therefore never appear in dashboard HTML; anything verbatim is cut from the local cache, redacted, and served by qanungo. The recall funnel stays a CLI/harness affordance, where your own shell already has raw access.
 
@@ -339,6 +350,26 @@ is cut on and therefore the only one on which the bars add up to the session cou
 not the transcript's own clock and it is not local time. The chart narrows with the scope control,
 carries a legend and the table of its own numbers, and the whole section on the wire is integers and
 ISO dates with no string in it at all.
+
+It also carries a **window control** beside the scope selects: a fixed trio of `7d`, `30d` and
+`90d`, each folded for *every* scope before the document is published, so changing the span re-reads
+bytes the browser already holds — the same refusal the scope control rests on, applied to a second
+axis. `--last` chooses which of the three the page opens on and nothing else; the bill keeps
+`--cost-last` and the narrative `--standup-last`, and neither moves with this control, which the
+note under the selects says out loud. The window changes the scores, the findings, the timeline, the
+habits grid *and the scope lists themselves* — a repository with no session in the last week is not
+an option there — because every window × scope cell is a cell some refresh already folded.
+
+And it carries **links to what the numbers mean**. Every finding's rule id is a link to that rule's
+section of the generated catalogue at `/rules#<rule key>`; every lane tile carries one line under
+its score saying what moves it — "reads: retry-loop fire rate, tool error rate" — rendered
+server-side from the same signal list the rule-pack digest hashes, with each half linked to the
+section that defines it; and the provenance footer's rule-pack stamp links to the catalogue as a
+whole. The `/rules` page is served by this same process, reads **no archive** (no request, no cached
+blob, not even the payload), and carries no transcript byte — it describes the build, so its bytes
+are fixed the moment the binary is compiled. These are the *only* links on the dashboard: there is
+still no link into Patwari, which serves unredacted blobs, and the page assigns an `href` in exactly
+one place, which a test pins.
 
 Beside it now sits a **heatmap** — a "Habits" grid of hour-of-day against day-of-week — which waited
 on exactly what the timeline did not need: each session's own local offset, since "worked at 1 a.m."

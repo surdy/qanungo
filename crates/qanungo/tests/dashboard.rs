@@ -510,6 +510,33 @@ fn request_with(address: SocketAddr, method: &str, target: &str) -> (String, Str
     (head.to_owned(), body.to_owned())
 }
 
+/// **The one destination the dashboard page may link to**, restated wherever the page is fetched.
+///
+/// The 2026-08-24 grilling took the Patwari deep links off this page, and that refusal is
+/// unchanged: Patwari serves unredacted blobs, so a link from an unauthenticated surface into the
+/// archive would hand every tailnet device a whole transcript. What the affordances slice added is
+/// a link to `/rules` — this same server's rule catalogue, rendered from the build's own constants,
+/// which reads no archive and carries no transcript byte.
+///
+/// So the invariant is no longer "no links"; it is **one link shape, built in one place**. The
+/// page assigns an `href` exactly once, in `ruleLink`, and that assignment is a same-origin
+/// `/rules#<key>`.
+fn assert_no_link_but_the_catalogue(body: &str) {
+    assert_eq!(
+        body.matches(".href =").count(),
+        1,
+        "one assignment to an href in the whole page, and it is `ruleLink`'s",
+    );
+    assert!(
+        body.contains(r#"node.href = anchor ? "/rules#" + encodeURIComponent(anchor) : "/rules";"#),
+        "the page's only link is the catalogue's",
+    );
+    assert!(
+        !body.contains("http://") && !body.contains("https://") && !body.contains("//fonts."),
+        "and it reaches nothing off this server",
+    );
+}
+
 /// The transcript fixtures, as the archive would hold them.
 fn transcript(relative: &str) -> Vec<u8> {
     std::fs::read(fixture(relative)).expect("fixture is readable")
@@ -674,8 +701,9 @@ fn the_page_route_serves_the_embedded_page() {
         assert!(head.contains("Connection: close"), "{head}");
         assert!(body.starts_with("<!doctype html>"), "{target}");
         assert!(body.contains("Practice scores"), "{target}");
-        // The page is the whole deployment: no asset route exists to load anything from.
-        assert!(!body.contains("href"), "the page links to nothing");
+        // The page is the whole deployment: no asset route exists to load anything from, and
+        // the only destination it links to is this same server's rule catalogue.
+        assert_no_link_but_the_catalogue(&body);
     }
 }
 
@@ -936,12 +964,28 @@ fn the_event_stream_announces_the_current_refresh() {
         payload["provenance"]["refreshed_at"],
         notice["refreshed_at"]
     );
+
+    // And the payload that generation names carries the whole window trio, which is what makes a
+    // refresh a complete replacement: a page that had `90d` selected when the numbers moved reads
+    // its own window out of the new document rather than fetching a second time for it.
+    assert_eq!(
+        payload["windows"]["options"],
+        serde_json::json!(["7d", "30d", "90d"]),
+    );
+    let views = payload["windows"]["views"]
+        .as_object()
+        .expect("a view per window");
+    assert_eq!(views.len(), 3, "one generation, every window: {views:?}");
+    assert!(
+        views["7d"]["lanes"].is_array() && views["90d"]["lanes"].is_array(),
+        "the unselected windows arrive whole",
+    );
 }
 
-/// Five routes, read-only, and nothing else — including nothing that looks like a path into the
+/// Six routes, read-only, and nothing else — including nothing that looks like a path into the
 /// archive or the filesystem.
 #[test]
-fn nothing_but_the_five_routes_answers() {
+fn nothing_but_the_six_routes_answers() {
     let (address, _directory) = spawn_dashboard(canary_archive());
     for target in [
         "/api",
@@ -949,6 +993,11 @@ fn nothing_but_the_five_routes_answers() {
         "/favicon.ico",
         "/../../etc/passwd",
         "/api/v1/sessions",
+        // The catalogue is one exact path. There is no filesystem behind this server, so there is
+        // no directory under it and no `.md` alternative beside it to offer.
+        "/rules/",
+        "/rules.md",
+        "/RULES.md",
     ] {
         let (head, _body) = request(address, target);
         assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{target}");
@@ -2103,8 +2152,7 @@ fn the_page_renders_the_two_new_sections_under_the_same_invariants() {
     );
 
     // Every invariant the V1 page was pinned by, restated over the grown file.
-    assert!(!body.contains("href"), "the page carries no links at all");
-    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert_no_link_but_the_catalogue(&body);
     assert!(
         !body.contains("innerHTML"),
         "every value is set as text, never parsed as markup",
@@ -2852,16 +2900,18 @@ fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
         );
     }
 
-    // Remembering the scope is a convenience, so every access to storage is guarded and a page with
-    // nothing stored renders the whole window.
+    // Remembering the scope — and now the window — is a convenience, so every access to storage is
+    // guarded and a page with nothing stored renders the whole window over the launched span.
     assert_eq!(
         body.matches("localStorage").count(),
-        2,
-        "one read and one write, and nowhere else",
+        4,
+        "one read and one write per remembered axis, and nowhere else",
     );
     for guarded in [
         "window.localStorage.getItem(SCOPE_KEY)",
         "window.localStorage.setItem(SCOPE_KEY",
+        "window.localStorage.getItem(WINDOW_KEY)",
+        "window.localStorage.setItem(WINDOW_KEY",
     ] {
         let at = body.find(guarded).expect("the access is there");
         let before = &body[..at];
@@ -2876,8 +2926,7 @@ fn the_page_carries_one_scope_control_and_scores_nothing_itself() {
     );
 
     // And every invariant the page already held, restated over the grown file.
-    assert!(!body.contains("href"), "the page carries no links at all");
-    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert_no_link_but_the_catalogue(&body);
     assert!(
         !body.contains("innerHTML"),
         "every value is set as text, never parsed as markup",
@@ -3547,8 +3596,7 @@ fn the_page_draws_one_inline_svg_chart_and_computes_nothing() {
     );
 
     // Every invariant the page already held, restated over the grown file.
-    assert!(!body.contains("href"), "the page carries no links at all");
-    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert_no_link_but_the_catalogue(&body);
     assert!(
         !body.contains("innerHTML"),
         "every value is set as text, never parsed as markup",
@@ -4450,8 +4498,7 @@ fn the_page_carries_one_ask_box_that_ranks_nothing_itself() {
     );
 
     // Every invariant the page already held, restated over the grown file.
-    assert!(!body.contains("href"), "the page carries no links at all");
-    assert!(!body.contains("<a "), "the page carries no anchors");
+    assert_no_link_but_the_catalogue(&body);
     assert!(
         !body.contains("innerHTML"),
         "every value is set as text, never parsed as markup",
@@ -4465,4 +4512,528 @@ fn the_page_carries_one_ask_box_that_ranks_nothing_itself() {
         3,
         "the payload, an excerpt and a search, and nothing the ask box adds",
     );
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * The beginner affordances (qanungo #X3): the rule catalogue on the surface that cites it, a line
+ * under every lane tile saying what moves it, and a window the reader can change without a fetch.
+ * ---------------------------------------------------------------------------------------------- */
+
+/// The catalogue route: a whole page, from this build's own constants, over HTTP.
+///
+/// Three properties, and the third is the load-bearing one. It **serves a page** — the same
+/// document `qanungo rules` prints and `RULES.md` is pinned to. It carries **an anchor for every
+/// rule and every lane**, because the dashboard writes `/rules#<key>` beside every finding and
+/// under every lane tile, and a link that lands nowhere is worse than no link. And it **reads
+/// nothing**: no archive request, no cached blob, no payload — which is why a browser hammering it
+/// cannot make this process talk to Patwari.
+#[test]
+fn the_rules_route_serves_the_catalogue_and_never_reaches_the_archive() {
+    let (base, requests) = spawn_counted_archive(three_lane_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args(&base, &directory.path().join("qanungo"));
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let mirrored = requests.load(Ordering::Relaxed);
+    assert!(mirrored > 0, "the refresh mirrored the archive");
+
+    let (head, body) = request(address, "/rules");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(
+        head.contains("Content-Type: text/html; charset=utf-8"),
+        "{head}"
+    );
+    assert!(head.contains("Connection: close"), "{head}");
+    assert!(body.starts_with("<!doctype html>"), "a whole page");
+    assert!(body.contains("What qanungo looks for"), "the catalogue");
+
+    // Every anchor the dashboard page will link at, present on the page it links to.
+    for rule in qanungo::rules::RuleId::ALL {
+        assert!(
+            body.contains(&format!("id=\"{}\"", rule.key())),
+            "no anchor for rule {}",
+            rule.key(),
+        );
+    }
+    for lane in Lane::ALL {
+        assert!(
+            body.contains(&format!("id=\"lane-{}\"", lane.key())),
+            "no anchor for lane {}",
+            lane.key(),
+        );
+    }
+
+    // It reads no archive — the invariant `/api/ask` and `/api/evidence` hold, held here for free
+    // because the catalogue describes the build rather than a window of history. A query string on
+    // it decides nothing either, like every route's but the search's.
+    // A fragment never leaves the browser, so the only two targets a reader can send are these.
+    for target in ["/rules", "/rules?redact=off"] {
+        let (head, _body) = request(address, target);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{target}: {head}");
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            mirrored,
+            "{target} reached for the archive",
+        );
+    }
+
+    // And nothing on the catalogue links back into the archive, whose blobs are unredacted.
+    assert!(!body.contains("/api/v1/artifacts"), "no archive link");
+    assert!(!body.contains(&base), "not even the archive's own URL");
+}
+
+/// One line under every lane tile saying what moves the score, and a link from each half of it to
+/// the section of the catalogue that defines it.
+///
+/// The text is the **server's**, rendered from `Lane::components()` — the same signal list the
+/// rule-pack digest hashes and the score itself was computed from. That is the whole point: a page
+/// that composed its own sentence would be a second statement of the lane→signal mapping, and the
+/// first one to go stale when a lane gained a component.
+#[test]
+fn every_lane_says_what_moves_it_and_links_each_half_to_the_catalogue() {
+    let (address, _directory) = spawn_dashboard(three_lane_archive());
+    let payload = payload_of(address);
+    let (_head, catalogue) = request(address, "/rules");
+
+    let lanes = payload["lanes"].as_array().expect("five lanes");
+    assert_eq!(lanes.len(), Lane::ALL.len());
+    for (served, lane) in lanes.iter().zip(Lane::ALL) {
+        assert_eq!(served["key"], lane.key());
+        let reads = served["reads"].as_array().expect("a hint per lane");
+        let components = lane.components();
+        assert_eq!(
+            reads.len(),
+            components.len(),
+            "{} reads {} things and serves {}",
+            lane.key(),
+            components.len(),
+            reads.len(),
+        );
+        for (reading, component) in reads.iter().zip(&components) {
+            // The clause is the fold's own wording, not a re-derivation.
+            assert_eq!(reading["text"], component.reads, "{}", lane.key());
+            assert_eq!(reading["anchor"], component.anchor, "{}", lane.key());
+            // And it resolves on the page it points at.
+            let anchor = reading["anchor"].as_str().expect("an anchor");
+            assert!(
+                catalogue.contains(&format!("id=\"{anchor}\"")),
+                "{}'s hint points at #{anchor}, which the catalogue does not have",
+                lane.key(),
+            );
+        }
+    }
+
+    // A finding's rule key is the other link, and it resolves the same way.
+    let findings = payload["findings"].as_array().expect("findings");
+    assert!(!findings.is_empty(), "the fixture fires something");
+    for finding in findings {
+        let rule = finding["rule"].as_str().expect("a rule key");
+        assert!(
+            catalogue.contains(&format!("id=\"{rule}\"")),
+            "a finding cites {rule}, which the catalogue does not anchor",
+        );
+    }
+
+    // The page builds both links from those keys, in one place, and reaches nowhere else.
+    let (_head, page) = request(address, "/");
+    assert!(page.contains("ruleLink(reading.text, reading.anchor)"));
+    assert!(page.contains("ruleLink(finding.rule, finding.rule)"));
+    assert!(page.contains(r#"ruleLink(provenance.rule_pack, "")"#));
+    assert_no_link_but_the_catalogue(&page);
+}
+
+/// A window spanning all three of the trio and both comparison halves, so `7d`, `30d` and `90d`
+/// each hold a different set of sessions and a different set of repositories.
+///
+/// The days are chosen away from every boundary the trio cuts on — 7, 14, 30, 60, 90 and 180 days
+/// back — so a fold taken a few milliseconds after another still selects the same sessions and the
+/// reconciliation below is a comparison of two folds rather than a race against the clock.
+fn windowed_archive() -> Vec<ArchivedSession> {
+    let clean = transcript("rules/marathon-session.jsonl");
+    let copilot = transcript("munshi/copilot-1.0.76-compaction.jsonl");
+    // An *event-anchored* rule in the half of the quarter the month cannot see, so there is an
+    // expandable anchor a reader can only reach by selecting `90d` — see
+    // `an_anchor_from_an_unselected_window_still_expands`.
+    let failing = transcript("rules/high-tool-error-rate.jsonl");
+    vec![
+        // Inside 7d, and therefore inside all three.
+        ArchivedSession::new(1, "claude-code", &clean, 0)
+            .completed_on(2, 9, 0, 0)
+            .in_repository("surdy/qanungo"),
+        ArchivedSession::new(2, "copilot-cli", &copilot, 0)
+            .completed_on(3, 11, 0, 0)
+            .in_repository("surdy/qanungo"),
+        // Inside 30d and 90d; in 7d it is older than the comparison half too, so 7d has never
+        // heard of it.
+        ArchivedSession::new(3, "claude-code", &clean, 0)
+            .completed_on(20, 9, 0, 0)
+            .in_repository("surdy/munshi"),
+        // Inside 90d, and 30d's *comparison* half — the window before the reported one.
+        ArchivedSession::new(4, "claude-code", &failing, 0)
+            .completed_on(45, 9, 0, 0)
+            .in_repository("surdy/patwari"),
+        // Inside 90d's comparison half and nothing else's anything.
+        ArchivedSession::new(5, "claude-code", &clean, 0)
+            .completed_on(120, 9, 0, 0)
+            .in_repository("surdy/chitrakar"),
+    ]
+}
+
+/// **Decision 11 on a second axis.** Every window in the trio is folded for every scope before the
+/// document is published, so a reader changing the window re-reads bytes they already hold.
+///
+/// The shape has one thing in it worth reading twice: `views` is total over the trio, and the
+/// selected window's entry is `null` because that view *is* the document's top level. Shipping it
+/// twice would put the largest section of the payload on the wire to say what it already says.
+#[test]
+fn the_window_trio_is_pre_folded_for_every_scope() {
+    let (address, _directory) = spawn_dashboard(windowed_archive());
+    let payload = payload_of(address);
+    let windows = &payload["windows"];
+
+    assert_eq!(
+        windows["options"],
+        serde_json::json!(["7d", "30d", "90d"]),
+        "the trio, shortest first",
+    );
+    assert_eq!(windows["selected"], "30d", "`--last 30d` is the default");
+    assert_eq!(
+        payload["window"]["last"], "30d",
+        "and the document's top level is that window",
+    );
+
+    let views = windows["views"].as_object().expect("a view per window");
+    assert_eq!(views.len(), 3, "the map is total over the trio: {views:?}");
+    assert_eq!(
+        views["30d"],
+        serde_json::Value::Null,
+        "the selected window is the top level and is not shipped twice",
+    );
+
+    // Every other window carries a whole view: the same seven keys the top level carries for a
+    // window, so switching the control changes which object the page reads and never how.
+    for last in ["7d", "90d"] {
+        let view = &views[last];
+        for key in [
+            "window", "sessions", "lanes", "findings", "scopes", "timeline", "heatmap",
+        ] {
+            assert!(!view[key].is_null(), "{last} has no {key}: {view}");
+        }
+        assert_eq!(view["window"]["last"], last);
+        assert_eq!(
+            view["lanes"].as_array().expect("lanes").len(),
+            usize::from(LANES),
+            "{last} keeps every lane's place",
+        );
+        // And the scopes are that window's own, folded — not the selected window's reused.
+        for axis in ["repositories", "devices"] {
+            assert!(
+                view["scopes"][axis].is_array(),
+                "{last} has no {axis} scopes",
+            );
+        }
+    }
+
+    // The windows hold different work, which is the whole reason there is a control: 7d cannot see
+    // the 20-day-old session, and 90d can see everything 30d can and more.
+    let folded = |value: &serde_json::Value| value["sessions"]["folded"].as_u64().expect("a count");
+    let week = folded(&views["7d"]);
+    let month = folded(&payload);
+    let quarter = folded(&views["90d"]);
+    assert_eq!(
+        (week, month, quarter),
+        (2, 3, 4),
+        "{week}/{month}/{quarter}"
+    );
+
+    // Every scope is folded in every window, so the two controls compose: the repositories the
+    // quarter knows about are a superset of the month's, which are a superset of the week's.
+    let repositories = |view: &serde_json::Value| {
+        view["scopes"]["repositories"]
+            .as_array()
+            .expect("a repository list")
+            .iter()
+            .map(|scope| scope["repository"].as_str().expect("a name").to_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let week = repositories(&views["7d"]);
+    let quarter = repositories(&views["90d"]);
+    assert!(week.contains("surdy/qanungo"), "{week:?}");
+    assert!(!week.contains("surdy/munshi"), "{week:?}");
+    assert!(quarter.contains("surdy/munshi"), "{quarter:?}");
+    assert!(quarter.contains("surdy/patwari"), "{quarter:?}");
+}
+
+/// The property the window control rests on, exactly as the scope control's: **every number a
+/// selection can put on screen is the standalone command's own.**
+///
+/// Each of the three views is checked against an independent `fold_coaching` over the same window —
+/// the same call `qanungo report --last <w>` makes — so a pre-fold that quietly cut a narrow window
+/// out of a wide one *wrongly* fails here rather than reaching a browser. That is the risk this
+/// slice introduced: one mirror and one pass over each transcript produce all three, and a
+/// mis-placed boundary would be invisible in every other test on this page.
+#[test]
+fn every_windows_numbers_are_the_standalone_reports_own() {
+    let base = spawn_archive(windowed_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args(&base, &directory.path().join("qanungo"));
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let payload = payload_of(address);
+    for last in ["7d", "30d", "90d"] {
+        let view = if payload["windows"]["views"][last].is_null() {
+            &payload
+        } else {
+            &payload["windows"]["views"][last]
+        };
+        let Command::Dashboard(standalone) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--last",
+            last,
+            "--patwari-url",
+            &base,
+            "--cache-dir",
+            directory.path().join("qanungo").to_str().expect("utf-8"),
+        ])
+        .command
+        else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        let folded = command::fold_coaching(
+            &standalone.archive,
+            &standalone.last,
+            &args.redaction.redactor(),
+        )
+        .expect("a second, independent fold of the same window");
+
+        assert_eq!(
+            view["sessions"]["folded"].as_u64().expect("a count") as usize,
+            folded.sessions.len(),
+            "{last}: the served count is not the fold's",
+        );
+        assert_eq!(
+            view["window"]["compared"], folded.compared,
+            "{last}: the comparison window's presence disagrees",
+        );
+        assert_eq!(
+            view["findings"].as_array().expect("findings").len(),
+            folded.findings.len(),
+            "{last}: a different set of rules fired",
+        );
+
+        // The lane scores themselves, per harness, against a scorecard folded here.
+        let now = Scorecard::fold(&folded.sessions);
+        for (served, lane) in view["lanes"]
+            .as_array()
+            .expect("lanes")
+            .iter()
+            .zip(Lane::ALL)
+        {
+            for column in served["harnesses"].as_array().expect("columns") {
+                let agent = column["source_agent"].as_str().expect("a label");
+                let Some(harness) = now.harness(agent) else {
+                    assert_eq!(column["state"], "no-sessions", "{last} {agent}");
+                    continue;
+                };
+                match harness.lane(lane).score() {
+                    Some(score) => assert_eq!(
+                        column["score"].as_u64().expect("a score"),
+                        u64::from(score),
+                        "{last} {agent} {}",
+                        lane.key(),
+                    ),
+                    None => assert!(
+                        column["score"].is_null(),
+                        "{last} {agent} {}: served a score the fold did not have",
+                        lane.key(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// `--last` on this lane is a selection out of the trio, and a spelling outside it is refused
+/// rather than folded.
+///
+/// A refusal and not a clamp: somebody who typed `--last 14d` has a belief about what the page will
+/// score, and rounding it to the nearest pre-folded window would be the page answering a different
+/// question under the number they asked for. The message names the three, so a refused run reads as
+/// a menu.
+#[test]
+fn a_window_outside_the_trio_is_refused_before_anything_is_folded() {
+    let refused = Cli::try_parse_from([
+        "qanungo",
+        "dashboard",
+        "--last",
+        "14d",
+        "--patwari-url",
+        "http://127.0.0.1:1",
+    ])
+    .expect_err("14d is not one of the pre-folded windows");
+    let message = refused.to_string();
+    assert!(message.contains("pre-folded windows"), "{message}");
+    assert!(message.contains("7d, 30d, 90d"), "{message}");
+
+    // And each of the three is accepted and opens the page on itself.
+    for last in ["7d", "30d", "90d"] {
+        let directory = tempfile::tempdir().expect("a scratch directory");
+        let base = spawn_archive(windowed_archive());
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--last",
+            last,
+            "--bind",
+            "127.0.0.1:0",
+            "--patwari-url",
+            &base,
+            "--cache-dir",
+            directory.path().join("qanungo").to_str().expect("utf-8"),
+        ])
+        .command
+        else {
+            panic!("`dashboard` parses as the dashboard command");
+        };
+        let dashboard = Dashboard::start(&args).expect("the first fold");
+        let address = dashboard.address();
+        std::thread::spawn(move || dashboard.serve());
+        let payload = payload_of(address);
+        assert_eq!(payload["windows"]["selected"], last);
+        assert_eq!(payload["window"]["last"], last);
+        assert_eq!(
+            payload["windows"]["views"][last],
+            serde_json::Value::Null,
+            "{last} is the top level, not a second copy of it",
+        );
+    }
+}
+
+/// The page's half of the window control: one `<select>`, one lookup, and **no second fetch**.
+///
+/// The counterpart of `the_page_carries_one_scope_control_and_scores_nothing_itself`. What is
+/// pinned is that changing the window is a change of which pre-folded object the page reads — never
+/// a query string, never a re-fold, and never a number this file computed.
+#[test]
+fn the_page_carries_one_window_control_and_folds_nothing_itself() {
+    let (address, _directory) = spawn_dashboard(windowed_archive());
+    let (head, body) = request(address, "/");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+
+    for anchor in [
+        r#"id="scope-window""#,
+        "data.windows.options",
+        "data.windows.selected",
+        "data.windows.views[chosenWindow]",
+        "function windowView(data)",
+        "fillWindowControl(data)",
+    ] {
+        assert!(body.contains(anchor), "the page has no {anchor}");
+    }
+
+    // The selection is held as the spelling the payload wrote, never as a position — the same rule
+    // the scope labels follow, for the same reason.
+    assert!(
+        body.contains("chosenWindow = event.target.value || null;"),
+        "the window is remembered by its own spelling",
+    );
+    // Changing it costs nothing: the same three fetches the page had before a window control
+    // existed, and no query string anywhere.
+    assert_eq!(
+        body.matches("fetch(").count(),
+        3,
+        "the payload, an excerpt and a search — a window control adds no request",
+    );
+    assert!(
+        !body.contains("?last=") && !body.contains("/api/data?"),
+        "a window is never a query string",
+    );
+    // And the scope note names the span every count above it is a statement about.
+    assert!(
+        body.contains("which the Window control chooses from the three this refresh folded"),
+        "the scope note says which window it is showing",
+    );
+}
+
+/// An evidence control on a window a reader can *select* has to work — which means the servable
+/// anchor set is the union over the trio, not the selected window's alone.
+///
+/// This is the one place the window trio widened something outside the payload, and it is the
+/// narrowest widening that keeps the route's rule true: **only what the payload named**. The
+/// payload now names three windows' findings, so all three are servable, and an anchor no view
+/// cites is still a 404. Nothing else moves — the blobs were all mirrored by the same pass that
+/// folded them, so no request here can make this process reach for the archive.
+#[test]
+fn an_anchor_from_an_unselected_window_still_expands() {
+    let (base, requests) = spawn_counted_archive(windowed_archive());
+    let directory = tempfile::tempdir().expect("a scratch directory");
+    let args = args(&base, &directory.path().join("qanungo"));
+    let dashboard = Dashboard::start(&args).expect("the first fold");
+    let address = dashboard.address();
+    std::thread::spawn(move || dashboard.serve());
+
+    let mirrored = requests.load(Ordering::Relaxed);
+    let payload = payload_of(address);
+    let quarter = &payload["windows"]["views"]["90d"];
+
+    // A session the quarter holds and the selected month does not — the 45-day-old one.
+    let month: std::collections::BTreeSet<String> = payload["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .flat_map(|finding| finding["evidence"].as_array().unwrap())
+        .map(|evidence| evidence["source_hash"].as_str().unwrap().to_owned())
+        .collect();
+    let only_in_the_quarter: Vec<(String, u64)> = quarter["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .flat_map(|finding| finding["evidence"].as_array().unwrap())
+        .filter(|evidence| !month.contains(evidence["source_hash"].as_str().unwrap()))
+        .flat_map(|evidence| {
+            let hash = evidence["source_hash"].as_str().unwrap().to_owned();
+            evidence["anchors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(move |anchor| (hash.clone(), anchor["locator"].as_u64().unwrap()))
+        })
+        .collect();
+    assert!(
+        !only_in_the_quarter.is_empty(),
+        "the fixture has a session the quarter cites and the month does not",
+    );
+
+    for (source_hash, locator) in &only_in_the_quarter {
+        let (head, body) = request(address, &format!("/api/evidence/{source_hash}/{locator}"));
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{source_hash}/{locator}: {head}",
+        );
+        let excerpt: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(excerpt["locator"], *locator);
+        // Still no fetch: the widest window's mirror already put the blob on this disk.
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            mirrored,
+            "expanding an anchor reached for the archive",
+        );
+    }
+
+    // And an anchor no window cites is still refused, which is the half that makes this a union
+    // rather than an opening.
+    let (head, _body) = request(
+        address,
+        &format!("/api/evidence/{}/1", only_in_the_quarter[0].0),
+    );
+    if !anchored_locators(&payload, &only_in_the_quarter[0].0).contains(&1)
+        && !anchored_locators(quarter, &only_in_the_quarter[0].0).contains(&1)
+    {
+        assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
+    }
 }

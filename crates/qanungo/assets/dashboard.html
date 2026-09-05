@@ -28,6 +28,7 @@
   --down: #d03b3b;
   --warn-surface: #fdf3d8;
   --warn-ink: #5c4405;
+  --link: #1a4f9c;
   /*
    * The chart's categorical slots, in fixed order. Colour follows the harness, never
    * its rank: a slot is the harness's index in the payload's one harness axis
@@ -62,6 +63,7 @@
     --down: #d03b3b;
     --warn-surface: #2e2611;
     --warn-ink: #fab219;
+    --link: #7fb2ff;
     --series-1: #3987e5;
     --series-2: #d95926;
     --series-3: #199e70;
@@ -264,6 +266,12 @@ p { margin: 0 0 0.5rem; }
 .split-name { color: var(--ink-2); white-space: nowrap; }
 .split-score { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .reason { margin: 0.4rem 0 0; font-size: 0.85rem; color: var(--ink-muted); }
+/* The lane hint: one line of what moves this score, under it. Muted, because it is a
+   definition and not a reading — the numbers stay the loudest thing on the tile. */
+.reads { margin: 0.35rem 0 0; font-size: 0.82rem; color: var(--ink-muted); }
+/* The only links on this page, and all of them to this server's own /rules. Underlined
+   rather than coloured alone, so they read as links without colour vision. */
+.rule-link { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
 
 details { margin-top: 0.5rem; }
 summary {
@@ -542,6 +550,18 @@ footer .archive { overflow-wrap: anywhere; }
       <label for="scope-harness">Harness</label>
       <select id="scope-harness"></select>
     </div>
+    <!--
+      The window. Unlike the three above it this control has fixed options, because the
+      payload carries a fixed trio: 7d / 30d / 90d, each folded for every scope before
+      this document was published. It sits in the same row because it narrows the same
+      numbers — the scores, the findings, the timeline and the habits grid — and because
+      a reader asking "how have I been doing" is choosing a span and a subject together.
+      The bill and the narrative keep their own windows and say so.
+    -->
+    <div class="scope-field">
+      <label for="scope-window">Window</label>
+      <select id="scope-window"></select>
+    </div>
     <button type="button" class="scope-reset" id="scope-reset">Whole window</button>
   </div>
   <p class="scope-note" id="scope-note"></p>
@@ -654,11 +674,17 @@ footer .archive { overflow-wrap: anywhere; }
  * of that discipline. No string in this file is ever assigned to a property that
  * would parse it as markup — the elements below are built and their text set.
  *
- * It also contains no links. Patwari serves unredacted blobs, so a deep link
- * from this page into the archive would hand every tailnet device a whole
- * transcript. The only evidence this page can expand is what the payload itself
- * named — one scrubbed event per anchor, from this server's own route — and a
- * whole session is still a hash you take to your own shell.
+ * The only links it carries go to `/rules`, this same server's rule catalogue —
+ * a page rendered from the build's own constants, which reads no archive and
+ * carries no transcript byte. There is still **no link into Patwari**, and there
+ * will not be one: Patwari serves unredacted blobs, so a deep link from this page
+ * into the archive would hand every tailnet device a whole transcript. The only
+ * evidence this page can expand is what the payload itself named — one scrubbed
+ * event per anchor, from this server's own route — and a whole session is still a
+ * hash you take to your own shell.
+ *
+ * Every href below is built by `ruleLink`, from a key the server wrote, so there
+ * is one place that decides what this page is allowed to link to.
  */
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -668,6 +694,22 @@ const el = (tag, className, text) => {
 };
 
 let generation = null;
+
+/* A link into this server's own rule catalogue. `anchor` is a key the payload wrote —
+   a rule key, or `lane-<lane key>` — and the catalogue emits an id for each, so a
+   reader who has just been told a rule fired is one tap from what that rule looks for.
+   An empty anchor is the catalogue as a whole, which is what the rule-pack stamp in the
+   footer points at: the stamp is a digest of every rule, not of one.
+
+   The whole vocabulary of what this page may link to is here: a same-origin path and at
+   most one fragment, and nothing a payload string can turn into a different destination.
+   `encodeURIComponent` is belt over braces — the keys are this build's own constants —
+   and the text is set with textContent like every other string on the page. */
+function ruleLink(text, anchor) {
+  const node = el("a", "rule-link", text);
+  node.href = anchor ? "/rules#" + encodeURIComponent(anchor) : "/rules";
+  return node;
+}
 
 /*
  * The scope. Three labels, each null for "everything" — never an index, because the
@@ -685,6 +727,50 @@ let generation = null;
 const SCOPE_KEY = "qanungo.scope";
 let current = null;
 let scope = { repository: null, device: null, harness: null };
+
+/*
+ * The window, the second axis this payload is pre-folded along. It is held as the
+ * spelling (`"7d"`) and never as an index, for the reason the scope labels are: the
+ * payload's own list is the vocabulary, and a remembered position would silently become
+ * a different span if the trio ever changed.
+ *
+ * `null` means "whichever window this dashboard was launched on", which is the payload's
+ * `windows.selected` and the document's own top level. Every one of the three was folded
+ * for every scope before this document was published, so changing this control fetches
+ * nothing and recomputes nothing — decision 11, applied to a second axis.
+ */
+const WINDOW_KEY = "qanungo.window";
+let chosenWindow = null;
+
+function readRememberedWindow() {
+  try {
+    const raw = window.localStorage.getItem(WINDOW_KEY);
+    return typeof raw === "string" && raw ? raw : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function rememberWindow() {
+  try {
+    window.localStorage.setItem(WINDOW_KEY, chosenWindow === null ? "" : chosenWindow);
+  } catch (error) {
+    /* Storage is unavailable or full. The page is already rendered correctly. */
+  }
+}
+
+/* The seven sections a coaching window owns — `window`, `sessions`, `lanes`, `findings`,
+   `scopes`, `timeline`, `heatmap` — for whichever window is selected.
+
+   `views` is total over the trio and the selected window's entry is `null`, because that
+   view IS the document's top level and shipping it twice would put the largest section of
+   the payload on the wire to say what it already says. So the fallback here is not an
+   error path: it is the ordinary case for one of the three, and the case for a remembered
+   window a newer payload no longer offers. */
+function windowView(data) {
+  if (!data.windows) return data;
+  return (chosenWindow !== null && data.windows.views[chosenWindow]) || data;
+}
 
 /* Remembering the scope is a convenience for one viewer in one browser, so every
    access is guarded and every failure is silent: a private window, cleared site data,
@@ -762,6 +848,20 @@ function laneTile(lane, column) {
   const scored = headline.state === "scored";
   tile.appendChild(el("div", "tile-value" + (scored ? "" : " unscored"), scoreText(headline)));
   if (scored) tile.appendChild(deltaNode(headline.trend));
+
+  /* What moves this lane, in one line, with each half linked to the catalogue section
+     that defines it. The clauses are the server's — `lane.reads`, rendered from the same
+     signal list the rule-pack digest hashes — so this composes no sentence and derives
+     no mapping: it joins strings it was handed and hangs a link on each. */
+  if (lane.reads && lane.reads.length) {
+    const hint = el("div", "reads");
+    hint.appendChild(el("span", null, "reads: "));
+    lane.reads.forEach((reading, index) => {
+      if (index > 0) hint.appendChild(el("span", null, ", "));
+      hint.appendChild(ruleLink(reading.text, reading.anchor));
+    });
+    tile.appendChild(hint);
+  }
 
   if (picked) {
     tile.appendChild(
@@ -994,13 +1094,15 @@ function citedInScope(evidence) {
 function findingCard(finding, cited, folded) {
   const card = el("div", "finding");
   card.appendChild(el("h3", null, finding.title));
-  card.appendChild(
-    el(
-      "div",
-      "finding-count",
-      cited.length + " of " + folded + " folded sessions · rule " + finding.rule
-    )
+  /* The rule key is the one string on this card a reader cannot act on without knowing
+     what it means, so it is the link: `/rules#<key>` is the section that says what the
+     rule fires on, at what threshold, and what the threshold was measured against. */
+  const count = el("div", "finding-count");
+  count.appendChild(
+    el("span", null, cited.length + " of " + folded + " folded sessions · rule ")
   );
+  count.appendChild(ruleLink(finding.rule, finding.rule));
+  card.appendChild(count);
   const list = el("dl");
   list.appendChild(el("dt", null, "Problem"));
   list.appendChild(el("dd", null, finding.problem));
@@ -2613,6 +2715,11 @@ function wireAskControls() {
    invent a repository × device cell the payload does not carry. A device scope and a
    repository scope have the identical shape (lanes, timeline, sessions, findings); they
    differ only in which label key they carry, which `primaryLabel` reads. */
+/* From here down, the `data` a scope helper is handed is one **window view** — the
+   object holding `window`, `sessions`, `lanes`, `findings`, `scopes`, `timeline` and
+   `heatmap` for the selected span. On the launched window that object is the payload
+   itself; on either of the other two it is `windows.views[<span>]`. Both have the same
+   keys, which is what lets one set of helpers read either. See `windowView`. */
 function chosenScope(data) {
   if (scope.device !== null) {
     return data.scopes.devices.find((entry) => entry.device === scope.device) || null;
@@ -2689,6 +2796,22 @@ function fillScopeControls(data) {
   harnesses.value = chosenHarness >= 0 ? String(chosenHarness) : "";
 }
 
+/* The window control, rebuilt from the payload's own trio on every fetch. The value is
+   the spelling itself rather than a position, and a remembered window the payload no
+   longer offers falls back to the one the dashboard was launched on. */
+function fillWindowControl(data) {
+  const select = document.getElementById("scope-window");
+  const trio = data.windows ? data.windows.options : [];
+  const selected = data.windows ? data.windows.selected : null;
+  select.replaceChildren(
+    ...trio.map((last) =>
+      option(last, "Last " + last + (last === selected ? " (launched)" : ""))
+    )
+  );
+  if (chosenWindow !== null && !trio.includes(chosenWindow)) chosenWindow = null;
+  select.value = chosenWindow === null ? selected || "" : chosenWindow;
+}
+
 function option(value, text) {
   const node = el("option", null, text);
   node.value = value;
@@ -2716,14 +2839,22 @@ function scopedFolded(data, entry, column) {
 }
 
 function scopeSentence(data, entry, column) {
+  /* The window clause is on every branch, because the span is what every count above is
+     a statement *about* and a reader who has just changed it should see it named. */
+  const span =
+    "Over the last " +
+    data.window.last +
+    ", which the Window control chooses from the three this refresh folded. The bill and " +
+    "the narrative keep their own windows and each says which below. ";
   if (!entry && column < 0) {
     return (
+      span +
       "Showing the whole window. Choose a repository or a device to narrow the scores, the " +
       "timeline and the findings — and, for a repository, the bill and the narrative too — or a " +
       "harness to cut any of those by harness. Repository and device are alternatives: picking " +
       "one clears the other, because the payload holds no repository-and-device combination. " +
-      "Every scope is folded server-side and shipped with this payload; nothing here recomputes " +
-      "a score."
+      "Every scope is folded server-side, in every window, and shipped with this payload; " +
+      "nothing here recomputes a score."
     );
   }
   const onDevice = Boolean(entry) && !scopeIsRepository(entry);
@@ -2731,6 +2862,7 @@ function scopeSentence(data, entry, column) {
   if (entry) parts.push(primaryLabel(entry));
   if (column >= 0) parts.push(data.scopes.harnesses[column]);
   let sentence =
+    span +
     "Scoped to " +
     parts.join(" · ") +
     " — " +
@@ -2761,27 +2893,60 @@ function scopeSentence(data, entry, column) {
   return sentence;
 }
 
+/* The stamp every number above is only comparable under, and the one line in the footer
+   that has somewhere to go: `/rules` is the catalogue this exact pack rendered — the rule
+   ids, the thresholds, the lane mapping and the formula the stamp is a digest of. Built as
+   nodes rather than one string so the stamp itself is the link and the rest is text. */
+function rulePackLine(provenance) {
+  const line = el("p");
+  line.appendChild(el("span", null, "Rule pack "));
+  line.appendChild(ruleLink(provenance.rule_pack, ""));
+  line.appendChild(
+    el(
+      "span",
+      null,
+      " · price table " +
+        provenance.price_table_revision +
+        " · redaction patterns " +
+        provenance.redaction_pattern_revision +
+        " · refresh " +
+        provenance.generation +
+        " at " +
+        provenance.refreshed_at +
+        " in " +
+        provenance.refresh_elapsed +
+        ", every " +
+        provenance.refresh_interval
+    )
+  );
+  return line;
+}
+
 function paint() {
   const data = current;
   if (!data) return;
   const provenance = data.provenance;
-  const entry = chosenScope(data);
-  const column = chosenColumn(data);
-  const scopedSessions = entry ? entry.sessions : data.sessions;
-  const folded = scopedFolded(data, entry, column);
+  /* Everything a coaching window owns comes out of the view; `cost`, `standup` and
+     `provenance` come off the document, because they are not a function of this control
+     and moving them under it would be answering a question nobody asked. */
+  const view = windowView(data);
+  const entry = chosenScope(view);
+  const column = chosenColumn(view);
+  const scopedSessions = entry ? entry.sessions : view.sessions;
+  const folded = scopedFolded(view, entry, column);
   // With a harness picked, the split below it is that one harness — listing the others
   // beside a count that excludes them would be two numbers describing different sets.
   const harnesses = Object.entries(scopedSessions.by_harness)
-    .filter(([name]) => column < 0 || name === data.scopes.harnesses[column])
+    .filter(([name]) => column < 0 || name === view.scopes.harnesses[column])
     .map(([name, count]) => name + " (" + count + ")")
     .join(", ");
   document.getElementById("subtitle").textContent =
     "Scored over the last " +
-    data.window.last +
+    view.window.last +
     " — " +
     folded +
     " sessions since " +
-    data.window.opens_at +
+    view.window.opens_at +
     " (UTC)" +
     (harnesses ? " — " + harnesses : "") +
     ". Cost covers the last " +
@@ -2789,7 +2954,7 @@ function paint() {
     " and the standup the last " +
     data.standup.window.last +
     "; each section says which.";
-  document.getElementById("scope-note").textContent = scopeSentence(data, entry, column);
+  document.getElementById("scope-note").textContent = scopeSentence(view, entry, column);
   /* Re-rendered with the rest of the page so an answer taken over an older refresh is
      dated rather than left looking current. The scope has no say in it — the search is
      all of history, and the note under the box says so. */
@@ -2807,16 +2972,16 @@ function paint() {
     banner("");
   }
 
-  const lanes = entry ? entry.lanes : data.lanes;
+  const lanes = entry ? entry.lanes : view.lanes;
   document
     .getElementById("tiles")
     .replaceChildren(...lanes.map((lane) => laneTile(lane, column)));
 
-  paintTimeline(data, entry, column);
-  paintHeatmap(data, entry, column);
+  paintTimeline(view, entry, column);
+  paintHeatmap(view, entry, column);
 
   const findings = document.getElementById("findings");
-  const cards = data.findings
+  const cards = view.findings
     .map((finding) => ({ finding, cited: finding.evidence.filter(citedInScope) }))
     .filter(({ cited }) => cited.length > 0)
     .map(({ finding, cited }) => findingCard(finding, cited, folded));
@@ -2843,7 +3008,7 @@ function paint() {
     .getElementById("cost")
     .replaceChildren(
       ...(byRepository
-        ? scopedCostSection(data.cost, entry.repository, data.scopes.unattributed)
+        ? scopedCostSection(data.cost, entry.repository, view.scopes.unattributed)
         : costSection(data.cost))
     );
   document
@@ -2932,30 +3097,21 @@ function paint() {
       provenance.lanes.ask.sync +
       " · fold " +
       provenance.lanes.ask.fold,
-    "Rule pack " +
-      provenance.rule_pack +
-      " · price table " +
-      provenance.price_table_revision +
-      " · redaction patterns " +
-      provenance.redaction_pattern_revision +
-      " · refresh " +
-      provenance.generation +
-      " at " +
-      provenance.refreshed_at +
-      " in " +
-      provenance.refresh_elapsed +
-      ", every " +
-      provenance.refresh_interval,
   ];
-  if (gaps) lines.push("Gaps — " + gaps);
   const nodes = lines.map((line) => el("p", null, line));
+  nodes.push(rulePackLine(provenance));
+  if (gaps) nodes.push(el("p", null, "Gaps — " + gaps));
   nodes.push(el("p", "archive", "Archive " + provenance.patwari_url + " · cache " + provenance.cache_root));
   footer.replaceChildren(...nodes);
 }
 
 function render(data) {
   current = data;
-  fillScopeControls(data);
+  fillWindowControl(data);
+  /* The scope lists belong to the window that is selected: a repository with no session
+     in the last 7 days is not an option there, and every option's session count is that
+     window's own. Filling them from the view is what keeps the two controls composable. */
+  fillScopeControls(windowView(data));
   paint();
 }
 
@@ -2970,18 +3126,21 @@ function render(data) {
    neither. */
 function applyScope(changed) {
   if (!current) return;
+  /* The options were built from the selected window's scopes, so they are read back
+     against the same list — see `fillScopeControls`. */
+  const view = windowView(current);
   const repoSelect = document.getElementById("scope-repository");
   const deviceSelect = document.getElementById("scope-device");
   scope.repository = labelAt(
-    current.scopes.repositories.map((entry) => entry.repository),
+    view.scopes.repositories.map((entry) => entry.repository),
     repoSelect.value
   );
   scope.device = labelAt(
-    current.scopes.devices.map((entry) => entry.device),
+    view.scopes.devices.map((entry) => entry.device),
     deviceSelect.value
   );
   scope.harness = labelAt(
-    current.scopes.harnesses,
+    view.scopes.harnesses,
     document.getElementById("scope-harness").value
   );
   if (changed === "repository" && scope.repository !== null) {
@@ -3005,6 +3164,17 @@ function wireScopeControls() {
   document
     .getElementById("scope-harness")
     .addEventListener("change", () => applyScope("harness"));
+  /* Changing the window re-renders from the payload already in hand, exactly as changing
+     the scope does: every window × scope cell was folded before this document was
+     published, so this picks which pre-folded object the page reads. */
+  document.getElementById("scope-window").addEventListener("change", (event) => {
+    chosenWindow = event.target.value || null;
+    rememberWindow();
+    paint();
+  });
+  /* "Whole window" resets the three scope axes and not the span: the button clears what
+     a reader narrowed *to*, and the window is what they are looking *over*. Resetting it
+     too would silently move the numbers under a control the reader did not touch. */
   document.getElementById("scope-reset").addEventListener("click", () => {
     document.getElementById("scope-repository").value = "";
     document.getElementById("scope-device").value = "";
@@ -3067,6 +3237,7 @@ function subscribe() {
 }
 
 scope = readRememberedScope();
+chosenWindow = readRememberedWindow();
 wireScopeControls();
 wireAskControls();
 /* The ask box says what it is before the payload lands: it is answered by its own
