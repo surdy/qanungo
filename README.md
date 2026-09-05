@@ -285,10 +285,8 @@ and later metrics ([#2](https://github.com/surdy/qanungo/issues/2)), each waitin
 instructions doctor's V1 shipped ([#11](https://github.com/surdy/qanungo/issues/11)); its V2
 measured-outcomes half is deferred until edits and post-deploy captures accrue. The narrator (#6) is
 likely mooted by the shipped `/coach` skill. The rule DSL (#3) was **declined**, not deferred —
-hardcoded Rust rules stand until a second rule-author exists. Full
-research + rationale:
-`~/repos/research/ai-coach/`. See
-issues for the phased plan.
+hardcoded Rust rules stand until a second rule-author exists. Design notes and the decision log are
+kept outside this repository. See issues for the phased plan.
 
 ## License
 

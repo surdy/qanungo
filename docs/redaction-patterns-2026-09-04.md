@@ -14,7 +14,8 @@ scrub, which is the whole reason the constant is stamped in a footer.
 ## 1. What was found
 
 The `qanungo flows` review of 2026-09-04 (#13) read the archive's global top-five clusters and found
-the string qanungo#15 was filed from *still half-readable*, one revision after it was fixed:
+the string qanungo#15 was filed from *still half-readable*, one revision after it was fixed (every
+credential value in this file is fabricated):
 
 > `use http://line.…/ username : feedface00 and password [REDACTED:prose-credential] for xtream. and
 > http://line.…/get.php?username=[REDACTED:paired-username]&password=[REDACTED:secret-assignment]&type=m3u_plus`
@@ -118,7 +119,7 @@ Two bounds, both of which hold:
   transcript, and it is what keeps a `user:` line of a YAML block from pairing with a `password:`
   three lines below it.
 - **`MAX_PAIR_SPAN_BYTES` = 256** either way, which is what keeps the search a constant rather than a
-  walk over a two-megabyte record. It is generous against the production sighting — twenty-five bytes
+  walk over a two-megabyte record. It is generous against the sighting — twenty-five bytes
   separate the username's value from the word `password` — and mean against a paragraph.
 
 **The byte bound is the one that does the work on raw JSONL**, where a record is one line and the

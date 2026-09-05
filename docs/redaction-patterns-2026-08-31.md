@@ -17,8 +17,9 @@ constant is stamped in a footer.
 
 ## 1. What was found
 
-The `qanungo doctor` V1 review (2026-08-30) rendered a real archived instruction — a repeated
-cross-session instruction, which is what that lane looks for — as:
+The `qanungo doctor` V1 review (2026-08-30) rendered a sighting of this shape — a repeated
+cross-session instruction, which is what that lane looks for — as (every credential value in this
+file is fabricated):
 
 > `use http://… username : feedface00 and password c0ffeec0ffee for xtream. and
 > http://…/get.php?username=feedface00&password=[REDACTED:secret-assignment]&type=m3u_plus`
@@ -48,7 +49,7 @@ A credential **noun**, one space, and a value shaped like a credential — with 
 | value | base62 plus `-` and `_`, optionally wrapped in `` ` ``, `"`, or `'`; **≥ 12 characters**; **at least one digit and at least one letter**; **not SHOUTING_SNAKE_CASE** | This is the entire guard, because the left side is only a noun and a space — the same grammar as *password manager*, *token stream*, *token count*, *the password is stored in the keychain*. |
 
 **On `pass`, and on wrappers.** Both came out of the independent review's eyeball pass over the
-first cut, which found the *same production credential* written a second way and still readable:
+first cut, which found the *same credential pair* written a second way and still readable:
 
 ```
 - user `feedface00` · pass `c0ffeec0ffee`
@@ -88,9 +89,10 @@ already makes when it refuses a longer `SHOUTING_IDENTIFIER` run.
 `. + / =`. Those are what turn a value into a file path, a version, a hostname, or the first word of
 the next sentence, and in prose there is no separator standing behind them as evidence.
 
-**On the floor.** Twelve is the length of the production sighting (`c0ffeec0ffee`, twelve hex
-characters). It is also above every English word carrying a digit that could plausibly follow one of
-these nouns: `sha256`, `base64url`, `argon2id`, `oauth2`, `utf8`, `pbkdf2`, `md5`.
+**On the floor.** Twelve is the length of the sighting (shown here as the fabricated
+`c0ffeec0ffee`, twelve hex characters). It is also above every English word carrying a digit that
+could plausibly follow one of these nouns: `sha256`, `base64url`, `argon2id`, `oauth2`, `utf8`,
+`pbkdf2`, `md5`.
 
 **On the digit-and-letter test.** All-letters is an English word however long it is; all-digits is a
 measurement, and this archive writes `"input_tokens": 61184` tens of thousands of times — `token
@@ -157,7 +159,7 @@ Narrower than `SECRET_KEY_WORDS` on purpose: a `token=` or `session=` beside a `
 the URLs in any archive look like, and a session id does not make a username sensitive. It is a
 *password* that makes it the other half of a login.
 
-**Prose usernames are not touched**, and that is the design rather than an omission. The production
+**Prose usernames are not touched**, and that is the design rather than an omission. The sighting's
 string keeps its `username : feedface00` in the sentence and loses only the query parameter. A
 report that redacts the reader's own login name everywhere it appears has stopped being a report.
 
@@ -237,7 +239,7 @@ fires it removed were all this one sentence in four archived copies of the same 
   contribute nothing, which is the value-shape gate doing the work it was built for. They are held
   to fixture canaries and to the noun × value × gap × wrapper grid in
   `the_prose_gate_is_the_noun_list_crossed_with_the_value_shape`.
-- **`pass` earns its place and nothing more.** Every one of its fires is the production credential;
+- **`pass` earns its place and nothing more.** Every one of its fires is the credential pair;
   *boarding pass*, *pass the build*, *pass-through*, and *the tests pass* fire nothing, on the
   archive and in the fixtures both.
 
@@ -276,8 +278,8 @@ Added to that list:
 
 ## Sources
 
-- qanungo#15, and the `qanungo doctor` V1 review of 2026-08-30 that filed it — the production string
-  in §1, and both recommendations.
+- qanungo#15, and the `qanungo doctor` V1 review of 2026-08-30 that filed it — the string in §1
+  (values fabricated), and both recommendations.
 - The independent review of this change (2026-08-31, SHIP WITH FIXES) — the second spelling of the
   same credential (`pass`, and values in code spans) that rounds 3–4 were built from, and the
   `MAX_URL_SCAN_BYTES` doc/behaviour mismatch in §3 clause 2.

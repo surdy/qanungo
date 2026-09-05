@@ -49,8 +49,10 @@
 //! # Two patterns whose evidence is not a separator (qanungo #15)
 //!
 //! [`PatternId::ProseCredential`] and [`PatternId::PairedUsername`] were added at revision
-//! `2026-08-31` from one real archived instruction, in which a credential pair was pasted twice —
-//! once as prose and once as a query string — and only the query string was scrubbed:
+//! `2026-08-31` from a sighting of this shape, in which a credential pair was pasted twice — once
+//! as prose and once as a query string — and only the query string was scrubbed. **Every credential
+//! value shown in this module is fabricated**; only the lengths and charset classes are the
+//! original.
 //!
 //! ```text
 //! use http://…  username : feedface00 and password c0ffeec0ffee for … and
@@ -62,7 +64,7 @@
 //! - **Prose** anchors on a credential *noun* standing alone as a word, and then on the **shape of
 //!   the value after it**. That shape is the whole guard, because `password manager`,
 //!   `token stream`, and `the password is stored in the keychain` are the same grammar as
-//!   `password c0ffeec0ffee`. Either side may sit in a code span — this archive writes that same
+//!   `password c0ffeec0ffee`. Either side may sit in a code span — the same sighting writes that
 //!   pair as a table row too, ``user `feedface00` · pass `c0ffeec0ffee` `` — and a wrapper is taken
 //!   as a boundary, never as evidence. See [`prose_credential`].
 //! - **The paired username** anchors on a `username=` query parameter *in the same URL as a
@@ -1175,11 +1177,11 @@ fn normalized_key(key: &[u8]) -> Option<([u8; MAX_KEY_CHARS], usize)> {
 /// key insight*, *the key is idempotence* — and this pattern's only guard is what comes next.
 ///
 /// **`pass` is here because the archive spells it that way.** Review's eyeball pass found the same
-/// production credential written a second way — ``user `feedface00` · pass `c0ffeec0ffee` `` — where
-/// neither the noun nor the wrapper was one this pattern knew. It is the riskiest entry in the list
-/// (*a boarding pass*, *pass the build*, *pass-through*), and it is carried on the same evidence as
-/// the rest: it fires on this archive only where a credential is, and nowhere else in 933,292
-/// records.
+/// credential pair written a second way — ``user `feedface00` · pass `c0ffeec0ffee` `` (a sighting
+/// of this shape; values fabricated) — where neither the noun nor the wrapper was one this pattern
+/// knew. It is the riskiest entry in the list (*a boarding pass*, *pass the build*,
+/// *pass-through*), and it is carried on the same evidence as the rest: it fires on this archive
+/// only where a credential is, and nowhere else in 933,292 records.
 const PROSE_SECRET_WORDS: [&[u8]; 9] = [
     b"password",
     b"passwords",
@@ -1225,17 +1227,18 @@ const PROSE_FIRST_BYTES: [u8; 8] = *b"pPtTsSaA";
 /// another sentence this pattern could wander into.
 const PROSE_FILLER_WORDS: [&[u8]; 2] = [b"is", b"was"];
 
-/// Shortest value [`prose_credential`] will believe. Twelve is the length of the production
-/// sighting that opened qanungo #15 (`c0ffeec0ffee`, twelve hex characters), and it is long enough
-/// that the English words carrying a digit which could otherwise follow a credential noun —
-/// `sha256`, `base64url`, `argon2id`, `oauth2`, `utf8` — are all too short to reach it.
+/// Shortest value [`prose_credential`] will believe. Twelve is the length of the sighting that
+/// opened qanungo #15 (shown here as the fabricated `c0ffeec0ffee`, twelve hex characters), and it
+/// is long enough that the English words carrying a digit which could otherwise follow a
+/// credential noun — `sha256`, `base64url`, `argon2id`, `oauth2`, `utf8` — are all too short to
+/// reach it.
 const MIN_PROSE_SECRET_CHARS: usize = 12;
 
 /// A credential noun, a space, and a value shaped like a credential — with **no separator at all**,
 /// which is the whole gap this pattern closes.
 ///
-/// [`secret_assignment`] requires a `:` or `=` binding the key to the value, and the real archived
-/// instruction behind qanungo #15 wrote the same pair twice: `password=c0ffeec0ffee` in a query
+/// [`secret_assignment`] requires a `:` or `=` binding the key to the value, and the sighting behind
+/// qanungo #15 wrote the same pair twice (values fabricated): `password=c0ffeec0ffee` in a query
 /// string, which fired, and `password c0ffeec0ffee` in the sentence above it, which did not.
 ///
 /// # The value shape is the entire guard
@@ -1392,9 +1395,9 @@ const MAX_URL_SCAN_BYTES: usize = 2048;
 ///
 /// A username is not a secret — [`SECRET_KEY_WORDS`] leaves it out deliberately, and prose
 /// usernames stay readable, because a report that redacts the person's own login name everywhere it
-/// appears has become noise. What is sensitive is a **live pair**, and the archived instruction
-/// behind qanungo #15 is exactly that: `?username=feedface00&password=…` in one URL, where scrubbing
-/// the password alone leaves the reader holding one usable half.
+/// appears has become noise. What is sensitive is a **live pair**, and the sighting behind qanungo
+/// #15 is exactly that (values fabricated): `?username=feedface00&password=…` in one URL, where
+/// scrubbing the password alone leaves the reader holding one usable half.
 ///
 /// So the evidence for this pattern is entirely *adjacency*, and it is spelled structurally:
 ///
@@ -1520,8 +1523,8 @@ const MIN_PROSE_USERNAME_CHARS: usize = 6;
 /// archive scan therefore sees wider spans than any rendered surface does, which over-counts and
 /// never under-counts.
 ///
-/// 256 is generous against the production sighting, where twenty-five bytes separate the username's
-/// value from the word `password`, and mean against a paragraph.
+/// 256 is generous against the sighting, where twenty-five bytes separate the username's value
+/// from the word `password`, and mean against a paragraph.
 const MAX_PAIR_SPAN_BYTES: usize = 256;
 
 /// Which structure bound the noun to its value, which is how much the value itself has to prove.
@@ -1537,8 +1540,8 @@ enum UsernameGap {
 /// The `username`/`user` of a **sentence** whose password half fires in the same span.
 ///
 /// [`paired_username`]'s prose sibling, added for qanungo #17 from the left half of the same
-/// production string. `2026-08-31` scrubbed that string's prose password and its URL username and
-/// left `username : feedface00` readable between them; `flows` then promoted the excerpt into the
+/// sighting. `2026-08-31` scrubbed that string's prose password and its URL username and left
+/// `username : feedface00` readable between them; `flows` then promoted the excerpt into the
 /// archive's global top five.
 ///
 /// # The evidence is adjacency, and the id says so
@@ -2576,11 +2579,11 @@ mod tests {
     /// The instruction that opened qanungo #15, in shape: the same pair written twice, once as
     /// prose and once as a query string, with only the query string's password scrubbed.
     ///
-    /// **The values are fake and the host is `example.com`, deliberately.** The production string
-    /// is quoted in issue #15; a test file is not somewhere to keep a live credential, and §5 of
-    /// the provenance file already refuses "a denylist of the operator's own known secrets" on
-    /// exactly that ground. Every length and charset class is the original's: a ten-character
-    /// username, a twelve-character hex password, both spelled twice.
+    /// **The values are fake and the host is `example.com`, deliberately.** A test file is not
+    /// somewhere to keep a live credential, and §5 of the provenance file already refuses "a
+    /// denylist of the operator's own known secrets" on exactly that ground. Every length and
+    /// charset class is the original's: a ten-character username, a twelve-character hex password,
+    /// both spelled twice.
     const ISSUE_15: &str = "use http://line.example.com username : fake64f1ab and password fakefake0123 for xtream. and http://line.example.com/get.php?username=fake64f1ab&password=fakefake0123&type=m3u_plus";
 
     /// The gap itself, and then the gap qanungo #17 found in the fix. At `2026-08-31` this string
@@ -2622,7 +2625,7 @@ mod tests {
 
     /// The over-match minefield, and the only thing standing in it is the value shape. Every line
     /// here is a credential noun followed by an ordinary word, which is the same grammar as the
-    /// production string.
+    /// sighting.
     #[test]
     fn a_credential_noun_followed_by_ordinary_words_is_prose() {
         const PROSE: [&str; 16] = [
@@ -2692,7 +2695,7 @@ mod tests {
             ("api", false),
         ];
         const VALUES: [(&str, bool); 9] = [
-            ("fakefake0123", true),       // twelve, mixed: the production shape
+            ("fakefake0123", true),       // twelve, mixed: the sighting shape
             ("fakefake012", false),       // eleven: under the floor
             ("fakefakefake", false),      // no digit: a word, however long
             ("123456789012", false),      // no letter: a measurement
@@ -2771,7 +2774,7 @@ mod tests {
         }
     }
 
-    /// The second spelling of the same production credential, which review's eyeball pass found
+    /// The second spelling of the same credential pair, which review's eyeball pass found
     /// still readable after the first cut shipped: a table row where the noun is `pass` and the
     /// value is a code span, so neither the noun list nor the single-space adjacency reached it.
     ///
@@ -2894,12 +2897,12 @@ mod tests {
         }
     }
 
-    /// The qanungo #17 shape, in every spelling the production string and the archive write it.
+    /// The qanungo #17 shape, in every spelling the sighting and the archive write it.
     /// Each is a `user`/`username` outside a URL whose password half fires in the same sentence.
     #[test]
     fn a_prose_username_goes_when_its_password_fires_in_the_same_sentence() {
         let cases = [
-            // The production form: a separator with spaces around it, which is a query parameter to
+            // The sighting form: a separator with spaces around it, which is a query parameter to
             // nobody and was the whole of qanungo #17.
             (
                 "username : fake64f1ab and password fakefake0123",
@@ -3111,7 +3114,7 @@ mod tests {
         ];
         /// The value, whether a separator will take it, and whether bare prose will.
         const VALUES: [(&str, bool, bool); 8] = [
-            ("fake64f1ab", true, true),   // the production shape
+            ("fake64f1ab", true, true),   // the sighting shape
             ("postgres", true, false), // a plain word: a name, and only a separator vouches for it
             ("alice", false, false),   // five: under the floor, whatever bound it
             ("123456", false, false),  // no letter: a measurement, not a name
