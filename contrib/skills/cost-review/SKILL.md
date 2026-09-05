@@ -9,6 +9,8 @@ The interpretation half of qanungo's cost lane (qanungo#12). `qanungo cost` comp
 
 ## Steps
 
+**Requires an archive URL.** `PATWARI_URL` must be set in the shell, or `--patwari-url <URL>` passed on each command; there is no default archive. If a command exits 2 with the missing-archive message, stop and tell the user to finish the install as the README's Install section describes.
+
 1. **Run the command.** `qanungo cost --last 12w` (a quarter; window as the user asks — `h`/`d`/`w`, no `m` by design). Output: totals, by-model and by-repository breakdowns, caching savings, comparison-window delta, a flagged section, the top-tier section when there is one, and the footer with the price-table revision.
 2. **Interpret within the lane's honesty rules:**
    - **Dollars are claude-code only**, at Anthropic API list prices — a *what-it-would-cost* reference, not a bill.

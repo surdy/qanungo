@@ -54,7 +54,7 @@ A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mir
 
 ## Skills & agents
 
-Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, `/coach`, and the two that propose a write — `instructions-editor`, over `qanungo doctor`, and `skill-finder`, over `qanungo flows`. What else the directory grows is the issues' business, not this README's. None of them write derived data back into the archive: they render or propose; you decide.
+Thin read-only clients that call qanungo's commands or the recall funnel ship in `contrib/skills/` (as munshi ships `session-recall`). Shipping today, one interpretation half per shipped command: `/standup`, `/cost-review`, `/ask`, `/coach`, and the two that propose a write — `instructions-editor`, over `qanungo doctor`, and `skill-finder`, over `qanungo flows`. What else the directory grows is the issues' business, not this README's. None of them write derived data back into the archive: they render or propose; you decide. Each calls qanungo with no URL flag of its own, so they require `PATWARI_URL` to be set in the shell (see [Install](#install)); a command that exits 2 with the missing-archive message means that install is unfinished.
 
 ## Design rules (inherited, non-negotiable)
 
