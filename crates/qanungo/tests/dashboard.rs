@@ -938,10 +938,10 @@ fn the_event_stream_announces_the_current_refresh() {
     );
 }
 
-/// Four routes, read-only, and nothing else — including nothing that looks like a path into the
+/// Five routes, read-only, and nothing else — including nothing that looks like a path into the
 /// archive or the filesystem.
 #[test]
-fn nothing_but_the_four_routes_answers() {
+fn nothing_but_the_five_routes_answers() {
     let (address, _directory) = spawn_dashboard(canary_archive());
     for target in [
         "/api",

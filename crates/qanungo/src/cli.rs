@@ -95,27 +95,29 @@ pub const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8878";
 /// inside five minutes — a session has to be finished, archived, and listed before it can move a
 /// number — so this is chosen to keep the archive quiet rather than to keep the page fresh.
 ///
-/// A refresh now folds three lanes rather than one, and the measurement moved with it: **45.4 s**
-/// warm against the production archive on 2026-08-25 — coaching 22.4 s, cost 20.6 s, standup 2.4 s
-/// — against the 23 s the coaching lane cost alone. Five minutes therefore spends about 15% of the
-/// dashboard's life talking to Patwari rather than 6%. Still a quiet client, and still well clear
-/// of the floor below.
+/// A refresh now folds three lanes rather than one, and the measurement moved with it — twice. The
+/// three lanes together measured 45.4 s warm against the production archive on 2026-08-25; qanungo
+/// #1's snapshot index then cut the same refresh to **about 13 s** — coaching 6.8 s, cost 6.1 s,
+/// standup 0.1 s — of which the archive itself is about 2.5 s. Five minutes therefore spends about
+/// 4% of the dashboard's life talking to Patwari. Still a quiet client, and still well clear of the
+/// floor below.
 pub const DEFAULT_DASHBOARD_REFRESH: &str = "5m";
 
 /// Floor under `--refresh`, refused rather than clamped.
 ///
-/// A warm three-lane refresh measured 45.4 s against the production archive, and Patwari serves
+/// A warm three-lane refresh measures about 13 s against the production archive, and Patwari serves
 /// about eight concurrent requests. A refresh interval near the refresh's own duration is not a
 /// fresher dashboard, it is a permanent polling load on a LAN archive that has other readers — so
 /// somebody who typed `--refresh 5s` is told what this client will not do rather than quietly given
 /// something else.
 ///
-/// The floor stayed at a minute when the slice tripled what a refresh costs, and that is worth
-/// saying out loud rather than leaving as an oversight: a minute is now only a third above the
-/// measured refresh instead of three times it, so `--refresh 60s` today means a dashboard that is
-/// talking to the archive about three quarters of the time. It is left where it is because the
-/// floor's job is to refuse the *absurd* ask — a five-second poll — and not to second-guess an
-/// operator who has decided their own archive can wear a tight loop. Raising it would be this
+/// The floor stayed at a minute through both measurements — 45 s when the slice tripled what a
+/// refresh costs, and about 13 s once qanungo #1's snapshot index made the refresh fold-bound — and
+/// that is worth saying out loud rather than leaving as an oversight: a minute was barely above the
+/// measured refresh at 45 s and is more than four times it at 13 s, so the same constant has meant
+/// two quite different things. It is left where it is because the floor's job is to refuse the
+/// *absurd* ask — a five-second poll — and not to second-guess an operator who has decided their
+/// own archive can wear a tight loop. Raising it would be this
 /// client deciding that for them; the honest place for the discouragement is the measured number in
 /// [`DEFAULT_DASHBOARD_REFRESH`] above, which is what anybody choosing an interval should read.
 pub const MIN_DASHBOARD_REFRESH: Duration = Duration::from_secs(60);
@@ -539,8 +541,8 @@ fn parse_refresh(value: &str) -> Result<Refresh, String> {
     let interval = Duration::from_secs(seconds);
     if interval < MIN_DASHBOARD_REFRESH {
         return Err(format!(
-            "must be at least {}s — a warm three-lane refresh takes about 45 s against the archive, \
-             and refreshing near that interval is a polling load on a LAN server rather than a \
+            "must be at least {}s — a warm three-lane refresh takes about 13 s against the archive, \
+             and refreshing anywhere near that is a polling load on a LAN server rather than a \
              fresher dashboard",
             MIN_DASHBOARD_REFRESH.as_secs(),
         ));

@@ -648,10 +648,10 @@ mod tests {
     #[test]
     fn parses_http_and_https_endpoints_and_rejects_others() {
         assert_eq!(
-            parse_endpoint("http://192.168.16.169:8787").unwrap(),
+            parse_endpoint("http://192.0.2.10:8787").unwrap(),
             Endpoint {
                 tls: false,
-                host: "192.168.16.169".to_owned(),
+                host: "192.0.2.10".to_owned(),
                 port: 8787,
             }
         );
@@ -661,7 +661,7 @@ mod tests {
         );
         assert_eq!(parse_endpoint("http://localhost").unwrap().port, 80);
         assert!(parse_endpoint("ftp://host").is_err());
-        assert!(parse_endpoint("192.168.16.169:8787").is_err());
+        assert!(parse_endpoint("192.0.2.10:8787").is_err());
         assert!(parse_endpoint("https://").is_err());
     }
 

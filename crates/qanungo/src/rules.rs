@@ -1,8 +1,9 @@
-//! The seven hardcoded coaching rules.
+//! The eight hardcoded coaching rules.
 //!
-//! P0 deliberately skips the rule DSL (qanungo #3): a handful of rules in Rust are enough to find
-//! out whether folded metrics say anything worth acting on, and a DSL built before that answer is
-//! known would encode guesses as syntax. Each rule reads the folded [`SessionMetrics`] and, when
+//! The DSL was declined (2026-09-04, qanungo #3): hardcoded Rust rules until a second rule-author
+//! exists. A handful of rules in Rust were enough to find out whether folded metrics say anything
+//! worth acting on, and the answer did not turn out to want syntax — one author editing Rust is
+//! cheaper than a grammar nobody else writes in. Each rule reads the folded [`SessionMetrics`] and, when
 //! it fires, states a **Problem**, an **Action**, and **evidence** — one line per session,
 //! carrying only aggregates, tool names, and the session's `source_hash`.
 //!

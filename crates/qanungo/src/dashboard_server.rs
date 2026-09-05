@@ -61,10 +61,11 @@
 //!   could parse it back would be two serializations and a subprocess where a function call does.
 //!   It calls [`command::fold_coaching`], [`command::fold_cost`], and [`command::fold_standup`]
 //!   directly — the same three calls `qanungo report`, `qanungo cost`, and `qanungo standup` make.
-//! - **It refreshes in the background.** The three lanes together are **45 s** against the
-//!   production archive, warm (measured 2026-08-25), and very nearly the sum of the three CLI runs:
-//!   the shared blob cache spares the bytes and not the requests, because [`crate::sync`] asks the
-//!   archive for one snapshot document per listed session before it consults the cache. On the
+//! - **It refreshes in the background.** The three lanes together are **about 13 s** against the
+//!   production archive, warm (measured 2026-08-25 at 45 s, and again after qanungo #1's snapshot
+//!   index cut it), and very nearly the sum of the three CLI runs: the shared blob cache spares the
+//!   bytes and not the requests, so before the index [`crate::sync`] asked the archive for one
+//!   snapshot document per listed session before it consulted the cache. On the
 //!   request path that is not a dashboard, it is a wait — so the folds happen on a timer, the
 //!   payload is serialized once per refresh, and a request is a memcpy. This is the "in-memory
 //!   service" half of the 2026-08-24 grilling: process memory is the disposable materialization,
@@ -512,10 +513,10 @@ impl Service {
 ///
 /// What that buys is still worth having. On a cold cache the sharing is real: the standup lane
 /// alone measured 4.94 s cold against 2.37 s warm, and the transcript lanes' cold cost is the
-/// archive's 3.1 GiB, paid once between the two of them instead of twice. And 45 s inside a
-/// five-minute interval is 15% of the process's life spent talking to Patwari, against the 6% the
-/// coaching lane alone spent — comfortably inside what [`crate::cli::MIN_DASHBOARD_REFRESH`] was
-/// set to protect, and the reason that floor is a floor rather than a default.
+/// archive's 3.1 GiB, paid once between the two of them instead of twice. And about 13 s inside a
+/// five-minute interval is roughly 4% of the process's life spent talking to Patwari, down from the
+/// 15% the pre-index refresh spent — comfortably inside what [`crate::cli::MIN_DASHBOARD_REFRESH`]
+/// was set to protect, and the reason that floor is a floor rather than a default.
 ///
 /// Every line goes to stderr, including the access log below: this lane writes no document to
 /// stdout, and keeping the whole narration on one stream means `qanungo dashboard >/dev/null`
