@@ -1838,7 +1838,7 @@ mod tests {
     #[test]
     fn a_non_loopback_bind_states_its_posture() {
         let redactor = Redactor::new();
-        for routable in ["0.0.0.0:8878", "100.64.0.7:8878", "[::]:8878"] {
+        for routable in ["0.0.0.0:8878", "192.0.2.10:8878", "[::]:8878"] {
             let line = posture_line(routable.parse().expect("a socket address"), &redactor);
             assert!(line.contains("NOT loopback"), "{line}");
             assert!(line.contains("UNAUTHENTICATED"), "{line}");
@@ -1866,7 +1866,7 @@ mod tests {
     #[test]
     fn turning_redaction_off_says_so_and_says_it_loudest_where_it_costs_most() {
         let raw = Redactor::new().with_secrets(false);
-        let routable: SocketAddr = "100.64.0.7:8878".parse().expect("a socket address");
+        let routable: SocketAddr = "192.0.2.10:8878".parse().expect("a socket address");
         let local: SocketAddr = "127.0.0.1:8878".parse().expect("a socket address");
 
         // The default posture prints one line and nothing else.

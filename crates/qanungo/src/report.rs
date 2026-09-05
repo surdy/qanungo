@@ -802,8 +802,15 @@ mod tests {
     fn window() -> Window {
         use clap::Parser;
 
-        let crate::cli::Command::Report(args) =
-            crate::cli::Cli::parse_from(["qanungo", "report", "--last", "7d"]).command
+        let crate::cli::Command::Report(args) = crate::cli::Cli::parse_from([
+            "qanungo",
+            "report",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            "7d",
+        ])
+        .command
         else {
             panic!("`report` parses as the report command");
         };

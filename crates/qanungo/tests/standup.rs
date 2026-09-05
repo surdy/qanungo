@@ -518,7 +518,14 @@ fn the_footer_reports_the_run_and_the_scrub() {
 }
 
 fn window() -> Window {
-    let Command::Standup(args) = Cli::parse_from(["qanungo", "standup"]).command else {
+    let Command::Standup(args) = Cli::parse_from([
+        "qanungo",
+        "standup",
+        "--patwari-url",
+        "http://127.0.0.1:8080",
+    ])
+    .command
+    else {
         panic!("`standup` parses as the standup command");
     };
     args.last

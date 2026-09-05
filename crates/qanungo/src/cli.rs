@@ -33,10 +33,20 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::redaction::{FILTER_PROFANITY_BY_DEFAULT, REDACT_SECRETS_BY_DEFAULT, Redactor};
 
-/// The production archive's published front door (Caddy on 443; raw :8787 is firewalled to the
-/// archive's own subnet). Same name session-recall uses. Overridable for a tunnel, a
-/// laptop-local server, or a second archive.
-pub const DEFAULT_PATWARI_URL: &str = "https://patwari.clusterfault.com";
+/// What to say when nobody told qanungo which archive to read.
+///
+/// There is deliberately **no default archive**. A Patwari instance is something a person runs;
+/// there is no hosted one to fall back to, and an address compiled in here could only ever be
+/// right for whoever compiled it. So the missing-URL case is not an accident to paper over with a
+/// guess — it is the one piece of setup this tool cannot do for you, and it gets a sentence that
+/// says how to finish it rather than a parser's shorthand. [`crate::cli`]'s caller prints this in
+/// place of clap's "required arguments were not provided" line; the flag is still declared
+/// `required`, so `--help` tells the same truth.
+pub const MISSING_PATWARI_URL: &str = "\
+qanungo reads a Patwari archive and needs that archive's base URL. There is no default, because \
+the archive is yours and only you know where it lives. Pass `--patwari-url <URL>` on any command, \
+or set it once in your shell — `export PATWARI_URL=https://patwari.example.net` — and every \
+command picks it up from there. The README's Install section has the rest of the setup.";
 
 /// How far back a standup reaches when nobody says otherwise.
 ///
@@ -146,8 +156,14 @@ pub enum Command {
 /// `--patwari-url` cannot come to mean two slightly different things in two subcommands.
 #[derive(Debug, Args, Clone)]
 pub struct ArchiveArgs {
-    /// Base URL of the Patwari archive server.
-    #[arg(long = "patwari-url", env = "PATWARI_URL", default_value = DEFAULT_PATWARI_URL)]
+    /// Base URL of the Patwari archive to read, e.g. `https://patwari.example.net`. Required on
+    /// every command; set `PATWARI_URL` once in your shell to stop typing it.
+    #[arg(
+        long = "patwari-url",
+        env = "PATWARI_URL",
+        required = true,
+        value_name = "URL"
+    )]
     pub patwari_url: String,
 
     /// Cache root for the mirrored transcripts. Defaults to `$XDG_CACHE_HOME/qanungo`, falling
@@ -693,19 +709,60 @@ mod tests {
             assert!(parse_concurrency(bad).is_err(), "`{bad}` must be refused");
         }
         for command in ["report", "cost", "standup", "doctor", "flows", "dashboard"] {
-            assert!(Cli::try_parse_from(["qanungo", command, "--concurrency", "64"]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "qanungo",
+                    command,
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                    "--concurrency",
+                    "64"
+                ])
+                .is_err()
+            );
         }
     }
 
     #[test]
-    fn report_defaults_to_the_lan_archive_over_thirty_days() {
-        let Command::Report(args) = Cli::parse_from(["qanungo", "report"]).command else {
+    fn report_defaults_to_thirty_days_over_the_named_archive() {
+        let Command::Report(args) = Cli::parse_from([
+            "qanungo",
+            "report",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
+        else {
             panic!("`report` parses as the report command");
         };
         assert_eq!(args.last.to_string(), "30d");
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
         assert!(args.archive.cache_dir.is_none());
+    }
+
+    /// There is no default archive, on any lane: a run that names none is a usage error rather
+    /// than a run against an address somebody else compiled in. The binary answers it with
+    /// [`MISSING_PATWARI_URL`], which has to keep naming both ways of supplying one.
+    ///
+    /// The parse half is skipped when the caller's own shell exports `PATWARI_URL`, because then
+    /// nothing *is* missing — the environment is the second way to give the flag a value, and clap
+    /// reads it before it decides anything is absent.
+    #[test]
+    fn a_run_with_no_archive_url_is_a_usage_error() {
+        if std::env::var_os("PATWARI_URL").is_none() {
+            for command in ["report", "cost", "standup", "doctor", "flows", "dashboard"] {
+                let error = Cli::try_parse_from(["qanungo", command])
+                    .expect_err("no archive URL is a usage error");
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument
+                );
+                assert!(error.to_string().contains("--patwari-url"), "{command}");
+            }
+        }
+        assert!(MISSING_PATWARI_URL.contains("--patwari-url"));
+        assert!(MISSING_PATWARI_URL.contains("PATWARI_URL"));
     }
 
     /// The cost lane's default is a quarter spelled in the units the grammar actually has. The
@@ -713,31 +770,57 @@ mod tests {
     /// a reader can only read one way.
     #[test]
     fn cost_defaults_to_a_quarter_spelled_in_weeks() {
-        let Command::Cost(args) = Cli::parse_from(["qanungo", "cost"]).command else {
+        let Command::Cost(args) =
+            Cli::parse_from(["qanungo", "cost", "--patwari-url", "http://127.0.0.1:8080"]).command
+        else {
             panic!("`cost` parses as the cost command");
         };
         assert_eq!(args.last.to_string(), "12w");
         assert_eq!(args.last.delta(), TimeDelta::weeks(12));
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
-        assert!(Cli::try_parse_from(["qanungo", "cost", "--last", "3m"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "cost",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--last",
+                "3m"
+            ])
+            .is_err()
+        );
     }
 
     /// The standup lane narrates one window a person can read to the end of. The issue's `30d` is
     /// still typeable; it is simply not what a run with no flags means.
     #[test]
-    fn standup_defaults_to_a_week_of_the_lan_archive() {
-        let Command::Standup(args) = Cli::parse_from(["qanungo", "standup"]).command else {
+    fn standup_defaults_to_a_week_of_the_named_archive() {
+        let Command::Standup(args) = Cli::parse_from([
+            "qanungo",
+            "standup",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
+        else {
             panic!("`standup` parses as the standup command");
         };
         assert_eq!(args.last.to_string(), DEFAULT_STANDUP_WINDOW);
         assert_eq!(args.last.delta(), TimeDelta::days(7));
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
         assert!(args.archive.cache_dir.is_none());
 
-        let Command::Standup(month) =
-            Cli::parse_from(["qanungo", "standup", "--last", "30d"]).command
+        let Command::Standup(month) = Cli::parse_from([
+            "qanungo",
+            "standup",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            "30d",
+        ])
+        .command
         else {
             panic!("`standup` parses as the standup command");
         };
@@ -791,21 +874,122 @@ mod tests {
     /// carrying no content would invite a reader to trust a control that is not doing anything.
     #[test]
     fn only_the_lanes_that_render_content_take_the_redaction_flags() {
-        assert!(Cli::try_parse_from(["qanungo", "standup", "--no-redact"]).is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--no-redact"]).is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--filter-profanity"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "standup",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--no-redact"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "dashboard",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--no-redact"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "dashboard",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--filter-profanity"
+            ])
+            .is_ok()
+        );
         // Ask renders matched summary prose, so it flattens the flags like the other two content
         // lanes — with a query, since the query is required.
-        assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--no-redact"]).is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--filter-profanity"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "ask",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "payments",
+                "--no-redact"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "ask",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "payments",
+                "--filter-profanity"
+            ])
+            .is_ok()
+        );
         // Doctor quotes the repeated instruction itself, so it takes them too.
-        assert!(Cli::try_parse_from(["qanungo", "doctor", "--no-redact"]).is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "doctor", "--filter-profanity"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--no-redact"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--filter-profanity"
+            ])
+            .is_ok()
+        );
         // Flows quotes the repeated request and every step of a flow — the third verbatim surface.
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--no-redact"]).is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--filter-profanity"]).is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "report", "--no-redact"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "cost", "--filter-profanity"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--no-redact"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--filter-profanity"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "report",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--no-redact"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "cost",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--filter-profanity"
+            ])
+            .is_err()
+        );
     }
 
     /// Flows is the third lane with no default window, for `ask` and `doctor`'s reason: "what do I
@@ -813,18 +997,28 @@ mod tests {
     /// nothing to search *for*, only history to read.
     #[test]
     fn flows_reads_all_history_until_a_window_narrows_it() {
-        let Command::Flows(args) = Cli::parse_from(["qanungo", "flows"]).command else {
+        let Command::Flows(args) =
+            Cli::parse_from(["qanungo", "flows", "--patwari-url", "http://127.0.0.1:8080"]).command
+        else {
             panic!("`flows` parses as the flows command");
         };
         assert!(args.last.is_none(), "no window means all of history");
         assert_eq!(args.clusters, crate::flows::DEFAULT_CLUSTERS);
         assert_eq!(args.flows, crate::flows::DEFAULT_FLOWS);
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
         assert!(args.archive.cache_dir.is_none());
         assert!(!args.redaction.no_redact, "the scrub is the default");
 
-        let Command::Flows(scoped) = Cli::parse_from(["qanungo", "flows", "--last", "4w"]).command
+        let Command::Flows(scoped) = Cli::parse_from([
+            "qanungo",
+            "flows",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            "4w",
+        ])
+        .command
         else {
             panic!("`flows` parses as the flows command");
         };
@@ -835,8 +1029,27 @@ mod tests {
 
         // The grammar is the crate's, so the month unit is refused here too, and the lane takes no
         // positional argument.
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--last", "5m"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "flows", "payments"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--last",
+                "5m"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "payments"
+            ])
+            .is_err()
+        );
     }
 
     /// Both of the flows lane's cuts are numbers the operator can move, refused at zero on
@@ -844,12 +1057,51 @@ mod tests {
     /// document, it is a heading with a footnote under it.
     #[test]
     fn flows_takes_two_caps_and_refuses_zero_on_either() {
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--clusters", "0"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--flows", "0"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--clusters", "many"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--clusters",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--flows",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--clusters",
+                "many"
+            ])
+            .is_err()
+        );
 
-        let Command::Flows(args) =
-            Cli::parse_from(["qanungo", "flows", "--clusters", "50", "--flows", "5"]).command
+        let Command::Flows(args) = Cli::parse_from([
+            "qanungo",
+            "flows",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--clusters",
+            "50",
+            "--flows",
+            "5",
+        ])
+        .command
         else {
             panic!("`flows` parses as the flows command");
         };
@@ -858,9 +1110,39 @@ mod tests {
 
         // They are this lane's own cuts: neither `doctor` nor any other lane learned them, and this
         // lane did not learn `doctor`'s.
-        assert!(Cli::try_parse_from(["qanungo", "doctor", "--clusters", "50"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "flows", "--clusters-per-repo", "50"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "report", "--flows", "5"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--clusters",
+                "50"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "flows",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--clusters-per-repo",
+                "50"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "report",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--flows",
+                "5"
+            ])
+            .is_err()
+        );
     }
 
     /// Doctor is the second lane with no default window, for `ask`'s reason: "have I been repeating
@@ -868,7 +1150,14 @@ mod tests {
     /// search *for*, only history to read.
     #[test]
     fn doctor_reads_all_history_until_a_window_narrows_it() {
-        let Command::Doctor(args) = Cli::parse_from(["qanungo", "doctor"]).command else {
+        let Command::Doctor(args) = Cli::parse_from([
+            "qanungo",
+            "doctor",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
+        else {
             panic!("`doctor` parses as the doctor command");
         };
         assert!(args.last.is_none(), "no window means all of history");
@@ -876,13 +1165,20 @@ mod tests {
             args.clusters_per_repo,
             crate::doctor::DEFAULT_CLUSTERS_PER_REPOSITORY,
         );
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
         assert!(args.archive.cache_dir.is_none());
         assert!(!args.redaction.no_redact, "the scrub is the default");
 
-        let Command::Doctor(scoped) =
-            Cli::parse_from(["qanungo", "doctor", "--last", "4w"]).command
+        let Command::Doctor(scoped) = Cli::parse_from([
+            "qanungo",
+            "doctor",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            "4w",
+        ])
+        .command
         else {
             panic!("`doctor` parses as the doctor command");
         };
@@ -892,8 +1188,27 @@ mod tests {
         );
 
         // The window shares the one grammar, and there is no query to give it.
-        assert!(Cli::try_parse_from(["qanungo", "doctor", "--last", "5m"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "doctor", "payments"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--last",
+                "5m"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "payments"
+            ])
+            .is_err()
+        );
     }
 
     /// What `doctor` builds out of the flags is what every other rendering lane builds: typing
@@ -902,10 +1217,15 @@ mod tests {
     fn the_doctor_lane_redacts_by_default_and_stops_only_when_told_to() {
         let redactor = |flags: &[&str]| {
             let Command::Doctor(args) = Cli::parse_from(
-                ["qanungo", "doctor"]
-                    .into_iter()
-                    .chain(flags.iter().copied())
-                    .collect::<Vec<_>>(),
+                [
+                    "qanungo",
+                    "doctor",
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>(),
             )
             .command
             else {
@@ -925,17 +1245,33 @@ mod tests {
     /// terms is a usage error, not an empty run.
     #[test]
     fn ask_searches_all_history_until_a_window_narrows_it() {
-        let Command::Ask(args) = Cli::parse_from(["qanungo", "ask", "payments API"]).command else {
+        let Command::Ask(args) = Cli::parse_from([
+            "qanungo",
+            "ask",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "payments API",
+        ])
+        .command
+        else {
             panic!("`ask` parses as the ask command");
         };
         assert_eq!(args.query, "payments API");
         assert!(args.last.is_none(), "no window means all of history");
         assert_eq!(args.limit, DEFAULT_ASK_LIMIT);
         assert!(!args.verbatim, "the escalation is opt-in");
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
 
-        let Command::Ask(scoped) =
-            Cli::parse_from(["qanungo", "ask", "payments", "--last", "30d"]).command
+        let Command::Ask(scoped) = Cli::parse_from([
+            "qanungo",
+            "ask",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "payments",
+            "--last",
+            "30d",
+        ])
+        .command
         else {
             panic!("`ask` parses as the ask command");
         };
@@ -945,8 +1281,22 @@ mod tests {
         );
 
         // No query is a usage error, and the window still shares the one grammar.
-        assert!(Cli::try_parse_from(["qanungo", "ask"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--last", "5m"]).is_err());
+        assert!(
+            Cli::try_parse_from(["qanungo", "ask", "--patwari-url", "http://127.0.0.1:8080"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "ask",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "x",
+                "--last",
+                "5m"
+            ])
+            .is_err()
+        );
     }
 
     /// `--verbatim` is a plain opt-in switch that composes with everything else the lane takes: a
@@ -958,6 +1308,8 @@ mod tests {
         let Command::Ask(args) = Cli::parse_from([
             "qanungo",
             "ask",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
             "payments",
             "--verbatim",
             "--last",
@@ -979,8 +1331,28 @@ mod tests {
         assert!(args.redaction.no_redact);
 
         // It is a flag, not an option, and it belongs to this lane alone.
-        assert!(Cli::try_parse_from(["qanungo", "ask", "payments", "--verbatim", "5"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "standup", "--verbatim"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "ask",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "payments",
+                "--verbatim",
+                "5"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "standup",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--verbatim"
+            ])
+            .is_err()
+        );
     }
 
     /// A result limit is refused at zero rather than clamped, and defaults to ten.
@@ -991,8 +1363,28 @@ mod tests {
         for bad in ["0", "-1", "lots", ""] {
             assert!(parse_limit(bad).is_err(), "`{bad}` must be refused");
         }
-        assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--limit", "0"]).is_err());
-        let Command::Ask(args) = Cli::parse_from(["qanungo", "ask", "x", "--limit", "3"]).command
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "ask",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "x",
+                "--limit",
+                "0"
+            ])
+            .is_err()
+        );
+        let Command::Ask(args) = Cli::parse_from([
+            "qanungo",
+            "ask",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "x",
+            "--limit",
+            "3",
+        ])
+        .command
         else {
             panic!("`ask` parses as the ask command");
         };
@@ -1008,18 +1400,56 @@ mod tests {
         for bad in ["0", "-1", "all", ""] {
             assert!(parse_cluster_cap(bad).is_err(), "`{bad}` must be refused");
         }
-        assert!(Cli::try_parse_from(["qanungo", "doctor", "--clusters-per-repo", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--clusters-per-repo",
+                "0"
+            ])
+            .is_err()
+        );
 
-        let Command::Doctor(args) =
-            Cli::parse_from(["qanungo", "doctor", "--clusters-per-repo", "50"]).command
+        let Command::Doctor(args) = Cli::parse_from([
+            "qanungo",
+            "doctor",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--clusters-per-repo",
+            "50",
+        ])
+        .command
         else {
             panic!("`doctor` parses as the doctor command");
         };
         assert_eq!(args.clusters_per_repo, 50);
 
         // It is the doctor's own cut, not a limit the other lanes learned.
-        assert!(Cli::try_parse_from(["qanungo", "ask", "x", "--clusters-per-repo", "50"]).is_err());
-        assert!(Cli::try_parse_from(["qanungo", "report", "--clusters-per-repo", "50"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "ask",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "x",
+                "--clusters-per-repo",
+                "50"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "report",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--clusters-per-repo",
+                "50"
+            ])
+            .is_err()
+        );
     }
 
     /// The dashboard's scrub is decided once, on the command line, and typing nothing is the safe
@@ -1029,10 +1459,15 @@ mod tests {
     fn the_dashboard_redacts_by_default_and_stops_only_when_told_to() {
         let redactor = |flags: &[&str]| {
             let Command::Dashboard(args) = Cli::parse_from(
-                ["qanungo", "dashboard"]
-                    .into_iter()
-                    .chain(flags.iter().copied())
-                    .collect::<Vec<_>>(),
+                [
+                    "qanungo",
+                    "dashboard",
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>(),
             )
             .command
             else {
@@ -1052,12 +1487,19 @@ mod tests {
     /// numbers under a different presentation.
     #[test]
     fn the_dashboard_defaults_to_loopback_thirty_days_and_the_named_interval() {
-        let Command::Dashboard(args) = Cli::parse_from(["qanungo", "dashboard"]).command else {
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
+        else {
             panic!("`dashboard` parses as the dashboard command");
         };
         assert_eq!(args.last.to_string(), "30d");
         assert_eq!(args.last.delta(), TimeDelta::days(30));
-        assert_eq!(args.archive.patwari_url, DEFAULT_PATWARI_URL);
+        assert_eq!(args.archive.patwari_url, "http://127.0.0.1:8080");
         assert_eq!(args.archive.concurrency, crate::sync::DEFAULT_CONCURRENCY);
         assert_eq!(args.bind.to_string(), DEFAULT_DASHBOARD_BIND);
         assert!(args.bind.ip().is_loopback());
@@ -1070,14 +1512,32 @@ mod tests {
     /// CLI runs with no flags would print.
     #[test]
     fn the_dashboards_three_windows_default_to_their_own_lanes_defaults() {
-        let Command::Dashboard(dashboard) = Cli::parse_from(["qanungo", "dashboard"]).command
+        let Command::Dashboard(dashboard) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
         else {
             panic!("`dashboard` parses as the dashboard command");
         };
         let (Command::Report(report), Command::Cost(cost), Command::Standup(standup)) = (
-            Cli::parse_from(["qanungo", "report"]).command,
-            Cli::parse_from(["qanungo", "cost"]).command,
-            Cli::parse_from(["qanungo", "standup"]).command,
+            Cli::parse_from([
+                "qanungo",
+                "report",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+            ])
+            .command,
+            Cli::parse_from(["qanungo", "cost", "--patwari-url", "http://127.0.0.1:8080"]).command,
+            Cli::parse_from([
+                "qanungo",
+                "standup",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+            ])
+            .command,
         ) else {
             panic!("each lane parses as itself");
         };
@@ -1098,10 +1558,15 @@ mod tests {
     fn the_extra_window_flags_share_the_window_grammar() {
         let windows = |flags: &[&str]| {
             let Command::Dashboard(args) = Cli::parse_from(
-                ["qanungo", "dashboard"]
-                    .into_iter()
-                    .chain(flags.iter().copied())
-                    .collect::<Vec<_>>(),
+                [
+                    "qanungo",
+                    "dashboard",
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>(),
             )
             .command
             else {
@@ -1131,13 +1596,29 @@ mod tests {
         for flag in ["--cost-last", "--standup-last"] {
             for bad in ["", "d", "30", "30m", "0d", "-1d", "30days", "5s"] {
                 assert!(
-                    Cli::try_parse_from(["qanungo", "dashboard", flag, bad]).is_err(),
+                    Cli::try_parse_from([
+                        "qanungo",
+                        "dashboard",
+                        "--patwari-url",
+                        "http://127.0.0.1:8080",
+                        flag,
+                        bad
+                    ])
+                    .is_err(),
                     "{flag} {bad:?} must not parse",
                 );
             }
             for good in ["12h", "30d", "12w"] {
                 assert!(
-                    Cli::try_parse_from(["qanungo", "dashboard", flag, good]).is_ok(),
+                    Cli::try_parse_from([
+                        "qanungo",
+                        "dashboard",
+                        "--patwari-url",
+                        "http://127.0.0.1:8080",
+                        flag,
+                        good
+                    ])
+                    .is_ok(),
                     "{flag} {good} is a window",
                 );
             }
@@ -1145,8 +1626,28 @@ mod tests {
 
         // And they belong to the dashboard alone: the single-lane commands each have one window.
         for command in ["report", "cost", "standup"] {
-            assert!(Cli::try_parse_from(["qanungo", command, "--cost-last", "4w"]).is_err());
-            assert!(Cli::try_parse_from(["qanungo", command, "--standup-last", "3d"]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "qanungo",
+                    command,
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                    "--cost-last",
+                    "4w"
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "qanungo",
+                    command,
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                    "--standup-last",
+                    "3d"
+                ])
+                .is_err()
+            );
         }
     }
 
@@ -1156,18 +1657,35 @@ mod tests {
     #[test]
     fn a_routable_bind_parses_because_the_tailnet_is_the_point() {
         let bind = |address: &str| {
-            let Command::Dashboard(args) =
-                Cli::parse_from(["qanungo", "dashboard", "--bind", address]).command
+            let Command::Dashboard(args) = Cli::parse_from([
+                "qanungo",
+                "dashboard",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--bind",
+                address,
+            ])
+            .command
             else {
                 panic!("`dashboard` parses as the dashboard command");
             };
             args.bind
         };
         assert!(!bind("0.0.0.0:8878").ip().is_loopback());
-        assert!(!bind("100.64.0.1:9000").ip().is_loopback());
+        assert!(!bind("192.0.2.1:9000").ip().is_loopback());
         assert!(bind("[::1]:8878").ip().is_loopback());
         // A malformed address is a usage error before a socket is ever opened.
-        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--bind", "nowhere"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "dashboard",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--bind",
+                "nowhere"
+            ])
+            .is_err()
+        );
     }
 
     /// The refresh grammar is disjoint from the window grammar: an interval is seconds, minutes,
@@ -1205,7 +1723,17 @@ mod tests {
         assert!(refused.contains("polling load"), "{refused}");
         assert!(parse_refresh("59s").is_err());
         assert!(parse_refresh("60s").is_ok());
-        assert!(Cli::try_parse_from(["qanungo", "dashboard", "--refresh", "5s"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qanungo",
+                "dashboard",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--refresh",
+                "5s"
+            ])
+            .is_err()
+        );
     }
 
     /// [`RedactionArgs`] is exercised through the same stand-in the redaction lane pinned it with,
@@ -1227,10 +1755,15 @@ mod tests {
     fn the_standup_lane_redacts_by_default_and_stops_only_when_told_to() {
         let redactor = |flags: &[&str]| {
             let Command::Standup(args) = Cli::parse_from(
-                ["qanungo", "standup"]
-                    .into_iter()
-                    .chain(flags.iter().copied())
-                    .collect::<Vec<_>>(),
+                [
+                    "qanungo",
+                    "standup",
+                    "--patwari-url",
+                    "http://127.0.0.1:8080",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>(),
             )
             .command
             else {

@@ -422,7 +422,16 @@ fn a_session_the_lane_cannot_read_whole_is_left_out_of_the_top_tier_section() {
 }
 
 fn window() -> Window {
-    let Command::Cost(args) = Cli::parse_from(["qanungo", "cost", "--last", "12w"]).command else {
+    let Command::Cost(args) = Cli::parse_from([
+        "qanungo",
+        "cost",
+        "--patwari-url",
+        "http://127.0.0.1:8080",
+        "--last",
+        "12w",
+    ])
+    .command
+    else {
         panic!("`cost` parses as the cost command");
     };
     args.last

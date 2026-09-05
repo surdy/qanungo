@@ -697,7 +697,12 @@ mod tests {
 
         fn from_str(value: &str) -> Result<Self, Self::Err> {
             let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from([
-                "qanungo", "doctor", "--last", value,
+                "qanungo",
+                "doctor",
+                "--patwari-url",
+                "http://127.0.0.1:8080",
+                "--last",
+                value,
             ])
             .map_err(|error| error.to_string())?;
             let crate::cli::Command::Doctor(args) = parsed.command else {

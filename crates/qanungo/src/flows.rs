@@ -823,7 +823,7 @@ mod tests {
             session(
                 'b',
                 "2026-08-21T10:00:00Z",
-                Some("surdy/quadhost"),
+                Some("alice/homelab"),
                 &[&second],
             ),
         ];
@@ -839,7 +839,7 @@ mod tests {
         // And both are listed in the coverage section, with the bucket last.
         assert_eq!(found.repositories.len(), 2);
         assert_eq!(found.repositories[1].repository, NO_REPOSITORY);
-        assert_eq!(found.repositories[0].repository, "surdy/quadhost");
+        assert_eq!(found.repositories[0].repository, "alice/homelab");
         assert_eq!(found.repositories[0].clusterable, 1);
     }
 

@@ -848,13 +848,13 @@ mod tests {
             session(
                 'a',
                 "2026-08-20T10:00:00Z",
-                Some("surdy/quadhost"),
+                Some("alice/homelab"),
                 &conversation,
             ),
             session(
                 'b',
                 "2026-08-20T10:01:00Z",
-                Some("surdy/quadhost"),
+                Some("alice/homelab"),
                 &conversation,
             ),
         ];
@@ -879,13 +879,13 @@ mod tests {
             session(
                 'a',
                 "2026-08-20T10:00:00Z",
-                Some("surdy/quadhost"),
+                Some("alice/homelab"),
                 &conversation,
             ),
             session(
                 'b',
                 "2026-08-21T10:00:00Z",
-                Some("surdy/quadhost"),
+                Some("alice/homelab"),
                 &[
                     conversation[0],
                     "Something else entirely about the podman socket and the quadlet unit files",

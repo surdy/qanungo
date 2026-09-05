@@ -649,8 +649,15 @@ mod tests {
     use crate::format::INVALID_IDENTIFIER;
 
     fn window(spelling: &str) -> Window {
-        let crate::cli::Command::Cost(args) =
-            crate::cli::Cli::parse_from(["qanungo", "cost", "--last", spelling]).command
+        let crate::cli::Command::Cost(args) = crate::cli::Cli::parse_from([
+            "qanungo",
+            "cost",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            spelling,
+        ])
+        .command
         else {
             panic!("the cost subcommand parses");
         };

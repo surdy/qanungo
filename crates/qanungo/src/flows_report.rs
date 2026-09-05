@@ -929,7 +929,12 @@ mod tests {
     /// A [`Window`] the tests can build without going through clap by hand.
     fn window(value: &str) -> Window {
         let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from([
-            "qanungo", "flows", "--last", value,
+            "qanungo",
+            "flows",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            value,
         ])
         .expect("a window this lane accepts");
         let crate::cli::Command::Flows(args) = parsed.command else {

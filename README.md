@@ -6,6 +6,22 @@ qanungo is the read-side analysis client designed and deferred in munshi [ADR 00
 
 Lineage: **munshi** (the scribe) → **patwari** (the record-keeper) → **qanungo** (the auditor who reviews the records).
 
+## Trust and authentication
+
+**There is no authentication anywhere in this suite, and that is a design decision rather than an oversight.** qanungo talks to patwari with no credential because patwari has none to ask for: this was built as one person's private tooling for their own LAN and tailnet, where every client that can reach the archive is already trusted. The dashboard is unauthenticated for the same reason and refuses nobody — anyone who can open the port sees everything it serves — so bind it to loopback (the default, `127.0.0.1:8878`) or to a private network only, never to the open internet; on a non-loopback bind it prints a startup line saying out loud that nothing authenticates a caller and the network is therefore the only boundary. Redaction is on by default on every surface that renders archived text, and turning it off is a launch-time flag that announces itself. Anyone is welcome to take this suite and adapt it — if you need real multi-user access control, that is yours to add, and nothing here pretends to have it.
+
+## Install
+
+qanungo builds with a Rust 1.85+ toolchain (edition 2024) and reads a patwari archive over HTTP. There is **no default archive**: `--patwari-url` is required on every command, and it also reads the `PATWARI_URL` environment variable, so set it once in your shell.
+
+```sh
+cargo build --release
+export PATWARI_URL=https://patwari.example.net   # your own archive's base URL
+cargo run -- report --last 30d
+```
+
+How that archive gets served is yours to decide — a host on your own network, a container, a reverse proxy in front of it; qanungo needs only the base URL and unauthenticated read access to it. Exporting `PATWARI_URL` is also what makes the skills in `contrib/skills/` work, since they call the commands with no URL flag of their own.
+
 ## Where it sits
 
 ```
@@ -156,8 +172,11 @@ which serves unredacted blobs; a hash is what you take to your own shell. Loopba
 `--bind` on a tailnet address is how a phone reads it, and startup prints one line saying that
 nothing authenticates a caller and the tailnet is therefore the only boundary.
 
+Every line below assumes `PATWARI_URL` is already exported (see [Install](#install)); without it, or
+without `--patwari-url`, a command stops and says so rather than guessing at an archive.
+
 ```sh
-cargo run -- report --last 30d                       # the production archive on the LAN
+cargo run -- report --last 30d                       # your archive, from PATWARI_URL
 cargo run -- report --last 7d --patwari-url http://127.0.0.1:8080
 cargo run -- cost --last 12w                         # a quarter, in the units the grammar has
 cargo run -- standup --last 7d                       # a week you can read to the end of
@@ -169,7 +188,7 @@ cargo run -- doctor --last 4w                        # or narrow it, on the same
 cargo run -- doctor --clusters-per-repo 50           # and read the clusters the default cut hides
 cargo run -- flows                                   # what do I keep asking for, anywhere
 cargo run -- flows --clusters 50 --flows 40          # each section's cut is a default, not a ceiling
-cargo run -- dashboard --bind 100.64.0.7:8878        # the tailnet, unauthenticated, and it says so
+cargo run -- dashboard --bind 192.0.2.10:8878        # a routable address on your private network, unauthenticated, and it says so
 ```
 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
@@ -183,7 +202,9 @@ clamped: a warm three-lane refresh measures about **13 s** against the productio
 snapshot index cut it from ~45 s), and polling near that is load on a LAN archive rather than a
 fresher page.
 
-`--patwari-url` also reads `PATWARI_URL`; `--cache-dir` overrides the cache root — the blob cache
+`--patwari-url` is **required** — there is no built-in archive to fall back on — and it also reads
+`PATWARI_URL`, so set that once in your shell and no lane needs the flag again; `--cache-dir`
+overrides the cache root — the blob cache
 plus the snapshot index beside it — which otherwise lives in `$XDG_CACHE_HOME/qanungo` (falling
 back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both
 flags work on every lane. The coaching report renders **aggregates, tool names, and content hashes
@@ -268,3 +289,7 @@ hardcoded Rust rules stand until a second rule-author exists. Full
 research + rationale:
 `~/repos/research/ai-coach/`. See
 issues for the phased plan.
+
+## License
+
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.

@@ -2083,8 +2083,15 @@ mod tests {
     }
 
     fn window(spelling: &str) -> Window {
-        let Command::Dashboard(args) =
-            Cli::parse_from(["qanungo", "dashboard", "--last", spelling]).command
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--last",
+            spelling,
+        ])
+        .command
         else {
             panic!("`dashboard` parses as the dashboard command");
         };
@@ -2092,7 +2099,14 @@ mod tests {
     }
 
     fn refresh() -> Refresh {
-        let Command::Dashboard(args) = Cli::parse_from(["qanungo", "dashboard"]).command else {
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+        ])
+        .command
+        else {
             panic!("`dashboard` parses as the dashboard command");
         };
         args.refresh
@@ -2197,8 +2211,15 @@ mod tests {
     }
 
     fn cost_window(spelling: &str) -> Window {
-        let Command::Dashboard(args) =
-            Cli::parse_from(["qanungo", "dashboard", "--cost-last", spelling]).command
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--cost-last",
+            spelling,
+        ])
+        .command
         else {
             panic!("`dashboard` parses as the dashboard command");
         };
@@ -2206,8 +2227,15 @@ mod tests {
     }
 
     fn standup_window(spelling: &str) -> Window {
-        let Command::Dashboard(args) =
-            Cli::parse_from(["qanungo", "dashboard", "--standup-last", spelling]).command
+        let Command::Dashboard(args) = Cli::parse_from([
+            "qanungo",
+            "dashboard",
+            "--patwari-url",
+            "http://127.0.0.1:8080",
+            "--standup-last",
+            spelling,
+        ])
+        .command
         else {
             panic!("`dashboard` parses as the dashboard command");
         };

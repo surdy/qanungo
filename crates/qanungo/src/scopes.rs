@@ -548,13 +548,13 @@ mod tests {
             &folded,
             &Redactor::new(),
             [
-                "quadhost".to_owned(),
+                "workstation".to_owned(),
                 // Already present: the union must not double it.
                 "macbookpro".to_owned(),
             ],
         );
         let labels: Vec<&str> = scopes.iter().map(|scope| scope.label.as_str()).collect();
-        assert_eq!(labels, vec!["macbookpro", "quadhost"]);
+        assert_eq!(labels, vec!["macbookpro", "workstation"]);
         assert!(scopes[1].sessions.is_empty());
         let card = Scorecard::fold_refs(&scopes[1].sessions);
         assert!(card.harnesses.is_empty());

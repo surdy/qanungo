@@ -2228,7 +2228,7 @@ mod tests {
             "AKIAFAKEFAKEFAKE1234567890 is not a key id, it is too long",
             "ghp_short",
             "ssh://git@github.com/surdy/munshi.git",
-            "https://patwari.clusterfault.com/v1/sessions",
+            "https://patwari.example.net/v1/sessions",
             "the secret sauce is that it does nothing clever",
             "credential helper: osxkeychain",
             "AIzaSHORT",

@@ -1,5 +1,6 @@
-# `munshi-transcript` is pulled from the private `surdy/munshi` repository. Cargo's built-in
-# git transport has no access to the developer's ssh agent or `~/.ssh/config`, so fetches go
-# through the system `git` binary, which does.
+# `munshi-transcript` is a git dependency rather than a crates.io one. Cargo's built-in git
+# transport cannot see the developer's credential helper, ssh agent, or `~/.ssh/config`, so fetches
+# go through the system `git` binary, which can — which is what any access-controlled checkout of
+# munshi needs.
 [net]
 git-fetch-with-cli = true
