@@ -300,6 +300,8 @@ impl Lane {
                 key: signal.key(),
                 label: signal.label(),
                 denominator: signal.denominator(),
+                reads: signal.reads(),
+                anchor: signal.anchor(self),
             })
             .collect()
     }
@@ -316,6 +318,17 @@ pub struct LaneComponent {
     pub label: &'static str,
     /// Which sessions (or calls) the reading is *of*, said in words.
     pub denominator: String,
+    /// The component in the words a one-line hint uses — "retry-loop fire rate", "tool error
+    /// rate". A shorter register than [`LaneComponent::label`], which is a heading over a
+    /// reading; this is a clause in a sentence about what moves a lane.
+    pub reads: String,
+    /// Where the generated catalogue documents this component: the rule's own section for a fire
+    /// rate, and the lane's own row for the pooled tool error rate, which no single rule owns.
+    ///
+    /// A field rather than something a reader derives from [`LaneComponent::key`], because the
+    /// grammar of that key (`fire-rate:<rule>`) is the rule pack's business and a second parser
+    /// for it elsewhere would be a second thing to keep in step with the digest.
+    pub anchor: String,
 }
 
 /// Which sessions a rule's fire rate is *of*, said in words.
@@ -354,6 +367,26 @@ impl Signal {
         match self {
             Self::PooledToolErrorRate => "Tool error rate",
             Self::FireRate(rule) => rule.title(),
+        }
+    }
+
+    /// The component in the words a lane hint uses. Deliberately the *rule key* rather than the
+    /// rule title: a hint sits beside a link to that rule's section in the catalogue, and naming
+    /// the thing the link lands on is what makes the pair readable.
+    fn reads(self) -> String {
+        match self {
+            Self::PooledToolErrorRate => "tool error rate".to_owned(),
+            Self::FireRate(rule) => format!("{} fire rate", rule.key()),
+        }
+    }
+
+    /// Where the catalogue documents this component: the rule's section, or — for the pooled tool
+    /// error rate, which is a lane's own reading rather than any rule's — the lane's row in the
+    /// lane table.
+    fn anchor(self, lane: Lane) -> String {
+        match self {
+            Self::PooledToolErrorRate => format!("lane-{}", lane.key()),
+            Self::FireRate(rule) => rule.key().to_owned(),
         }
     }
 

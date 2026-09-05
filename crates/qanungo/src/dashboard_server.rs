@@ -4,8 +4,27 @@
 //! It is the server counterpart of this crate's minimal HTTP client (munshi ADR 0006) and mirrors
 //! munshi-dashboard's shape deliberately: one request per connection, `Connection: close`, an
 //! explicit `Content-Length`, no keep-alive bookkeeping, an embedded single-file page, and no state
-//! of its own on disk. Five routes exist — the page, the JSON snapshot, the event stream, one
-//! evidence excerpt, and one ranked search — and everything else is 404.
+//! of its own on disk. Six routes exist — the page, the rule catalogue, the JSON snapshot, the
+//! event stream, one evidence excerpt, and one ranked search — and everything else is 404.
+//!
+//! # The catalogue route, and why it is the cheapest one here
+//!
+//! `GET /rules` serves [`crate::catalogue::render_html`] — the same document `qanungo rules` prints
+//! and `RULES.md` is pinned to, as a self-contained page. It is the only route that **reads
+//! nothing**: no archive, no cache, no payload, not even the redactor. The catalogue describes the
+//! *build*, so the bytes it serves are fixed the moment the binary is compiled, which is why it can
+//! be rendered once at startup and handed out as a `&'static str` for the life of the process.
+//!
+//! It exists because every rule id on the dashboard was, until it, a string a reader had to take to
+//! a terminal. A finding names `retry-loop`; the lane tile beside it says the lane reads
+//! `retry-loop`'s fire rate; and the one document that says what that means shipped in the
+//! repository rather than on the surface that cites it. The page now links both at
+//! `/rules#<rule key>`, which makes the catalogue's anchors part of the contract — see
+//! [`crate::catalogue::render_html`].
+//!
+//! **It is not an exception to anything.** It carries no transcript byte, no archive-written
+//! string, and no per-request behaviour: two readers on the same build get identical bytes, and a
+//! query string on it is discarded like every other route's but the search.
 //!
 //! # The excerpt route, and the three things that bound it
 //!
@@ -98,7 +117,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -108,7 +127,8 @@ use thiserror::Error;
 
 use crate::ask::Query;
 use crate::cache::{self, BlobCache};
-use crate::cli::{ArchiveArgs, DashboardArgs, Refresh};
+use crate::catalogue;
+use crate::cli::{ArchiveArgs, DashboardArgs, Refresh, Window};
 use crate::command::{self, CommandError, Folded};
 use crate::dashboard::{self, Payload, Refreshed, Windows};
 use crate::evidence::{self, EvidenceIndex};
@@ -121,6 +141,18 @@ use crate::report::stamp;
 /// The single-file page, embedded so the binary is the whole deployment. No asset route exists,
 /// and none can be added without also inventing a filesystem the server reads from.
 const PAGE: &str = include_str!("../assets/dashboard.html");
+
+/// The rule catalogue as a page, rendered once and served as bytes for the life of the process.
+///
+/// [`catalogue::render_html`] reads no clock, no environment, and no archive, so its output is a
+/// property of the build rather than of the run — rendering it per request would spend a few
+/// hundred microseconds of somebody's CPU to produce bytes that cannot have changed.
+static RULES_PAGE: OnceLock<String> = OnceLock::new();
+
+/// The rendered catalogue, rendering it on the first request that asks for it.
+fn rules_page() -> &'static str {
+    RULES_PAGE.get_or_init(catalogue::render_html)
+}
 
 /// Ceiling on a request head. The server reads a request line and discards the headers, so a peer
 /// that never sends the terminator cannot grow this buffer beyond one small allocation.
@@ -246,6 +278,7 @@ impl Dashboard {
 
         let windows = Windows {
             coaching: args.last.clone(),
+            trio: args.window_trio(),
             cost: args.cost_last.clone(),
             standup: args.standup_last.clone(),
         };
@@ -531,17 +564,46 @@ fn fold_and_publish(
     refreshed: Refreshed,
     redactor: &Redactor,
 ) -> Result<Served, CommandError> {
+    let trio: Vec<String> = windows.trio.iter().map(Window::to_string).collect();
     eprintln!(
-        "qanungo dashboard: folding four lanes from {} — coaching {} (and the window before it), \
-         cost {} (and the window before it), standup {}, ask all history",
-        archive.patwari_url, windows.coaching, windows.cost, windows.standup,
+        "qanungo dashboard: folding four lanes from {} — coaching {} (each with the window before \
+         it, opening on {}), cost {} (and the window before it), standup {}, ask all history",
+        archive.patwari_url,
+        trio.join(" / "),
+        windows.coaching,
+        windows.cost,
+        windows.standup,
     );
     let started = Instant::now();
-    let coaching = command::fold_coaching(archive, &windows.coaching, redactor)?;
-    eprintln!(
-        "qanungo dashboard: coaching — {}",
-        instrumentation_line(&coaching)
-    );
+    // One mirror and one pass over each transcript for the whole trio: the widest window's pair is
+    // a superset of the other two's, so the narrow windows are cut out of the same folded metrics
+    // rather than re-read. See [`command::fold_coaching_windows`].
+    let coaching_views: Vec<(Window, Folded)> = windows
+        .trio
+        .iter()
+        .cloned()
+        .zip(command::fold_coaching_windows(
+            archive,
+            &windows.trio,
+            redactor,
+        )?)
+        .collect();
+    // The window `--last` named, and therefore the one the document's top level is built from.
+    // It is in the trio by construction: `--last` is parsed by `parse_dashboard_window`, which
+    // refuses every spelling outside `DASHBOARD_WINDOWS`, and the trio is that same list parsed.
+    // A build that reached here without it would be serving a page whose own selector could not
+    // get back to what it was showing, which is not a state worth carrying a fallback for.
+    let coaching = coaching_views
+        .iter()
+        .find(|(window, _)| *window == windows.coaching)
+        .map(|(_, folded)| folded)
+        .expect("the selected window is one of the pre-folded trio");
+    for (window, folded) in &coaching_views {
+        eprintln!(
+            "qanungo dashboard: coaching {window} — {}",
+            instrumentation_line(folded)
+        );
+    }
     let cost = command::fold_cost(archive, &windows.cost, redactor)?;
     eprintln!(
         "qanungo dashboard: cost — sync {} · fold {} · {} sessions (+{} comparison) · {} records \
@@ -601,12 +663,16 @@ fn fold_and_publish(
         fleet.mirror.usage.files,
     );
 
-    let evidence = dashboard::evidence_index(&coaching);
+    // Every window the payload names, not just the selected one: a reader on `90d` is looking at
+    // findings this document shipped, and an evidence control that 404'd there would be the page
+    // offering something this process refused. See [`dashboard::evidence_index_over`].
+    let evidence = dashboard::evidence_index_over(coaching_views.iter().map(|(_, folded)| folded));
     let body = serde_json::to_vec(
         &Payload {
             windows,
             refresh,
-            coaching: &coaching,
+            coaching,
+            coaching_views: &coaching_views,
             cost: &cost,
             standup: &standup,
             fleet: &fleet,
@@ -882,6 +948,15 @@ fn handle(mut stream: TcpStream, service: &Service) {
                 "200 OK",
                 "text/html; charset=utf-8",
                 PAGE.as_bytes(),
+            );
+        }
+        Route::Rules => {
+            eprintln!("qanungo dashboard: {peer} - {request} 200");
+            let _ = write_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                rules_page().as_bytes(),
             );
         }
         Route::Data => {
@@ -1218,11 +1293,13 @@ fn logged_request(method: &str, target: &str) -> String {
     request
 }
 
-/// Which of the five routes a request is for.
+/// Which of the six routes a request is for.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
     /// The embedded page.
     Page,
+    /// The rule catalogue, rendered from this build's own constants. Reads nothing.
+    Rules,
     /// The JSON payload.
     Data,
     /// The refresh event stream.
@@ -1267,7 +1344,7 @@ enum AskRequest {
 ///
 /// # The one route whose query string is its argument
 ///
-/// For four of the five, the query string decides nothing and is discarded before anything else
+/// For five of the six, the query string decides nothing and is discarded before anything else
 /// happens. `/api/ask` is the exception and is bounded in the same breath as it is read: `q` capped
 /// and `limit` clamped by [`ask_route`], every other parameter ignored. What has not changed is the
 /// thing that sentence was ever protecting — **no parameter on this surface selects a redaction
@@ -1283,6 +1360,7 @@ fn route(method: &str, target: &str) -> Route {
     };
     match path {
         "/" | "/index.html" => Route::Page,
+        "/rules" => Route::Rules,
         "/api/data" => Route::Data,
         "/api/events" => Route::Events,
         "/api/ask" => Route::Ask(ask_route(query)),
@@ -1489,9 +1567,10 @@ mod tests {
     }
 
     #[test]
-    fn the_five_routes_are_the_only_routes() {
+    fn the_six_routes_are_the_only_routes() {
         assert_eq!(route("GET", "/"), Route::Page);
         assert_eq!(route("GET", "/index.html"), Route::Page);
+        assert_eq!(route("GET", "/rules"), Route::Rules);
         assert_eq!(route("GET", "/api/data"), Route::Data);
         assert_eq!(route("GET", "/api/events"), Route::Events);
         assert_eq!(
@@ -1521,12 +1600,19 @@ mod tests {
             // under it is not a narrower search, it is not this route.
             "/api/ask/",
             "/api/ask/redaction",
+            // And the catalogue is one exact path too: no directory under it, and no `.md`
+            // alternative, because there is no filesystem behind this route to offer one from.
+            "/rules/",
+            "/rules.md",
+            "/RULES.md",
         ] {
             assert_eq!(route("GET", target), Route::NotFound, "{target}");
         }
         for method in ["POST", "PUT", "DELETE", "HEAD", "get"] {
             assert_eq!(route(method, "/api/ask?q=x"), Route::NotFound, "{method}");
         }
+        // The catalogue's query string decides nothing, like every route's but the search's.
+        assert_eq!(route("GET", "/rules?redact=off"), Route::Rules);
     }
 
     /// The evidence target is a grammar, not a suggestion. Everything here is refused *at the
@@ -1973,7 +2059,7 @@ mod tests {
     }
 
     /// A guard that the embedded asset is the page this server thinks it is serving, and that the
-    /// page has no way to reach anything but this server's own three routes.
+    /// page has no way to reach anything but this server's own routes.
     #[test]
     fn the_embedded_page_talks_only_to_this_servers_routes() {
         assert!(PAGE.contains("/api/data"), "the page fetches the payload");
@@ -1982,22 +2068,35 @@ mod tests {
             "the page subscribes to refreshes"
         );
         assert!(PAGE.contains("/api/ask?q="), "the page can search");
-        // The three sections the payload feeds, each fed from its own key rather than from a
-        // second fetch: one document, one generation, and no route added to serve a section.
-        for section in ["data.cost", "data.standup", "data.lanes", "data.findings"] {
+        // The sections the payload feeds, each fed from its own key rather than from a second
+        // fetch: one document, one generation, and no route added to serve a section. The four a
+        // coaching *window* owns are read off the selected view — `windowView`, which is the
+        // document itself for the window the dashboard was launched on.
+        for section in ["data.cost", "data.standup", "view.lanes", "view.findings"] {
             assert!(PAGE.contains(section), "the page renders {section}");
         }
         assert_eq!(
             PAGE.matches("fetch(").count(),
             3,
-            "the payload, one excerpt at a time, and one search — and nothing else",
+            "the payload, one excerpt at a time, and one search — and nothing else: neither the \
+             scope control nor the window control adds a request",
+        );
+
+        // **The one destination this page may link to.** Every `href` is built by `ruleLink`, and
+        // `ruleLink` builds one shape: `/rules#<key>`, this server's own catalogue, which reads no
+        // archive and carries no transcript byte. There is still no link into Patwari, which
+        // serves unredacted blobs — the refusal the 2026-08-24 grilling made, unchanged.
+        assert_eq!(
+            PAGE.matches(".href =").count(),
+            1,
+            "one assignment to an href in the whole file, and it is `ruleLink`'s",
         );
         assert!(
-            !PAGE.contains("href"),
-            "the page carries no links at all — least of all into Patwari, which serves \
-             unredacted blobs",
+            PAGE.contains(
+                r#"node.href = anchor ? "/rules#" + encodeURIComponent(anchor) : "/rules";"#
+            ),
+            "the page's only link is built here",
         );
-        assert!(!PAGE.contains("<a "), "the page carries no anchors");
         assert!(
             !PAGE.contains("innerHTML"),
             "every value from the payload is set as text, never parsed as markup",
@@ -2006,6 +2105,51 @@ mod tests {
             !PAGE.contains("//fonts.") && !PAGE.contains("http://") && !PAGE.contains("https://"),
             "the page loads nothing from anywhere",
         );
+    }
+
+    /// The catalogue route serves a page, reads nothing, and carries the anchors the dashboard
+    /// links at.
+    ///
+    /// The anchors are the contract between two files: the page writes `/rules#<rule key>` beside
+    /// every finding and `/rules#<lane key or rule key>` under every lane tile, and this is where
+    /// a rule that lost its heading — or a lane that lost its table row — stops being a link that
+    /// silently lands nowhere.
+    #[test]
+    fn the_catalogue_page_carries_an_anchor_for_every_rule_and_lane() {
+        let page = rules_page();
+        assert!(page.starts_with("<!doctype html>"), "a whole page");
+        assert!(page.contains("<title>"), "a titled page");
+        // Self-contained: the same rule the dashboard page holds, for the same reason — there is
+        // no asset route to load anything from, and nothing on this surface reaches the network.
+        assert!(
+            !page.contains("http://") && !page.contains("https://") && !page.contains("//fonts."),
+            "the catalogue loads nothing from anywhere",
+        );
+        assert_eq!(
+            page.matches("href").count(),
+            1,
+            "one link, back to the dashboard",
+        );
+        assert!(page.contains(r#"href="/""#), "and it goes to the page");
+
+        for rule in crate::rules::RuleId::ALL {
+            let anchor = format!("id=\"{}\"", rule.key());
+            assert!(page.contains(&anchor), "no anchor for rule {}", rule.key());
+        }
+        for lane in crate::scoring::Lane::ALL {
+            let anchor = format!("id=\"lane-{}\"", lane.key());
+            assert!(page.contains(&anchor), "no anchor for lane {}", lane.key());
+            // And every component a lane tile will link at resolves to one of those two shapes.
+            for component in lane.components() {
+                let anchor = format!("id=\"{}\"", component.anchor);
+                assert!(
+                    page.contains(&anchor),
+                    "{} reads {} and nothing on the page has that id",
+                    lane.key(),
+                    component.anchor,
+                );
+            }
+        }
     }
 
     /// A published payload replaces the previous one whole, and a stream waiting on the old

@@ -606,3 +606,362 @@ fn footer(out: &mut String) {
          document changing with it.",
     );
 }
+
+/// The same catalogue as a self-contained HTML page, for the dashboard's `/rules` route.
+///
+/// # Why a converter and not a second renderer
+///
+/// The argument this module opens with — nothing is typed twice — applies to the page as hard as
+/// it applies to the Markdown. So this is a *converter over [`render`]'s own output*, not a second
+/// walk over the rules: there is exactly one description of what this build looks for, and the page
+/// is a rendering of it. A rule that changed its threshold changes `RULES.md` and this page in the
+/// same edit, and there is no third place for a number to go stale.
+///
+/// # What the converter handles, and nothing more
+///
+/// The subset [`render`] actually emits: `#`/`##`/`###` headings, pipe tables with a `| --- |`
+/// separator, `- ` bullet lists, a fenced ```` ``` ```` block, a `---` rule, paragraphs, and the
+/// three inline forms `**bold**`, `*emphasis*` and `` `code` ``. It is not a Markdown
+/// implementation and must not become one — a construct the catalogue does not emit is a construct
+/// this has no business guessing at, and `catalogue_html_is_the_catalogue` fails if the two ever
+/// come apart on the text.
+///
+/// **Every archive-written byte is absent by construction.** The catalogue reads no archive
+/// ([`render`]'s own guarantee), so the only strings on this page are this build's own constants
+/// and prose — which is why the route that serves it needs no redactor and reaches no fold. Text is
+/// nevertheless escaped on the way in, because a page assembled by string concatenation should not
+/// depend on a promise about its inputs to be well-formed.
+///
+/// # The anchors, and why they are derived rather than listed
+///
+/// Every rule heading carries `id="<rule key>"` and every lane's row carries `id="lane-<lane key>"`,
+/// because the dashboard links a finding and a lane hint straight at them. Both are found from the
+/// data rather than from a list kept here: a heading's id is the code span the heading ends with —
+/// which is how [`rules`] writes a rule's key — and a lane row is a table row whose key cell is one
+/// of [`Lane::ALL`]'s keys. A rule or lane added upstream therefore arrives with its anchor already
+/// working, and `every_rule_and_lane_has_an_anchor` is the gate that says so.
+#[must_use]
+pub fn render_html() -> String {
+    let markdown = render();
+    let mut out = String::with_capacity(markdown.len() * 2);
+    out.push_str(PAGE_HEAD);
+    to_html(&markdown, &mut out);
+    out.push_str(PAGE_FOOT);
+    out
+}
+
+/// The page around the catalogue. Self-contained: no asset route exists to load anything from, and
+/// the colour roles are the dashboard's own so the two pages are one surface in either theme.
+const PAGE_HEAD: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>qanungo — what this build looks for</title>
+<style>
+:root {
+  color-scheme: light;
+  --plane: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --ink-muted: #898781;
+  --rule: #e1e0d9;
+  --border: rgba(11, 11, 11, 0.10);
+  --link: #1a4f9c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --plane: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --ink-muted: #898781;
+    --rule: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.10);
+    --link: #7fb2ff;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: clamp(1rem, 3vw, 3rem);
+  background: var(--plane);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: clamp(15px, 0.45vw + 13px, 22px);
+  line-height: 1.55;
+}
+main { max-width: 90ch; margin: 0 auto; }
+a { color: var(--link); }
+h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 0.6rem; }
+h2 {
+  font-size: 1.35rem;
+  margin: 2.4rem 0 0.6rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+}
+h3 { font-size: 1.05rem; margin: 1.6rem 0 0.5rem; }
+h2:target, h3:target, tr:target > * { background: var(--surface); outline: 2px solid var(--link); }
+p { margin: 0 0 0.8rem; }
+ul { margin: 0 0 0.9rem; padding-left: 1.2rem; }
+li { margin: 0 0 0.35rem; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+}
+pre {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.8rem 1rem;
+  overflow-x: auto;
+}
+pre code { background: none; border: 0; padding: 0; }
+.scroll { overflow-x: auto; margin: 0 0 1rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92em; }
+th, td {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+th { color: var(--ink-2); font-weight: 600; }
+.back { display: inline-block; margin-bottom: 1.4rem; color: var(--link); }
+</style>
+</head>
+<body>
+<main>
+<a class="back" href="/">← back to the dashboard</a>
+"#;
+
+const PAGE_FOOT: &str = "</main>\n</body>\n</html>\n";
+
+/// The catalogue's Markdown as HTML. See [`render_html`] for the subset and the anchor rules.
+fn to_html(markdown: &str, out: &mut String) {
+    let lane_keys: Vec<&str> = Lane::ALL.iter().map(|lane| lane.key()).collect();
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim().is_empty() {
+            index += 1;
+        } else if line.starts_with("```") {
+            index = fenced(&lines, index, out);
+        } else if line.starts_with('#') {
+            heading(line, out);
+            index += 1;
+        } else if line.trim_end() == "---" {
+            out.push_str("<hr>\n");
+            index += 1;
+        } else if line.starts_with("| ") {
+            index = table(&lines, index, &lane_keys, out);
+        } else if line.starts_with("- ") {
+            index = bullets(&lines, index, out);
+        } else {
+            index = paragraph(&lines, index, out);
+        }
+    }
+}
+
+/// `#`, `##`, `###` — with the id the dashboard links at. See [`render_html`]'s anchor rules.
+fn heading(line: &str, out: &mut String) {
+    let level = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    let level = level.min(6);
+    let text = line[level..].trim();
+    let id = heading_id(text);
+    let _ = write!(out, "<h{level} id=\"{}\">", escape(&id));
+    inline(text, out);
+    let _ = writeln!(out, "</h{level}>");
+}
+
+/// A heading's anchor: the code span it ends with — which is how [`rules`] writes a rule's key —
+/// and otherwise a slug of its words.
+fn heading_id(text: &str) -> String {
+    if let Some(key) = text.strip_suffix('`').and_then(|rest| {
+        rest.rfind('`')
+            .map(|at| rest[at + 1..].to_owned())
+            .filter(|key| !key.is_empty())
+    }) {
+        return key;
+    }
+    let mut id = String::new();
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() {
+            id.extend(character.to_lowercase());
+        } else if character.is_whitespace() && !id.ends_with('-') && !id.is_empty() {
+            id.push('-');
+        }
+    }
+    id.trim_end_matches('-').to_owned()
+}
+
+/// A fenced block, verbatim. Returns the index of the line after the closing fence.
+fn fenced(lines: &[&str], start: usize, out: &mut String) -> usize {
+    out.push_str("<pre><code>");
+    let mut index = start + 1;
+    while index < lines.len() && !lines[index].starts_with("```") {
+        out.push_str(&escape(lines[index]));
+        out.push('\n');
+        index += 1;
+    }
+    out.push_str("</code></pre>\n");
+    index + 1
+}
+
+/// A pipe table with its `| --- |` separator, wrapped in a horizontal scroller so a wide row never
+/// makes the page itself scroll sideways. Returns the index of the line after the table.
+fn table(lines: &[&str], start: usize, lane_keys: &[&str], out: &mut String) -> usize {
+    out.push_str("<div class=\"scroll\">\n<table>\n");
+    let mut index = start;
+    let mut row = 0;
+    while index < lines.len() && lines[index].starts_with("| ") {
+        let cells = row_cells(lines[index]);
+        index += 1;
+        if cells.iter().all(|cell| cell.chars().all(|c| c == '-')) {
+            continue;
+        }
+        let tag = if row == 0 { "th" } else { "td" };
+        match lane_row_id(&cells, lane_keys) {
+            Some(id) => {
+                let _ = write!(out, "<tr id=\"lane-{}\">", escape(&id));
+            }
+            None => out.push_str("<tr>"),
+        }
+        for cell in &cells {
+            let _ = write!(out, "<{tag}>");
+            inline(cell, out);
+            let _ = write!(out, "</{tag}>");
+        }
+        out.push_str("</tr>\n");
+        row += 1;
+    }
+    out.push_str("</table>\n</div>\n");
+    index
+}
+
+/// One row's cells, trimmed. The catalogue writes no escaped pipe, so a split is the whole parse.
+fn row_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_owned())
+        .collect()
+}
+
+/// The lane a table row is *about*, when it is a row of the lane table: its second cell is that
+/// lane's key in a code span. Continuation rows leave that cell empty and get no id, which is what
+/// puts the anchor on the lane's first row and nowhere else.
+fn lane_row_id(cells: &[String], lane_keys: &[&str]) -> Option<String> {
+    let key = cells.get(1)?.strip_prefix('`')?.strip_suffix('`')?;
+    lane_keys.contains(&key).then(|| key.to_owned())
+}
+
+/// A run of `- ` bullets. Returns the index of the line after the list.
+fn bullets(lines: &[&str], start: usize, out: &mut String) -> usize {
+    out.push_str("<ul>\n");
+    let mut index = start;
+    while index < lines.len() && lines[index].starts_with("- ") {
+        out.push_str("<li>");
+        inline(&lines[index][2..], out);
+        out.push_str("</li>\n");
+        index += 1;
+    }
+    out.push_str("</ul>\n");
+    index
+}
+
+/// A paragraph: every line up to the next blank one or the next block opener.
+fn paragraph(lines: &[&str], start: usize, out: &mut String) -> usize {
+    let mut index = start;
+    let mut text = String::new();
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim().is_empty()
+            || line.starts_with('#')
+            || line.starts_with("- ")
+            || line.starts_with("| ")
+            || line.starts_with("```")
+            || line.trim_end() == "---"
+        {
+            break;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(line.trim());
+        index += 1;
+    }
+    out.push_str("<p>");
+    inline(&text, out);
+    out.push_str("</p>\n");
+    index
+}
+
+/// `**bold**`, `*emphasis*` and `` `code` ``, over already-escaped text.
+///
+/// Code spans are cut out **first** and their contents are escaped and nothing else, so a `*` or a
+/// `**` inside one is a character rather than markup — which matters here, where the code spans are
+/// constant names and price expressions.
+fn inline(text: &str, out: &mut String) {
+    for (index, part) in text.split('`').enumerate() {
+        if index % 2 == 1 {
+            let _ = write!(out, "<code>{}</code>", escape(part));
+        } else {
+            out.push_str(&emphasis(&escape(part)));
+        }
+    }
+}
+
+/// `**` then `*`, in that order, over escaped text. Unpaired markers are left as characters.
+fn emphasis(escaped: &str) -> String {
+    wrap(&wrap(escaped, "**", "strong"), "*", "em")
+}
+
+/// Pairs of `marker` become `<tag>`; an odd trailing marker stays a character.
+fn wrap(text: &str, marker: &str, tag: &str) -> String {
+    let parts: Vec<&str> = text.split(marker).collect();
+    if parts.len() < 3 {
+        return text.to_owned();
+    }
+    let pairs = (parts.len() - 1) / 2;
+    let mut out = String::with_capacity(text.len());
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            if index <= pairs * 2 {
+                let _ = write!(out, "<{}{tag}>", if index % 2 == 1 { "" } else { "/" });
+            } else {
+                out.push_str(marker);
+            }
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// The four characters that could turn text into markup.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}

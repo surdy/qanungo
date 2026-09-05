@@ -143,6 +143,40 @@
 //! cannot check, and the whole argument for scopes is that a reader can ask a narrower question and
 //! still see what answered it.
 //!
+//! ## What the window trio added, measured
+//!
+//! The trio (qanungo #X3) is the **most expensive thing on this wire**, and the honest way to say
+//! so is with the number rather than with a hedge. Measured on `tests/dashboard.rs`'s
+//! `three_lane_archive` — six sessions, all four lanes fed — the payload is **89,345 B with the
+//! trio against 36,933 B without it: +52,412 B, +141.9%**, of which the `windows` section is 58.7%
+//! of the whole body. On the `windowed_archive` fixture, whose five sessions are spread over 120
+//! days so the three windows genuinely differ, it is **77,213 B against 28,985 B — +48,228 B,
+//! +166.4%**, with the `7d` view 17,872 B and the `90d` view 30,275 B.
+//!
+//! Those percentages are the fixtures' shape and not the archive's, and the difference matters. A
+//! fixture payload is almost entirely coaching: it has six sessions of narrative where production
+//! has a hundred, so the section the trio triples is nearly all of it. Against production the
+//! standup section alone was 71% of the body and the four window-owned sections together were
+//! roughly 30%, so the same change lands near **+60–70%** there rather than +140%. It is still the
+//! largest single addition this payload has taken, and the reason it is worth it is decision 11:
+//! the alternative is not a smaller payload, it is a fold behind a request an unauthenticated peer
+//! controls.
+//!
+//! Two things hold it down, and both are refusals rather than optimizations. The selected window
+//! is **not shipped twice** — `windows.views` names it and carries `null`, because that view is the
+//! document's own top level — so the trio costs two views and not three. And `cost`, `standup` and
+//! `provenance` are **not in a view at all**: the bill keeps `--cost-last`, the narrative keeps
+//! `--standup-last`, and the largest section in the document therefore does not multiply. Had the
+//! standup ridden along, the same fixture would have grown by a multiple of its 71%.
+//!
+//! **The fold is not where it costs.** One mirror and one pass over each transcript produce all
+//! three ([`crate::command::fold_coaching_windows`]): on `three_lane_archive` the trio folded in
+//! **6.22 ms** against **6.09 ms** for a single-window [`crate::command::fold_coaching`] over the
+//! same archive — the same work plus two placements and two rule evaluations, against one run that
+//! pays its own sync. On `windowed_archive` it is 6.21 ms against 5.46 ms, **+14%**. Sync is
+//! unchanged by construction: the widest window's pair is a superset of the other two's, so there
+//! is one listing and one mirror however many windows are cut out of it.
+//!
 //! ## What the timeline slice added, measured
 //!
 //! Against production on 2026-08-25, same window and same run pair: **1,123,533 B (1097.2 KiB)**
@@ -293,12 +327,38 @@ pub struct Refreshed {
 /// page is something they may ask to expand. See [`crate::evidence::EvidenceIndex`] for why that
 /// boundary is what keeps this from becoming a transcript-browsing API.
 pub fn evidence_index(folded: &Folded) -> EvidenceIndex {
+    let mut index = EvidenceIndex::default();
+    offer_all(&mut index, folded);
+    index
+}
+
+/// The same, over **every** window one refresh pre-folded.
+///
+/// The rule this route is held by is "only what the payload named", and since the window trio the
+/// payload names more than one window's findings: a reader on `90d` is looking at a fold that is in
+/// their hands and whose evidence controls have to work. So the servable set is the union over the
+/// views, which is exactly the set of anchors this document offers and not one anchor more.
+///
+/// It does not widen anything the route refuses. Every blob behind these anchors was mirrored by
+/// the same pass that folded them — the widest window's pair — so nothing here can make the process
+/// reach for the archive; and a refresh swaps the whole index with the whole document, so an anchor
+/// from a window that no longer holds it is a 404 the moment the payload stops naming it.
+#[must_use]
+pub fn evidence_index_over<'a>(folds: impl IntoIterator<Item = &'a Folded>) -> EvidenceIndex {
+    let mut index = EvidenceIndex::default();
+    for folded in folds {
+        offer_all(&mut index, folded);
+    }
+    index
+}
+
+/// Offers every anchor one fold's findings cite.
+fn offer_all(index: &mut EvidenceIndex, folded: &Folded) {
     let by_hash: BTreeMap<&str, &SessionMetrics> = folded
         .sessions
         .iter()
         .map(|session| (session.source_hash.as_str(), session))
         .collect();
-    let mut index = EvidenceIndex::default();
     for finding in &folded.findings {
         for evidence in &finding.evidence {
             // A finding whose session is not in this window's fold cannot happen — the findings
@@ -317,7 +377,6 @@ pub fn evidence_index(folded: &Folded) -> EvidenceIndex {
             }
         }
     }
-    index
 }
 
 /// The three windows one refresh folds.
@@ -328,8 +387,15 @@ pub fn evidence_index(folded: &Folded) -> EvidenceIndex {
 /// test still passes.
 #[derive(Debug, Clone)]
 pub struct Windows {
-    /// What the lane scores and the findings are taken over. `--last`, default `30d`.
+    /// Which of [`Windows::trio`] the page opens on. `--last`, default `30d`.
     pub coaching: Window,
+    /// Every coaching window this refresh pre-folds, shortest first — [`crate::cli::DASHBOARD_WINDOWS`].
+    ///
+    /// `coaching` is one of these and is the one the document's top level is built from; the rest
+    /// ride in the `windows.views` map so the reader's own selector never asks for a fold. Held on
+    /// this type rather than derived at the fold, so the set the refresh folds and the set the
+    /// payload advertises are one list.
+    pub trio: Vec<Window>,
     /// What the bill covers. `--cost-last`, default `12w`.
     pub cost: Window,
     /// What the narrative covers. `--standup-last`, default `7d`.
@@ -348,6 +414,21 @@ pub struct Payload<'a> {
     pub windows: &'a Windows,
     pub refresh: &'a Refresh,
     pub coaching: &'a Folded,
+    /// Every pre-folded coaching window this refresh took, shortest first — including the selected
+    /// one, which is also [`Payload::coaching`].
+    ///
+    /// The window trio (qanungo #X3) is decision 11 applied to the axis the scopes already applied
+    /// it to: **every scope × window cell is folded before the document is published**, so a reader
+    /// changing the window re-reads bytes they already hold. There is no query string here for the
+    /// same two reasons there is none for a scope — a document that varied by who asked could show
+    /// two readers different numbers under one generation stamp, and a re-fold behind a request is
+    /// a fold an unauthenticated peer controls.
+    ///
+    /// One mirror and one pass over each transcript produce all three
+    /// ([`command::fold_coaching_windows`]), so the trio costs a rule evaluation and a placement per
+    /// window rather than three refreshes. What it costs on the *wire* is the one number worth
+    /// watching, and the module docs measure it.
+    pub coaching_views: &'a [(Window, Folded)],
     pub cost: &'a FoldedCost,
     pub standup: &'a FoldedStandup,
     /// What only the refresh loop can know about the pipeline itself: the archive's own inventory
@@ -403,16 +484,20 @@ impl Payload<'_> {
         // a group key that were computed twice are two things that can disagree, and the whole
         // point of a scope control is that the tag on a row and the scope it belongs to are the
         // same statement.
-        let tags = self.scope_tags();
-        let mut document = self.coaching_section(&tags);
+        let tags = self.scope_tags(self.coaching);
+        let mut document = self.coaching_section(&self.windows.coaching, self.coaching, &tags);
         let fields = document
             .as_object_mut()
             .expect("the coaching section is an object");
-        let timeline = self.timeline_section();
-        let heatmap = self.heatmap_section();
+        let timeline = self.timeline_section(self.coaching);
+        let heatmap = self.heatmap_section(self.coaching);
         fields.insert("cost".to_owned(), self.cost_section());
         fields.insert("standup".to_owned(), self.standup_section());
-        fields.insert("scopes".to_owned(), self.scopes_section(&tags));
+        fields.insert(
+            "scopes".to_owned(),
+            self.scopes_section(self.coaching, &tags),
+        );
+        fields.insert("windows".to_owned(), self.windows_section());
         fields.insert(
             "provenance".to_owned(),
             self.provenance(&timeline, &heatmap),
@@ -421,6 +506,65 @@ impl Payload<'_> {
         fields.insert("heatmap".to_owned(), heatmap);
         fields.insert("fleet".to_owned(), self.fleet_section());
         document
+    }
+
+    /// The window control's whole vocabulary, and every number a window selection can put on
+    /// screen.
+    ///
+    /// # The shape, and the one thing about it worth reading twice
+    ///
+    /// `options` is the trio in the order the control offers it, `selected` is the one `--last`
+    /// named, and `views` is total over the trio — but **the selected window's entry is `null`,
+    /// because that view is the document's own top level**. It is not missing and it is not a
+    /// defect: shipping it twice would put the largest section of this payload on the wire a second
+    /// time to say something the document already says, and leaving it out of `views` altogether
+    /// would make the page's lookup partial. `null` says "look up one level", the page's lookup is
+    /// one `||`, and nothing is serialized twice.
+    ///
+    /// Each view carries exactly the keys the top level carries for a window — `window`,
+    /// `sessions`, `lanes`, `findings`, `scopes`, `timeline`, `heatmap` — so switching the control
+    /// is a change of *which object* the page reads and never a change of how it reads one. The
+    /// three sections that are not a function of the coaching window (`cost`, `standup`,
+    /// `provenance`) are not in a view, because they do not move when it changes: the bill keeps
+    /// `--cost-last` and the narrative `--standup-last`, and a page that appeared to rewindow them
+    /// from this control would be answering a question it had not been asked.
+    ///
+    /// # Every scope, in every window
+    ///
+    /// A view holds its own `scopes` section, folded over its own window — so the repository and
+    /// device lists, their lane scores, their trends and their per-scope findings are all that
+    /// window's. The two controls therefore compose without either one recomputing anything: a
+    /// reader on `qanungo` × `90d` is reading a cell some refresh already folded.
+    fn windows_section(&self) -> Value {
+        let selected = self.windows.coaching.to_string();
+        let mut views = serde_json::Map::new();
+        for (window, folded) in self.coaching_views {
+            let spelling = window.to_string();
+            if spelling == selected {
+                views.insert(spelling, Value::Null);
+                continue;
+            }
+            let tags = self.scope_tags(folded);
+            let timeline = self.timeline_section(folded);
+            let heatmap = self.heatmap_section(folded);
+            let mut view = self.coaching_section(window, folded, &tags);
+            let fields = view
+                .as_object_mut()
+                .expect("a coaching section is an object");
+            fields.insert("scopes".to_owned(), self.scopes_section(folded, &tags));
+            fields.insert("timeline".to_owned(), timeline);
+            fields.insert("heatmap".to_owned(), heatmap);
+            views.insert(spelling, view);
+        }
+        json!({
+            "options": self
+                .coaching_views
+                .iter()
+                .map(|(window, _)| window.to_string())
+                .collect::<Vec<_>>(),
+            "selected": selected,
+            "views": Value::Object(views),
+        })
     }
 
     /// The coaching window on a calendar: how many sessions landed on each day, and how much work
@@ -454,8 +598,7 @@ impl Payload<'_> {
     /// to its own window's folded count and the page can draw the boundary where the window
     /// actually opens. A straddling day appears in both, holding its own half — which is the
     /// honest shape and, on a chart, a visible one.
-    fn timeline_section(&self) -> Value {
-        let folded = self.coaching;
+    fn timeline_section(&self, folded: &Folded) -> Value {
         let now = Scorecard::fold(&folded.sessions);
         let before = folded.compared.then(|| Scorecard::fold(&folded.previous));
         let columns = report::harness_columns(&now, before.as_ref());
@@ -494,8 +637,7 @@ impl Payload<'_> {
     /// Like the timeline, the section carries **no string at all** — a cell is a weekday index, an
     /// hour, and two arrays positional against `scopes.harnesses`. The weekday and hour *labels* are
     /// the page's, and the page builds no date through `Date`.
-    fn heatmap_section(&self) -> Value {
-        let folded = self.coaching;
+    fn heatmap_section(&self, folded: &Folded) -> Value {
         let now = Scorecard::fold(&folded.sessions);
         let before = folded.compared.then(|| Scorecard::fold(&folded.previous));
         let columns = report::harness_columns(&now, before.as_ref());
@@ -503,8 +645,8 @@ impl Payload<'_> {
     }
 
     /// The coaching lane, over this payload's own window. See [`coaching_section`].
-    fn coaching_section(&self, tags: &ScopeTags) -> Value {
-        coaching_section(&self.windows.coaching, self.coaching, tags, self.redactor)
+    fn coaching_section(&self, window: &Window, folded: &Folded, tags: &ScopeTags) -> Value {
+        coaching_section(window, folded, tags, self.redactor)
     }
 
     /// The cost lane, over this payload's own window. See [`cost_section`].
@@ -518,8 +660,8 @@ impl Payload<'_> {
     }
 
     /// Tags every session of the reported coaching window. See [`scope_tags`].
-    fn scope_tags(&self) -> ScopeTags {
-        scope_tags(self.coaching, self.redactor)
+    fn scope_tags(&self, folded: &Folded) -> ScopeTags {
+        scope_tags(folded, self.redactor)
     }
 }
 
@@ -726,8 +868,7 @@ impl Payload<'_> {
     /// so a harness keeps its position in every scope and the page's control is one index
     /// everywhere. A harness with no session in a scope renders `no-sessions` there — the state
     /// [`report::harness_columns`] takes the union to be able to state at all.
-    fn scopes_section(&self, tags: &ScopeTags) -> Value {
-        let folded = self.coaching;
+    fn scopes_section(&self, folded: &Folded, tags: &ScopeTags) -> Value {
         // The same two questions, and therefore the same answer, as the whole-window section: no
         // comparison window, no arrow anywhere — including inside a scope.
         let compared = folded.compared;
@@ -1464,6 +1605,21 @@ fn lane_value(
         "key": lane.key(),
         "title": lane.title(),
         "reason": lane.untyped(),
+        // What moves this lane, in one line, with the catalogue section each half of it is
+        // documented in. It is [`Lane::components`] — the same signal list the rule-pack digest
+        // hashes and the score above was computed from — rendered here rather than on the page,
+        // because a tile that composed its own sentence would be a second statement of the
+        // lane→signal mapping and the first one to go stale. It carries no reading and no number:
+        // it says what the lane is *of*, which is the fact a first-time reader is missing, and the
+        // readings behind the score are the disclosure below it.
+        "reads": lane
+            .components()
+            .iter()
+            .map(|component| json!({
+                "text": component.reads,
+                "anchor": component.anchor,
+            }))
+            .collect::<Vec<_>>(),
         "fleet": fleet,
         "harnesses": columns
             .iter()
@@ -2261,6 +2417,7 @@ mod tests {
     fn windows() -> Windows {
         Windows {
             coaching: window("7d"),
+            trio: vec![window("7d"), window("30d"), window("90d")],
             cost: cost_window("12w"),
             standup: standup_window("7d"),
         }
@@ -2453,10 +2610,20 @@ mod tests {
 
     /// The payload, from the four lanes a test chose — three folds and the search corpus, which
     /// feeds no section and appears only in the provenance block.
+    /// The pre-folded windows every payload below is built with: **none but the selected one**.
+    ///
+    /// A test about the cost section or the scrub is not a test about the trio, and folding two
+    /// more copies of a fixture window to satisfy every one of them would put the slice under test
+    /// three times over. `windows.views` is then the selected window's own `null` and nothing else,
+    /// which is a shape the page reads correctly — see `the_window_trio_ships_every_window_but_the_selected_one`
+    /// for the assertions that are about the trio.
+    const NO_OTHER_WINDOWS: &[(Window, Folded)] = &[];
+
     fn build(coaching: Folded, cost: FoldedCost, standup: Standup, redactor: Redactor) -> Value {
         Payload {
             windows: &windows(),
             refresh: &refresh(),
+            coaching_views: NO_OTHER_WINDOWS,
             coaching: &coaching,
             cost: &cost,
             standup: &folded_standup(standup),
@@ -3719,6 +3886,7 @@ mod tests {
         let payload = Payload {
             windows: &windows(),
             refresh: &refresh(),
+            coaching_views: NO_OTHER_WINDOWS,
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
@@ -3807,6 +3975,7 @@ mod tests {
         let stale = Payload {
             windows: &windows(),
             refresh: &refresh(),
+            coaching_views: NO_OTHER_WINDOWS,
             coaching: &coaching,
             cost: &cost,
             standup: &standup,
