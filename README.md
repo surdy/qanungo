@@ -59,6 +59,7 @@ cargo run -- flows                                   # what do I keep asking for
 cargo run -- flows --clusters 50 --flows 40          # each section's cut is a default, not a ceiling
 cargo run -- dashboard --bind 192.0.2.10:8878        # a routable address on your private network, unauthenticated, and it says so
 cargo run -- rules                                   # what it looks for; the one command that needs no archive
+cargo run -- report --last 30d --json | jq '.data.lanes'   # the same fold, for a program instead of a person
 ```
 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
@@ -72,6 +73,19 @@ because narrowing the coaching window says nothing about what the bill should co
 and an interval faster than a minute is refused rather than clamped: a warm three-lane refresh
 measures about **13 s** against the production archive (the snapshot index cut it from ~45 s), and
 polling near that is load on a LAN archive rather than a fresher page.
+
+`--json` is on every document lane — `report`, `cost`, `standup`, `ask`, `doctor`, `flows` — and
+**Markdown stays the default**, because the documents are what this tool is for. It is the same
+fold, never a second one: the coaching, cost and standup sections are the very ones the dashboard
+serves at `/api/data`, so `report --last 30d --json | jq '.data.lanes[0].fleet.score'` and the
+score on the page are the same number by construction. Every document wears one envelope —
+`schema_version`, `command`, `window`, `rule_pack` (the full digest, not the footer's short stamp),
+`generated_at`, `provenance`, and `data` — with the Markdown footer's own figures in `provenance`
+(fold and sync time, sessions listed and folded, bytes, cache hits and misses) rather than dropped.
+The scrub does not change with the medium: `report` and `cost` carry no transcript content in either
+form, and the four lanes that render archived text render it scrubbed in both, under the same
+`--no-redact` and `--filter-profanity`. Errors still go to stderr, so a failed run gives `jq`
+nothing rather than a document with an error sentence in it.
 
 `--patwari-url` is **required** on every lane that reads the archive — there is no built-in archive to fall back on — and it also reads
 `PATWARI_URL`, so set that once in your shell and no lane needs the flag again; `--cache-dir`

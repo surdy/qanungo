@@ -268,6 +268,7 @@ pub mod flows_report;
 pub mod format;
 pub mod heatmap;
 pub mod http;
+pub mod json;
 pub mod metrics;
 pub mod patwari;
 pub mod pricing;

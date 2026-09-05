@@ -101,6 +101,7 @@ use crate::doctor_report::{DoctorInstrumentation, DoctorReport};
 use crate::flows::{Flows, FlowsSession};
 use crate::flows_report::{FlowsInstrumentation, FlowsReport};
 use crate::format;
+use crate::json;
 use crate::metrics::{self, SessionMetrics};
 use crate::patwari::{PatwariError, ReadClient};
 use crate::redaction::{RedactionReport, Redactor};
@@ -232,6 +233,9 @@ pub fn fold_coaching(
 /// report cannot be written. A single unreadable session is a reported gap, not a failure.
 pub fn report(args: &ReportArgs, out: &mut impl Write) -> Result<(), CommandError> {
     let folded = fold_coaching(&args.archive, &args.last, &Redactor::new())?;
+    if args.output.json {
+        return json::write(out, &json::report(&args.last, &folded));
+    }
     let markdown = Report {
         window: &args.last,
         generated_at: folded.generated_at,
@@ -351,6 +355,9 @@ pub fn fold_cost(
 /// single unreadable session is a gap the document states, never a failed run.
 pub fn cost(args: &CostArgs, out: &mut impl Write) -> Result<(), CommandError> {
     let folded = fold_cost(&args.archive, &args.last, &Redactor::new())?;
+    if args.output.json {
+        return json::write(out, &json::cost(&args.last, &folded));
+    }
     let markdown = CostReport {
         window: &args.last,
         generated_at: folded.generated_at,
@@ -440,6 +447,9 @@ pub fn fold_standup(
 /// unparseable one, and a placeholder are each a stated gap, never a failed run.
 pub fn standup(args: &StandupArgs, out: &mut impl Write) -> Result<(), CommandError> {
     let folded = fold_standup(&args.archive, &args.last, args.redaction.redactor())?;
+    if args.output.json {
+        return json::write(out, &json::standup(&args.last, &folded));
+    }
     let markdown = StandupReport {
         window: &args.last,
         generated_at: folded.generated_at,
@@ -696,6 +706,17 @@ pub fn fold_ask_corpus(archive: &ArchiveArgs) -> Result<AskCorpus, CommandError>
 pub fn ask(args: &AskArgs, out: &mut impl Write) -> Result<(), CommandError> {
     let query = Query::parse(&args.query);
     if query.is_empty() {
+        if args.output.json {
+            return json::write(
+                out,
+                &json::ask_no_searchable_terms(
+                    args.last.as_ref(),
+                    &query,
+                    args.limit,
+                    &args.redaction.redactor(),
+                ),
+            );
+        }
         return out
             .write_all(crate::ask_report::no_searchable_terms(&args.query).as_bytes())
             .map_err(CommandError::Output);
@@ -708,6 +729,18 @@ pub fn ask(args: &AskArgs, out: &mut impl Write) -> Result<(), CommandError> {
         args.limit,
         args.verbatim,
     )?;
+    if args.output.json {
+        return json::write(
+            out,
+            &json::ask(
+                args.last.as_ref(),
+                &query,
+                args.limit,
+                args.verbatim,
+                &folded,
+            ),
+        );
+    }
     let markdown = AskReport {
         raw_query: &args.query,
         query: &query,
@@ -838,6 +871,12 @@ pub fn doctor(args: &DoctorArgs, out: &mut impl Write) -> Result<(), CommandErro
         args.redaction.redactor(),
         args.clusters_per_repo,
     )?;
+    if args.output.json {
+        return json::write(
+            out,
+            &json::doctor(args.last.as_ref(), args.clusters_per_repo, &folded),
+        );
+    }
     let markdown = DoctorReport {
         window: args.last.as_ref(),
         clusters_per_repo: args.clusters_per_repo,
@@ -937,6 +976,12 @@ pub fn flows(args: &FlowsArgs, out: &mut impl Write) -> Result<(), CommandError>
         args.clusters,
         args.flows,
     )?;
+    if args.output.json {
+        return json::write(
+            out,
+            &json::flows(args.last.as_ref(), args.clusters, args.flows, &folded),
+        );
+    }
     let markdown = FlowsReport {
         window: args.last.as_ref(),
         clusters: args.clusters,
