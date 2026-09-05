@@ -74,16 +74,17 @@ const STOP_WORDS: &[&str] = &[
 /// ordered so a reader can predict a ranking: a term in the title or the repository name says more
 /// about what a session was *about* than the same term buried in a validation command, so those
 /// score higher, and the snippet a hit shows is drawn from the highest-weighted field that matched.
-struct Field {
+pub struct Field {
     /// What the section is called when the fold reports which fields a hit matched in.
-    label: &'static str,
-    weight: u32,
+    pub label: &'static str,
+    /// How much a term found in this field is worth.
+    pub weight: u32,
     /// Whether a match in this field makes a good *snippet* — an explanatory line worth quoting —
     /// as opposed to a bare keyword or identifier that ranks well but reads as one word out of
     /// context. A tag or a repository name is a strong ranking signal and a poor thing to quote, so
     /// the snippet prefers a prose field that matched and only falls back to a keyword when nothing
     /// prose did.
-    quotable: bool,
+    pub quotable: bool,
 }
 
 /// The scoring rubric, highest-weighted field first. Iteration order is the tie-break for which
@@ -147,6 +148,20 @@ const FIELDS: &[Field] = &[
         quotable: false,
     },
 ];
+
+/// The rubric itself, for a document that states what the search weighs.
+///
+/// The same slice [`Ask::fold`] scores against, in the same order, so a catalogue built on this
+/// cannot disagree with the ranking it describes.
+pub const fn rubric() -> &'static [Field] {
+    FIELDS
+}
+
+/// The words a query drops before scoring. Rendered by the catalogue as a count and a list; the
+/// list is short on purpose, and this is where it is kept.
+pub const fn stop_words() -> &'static [&'static str] {
+    STOP_WORDS
+}
 
 /// A parsed query: the distinct, searchable, lower-cased words a summary is scored against.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -152,7 +152,23 @@ pub enum Command {
     /// Serve the coaching report's own numbers as a read-only web page, refreshed in the
     /// background.
     Dashboard(DashboardArgs),
+    /// Print the rules, lanes, thresholds, prices, and redaction pattern names this build decides
+    /// with, as Markdown on stdout. Reads no archive.
+    Rules(RulesArgs),
 }
+
+/// The catalogue lane, and the one command that does **not** flatten [`ArchiveArgs`].
+///
+/// It describes this build rather than a window of history: no session is read, no blob is
+/// mirrored, and nothing is listed. Requiring `--patwari-url` to print it would mean a person
+/// could not read what the tool looks for until they had finished setting the tool up, which is
+/// backwards for the document that explains it — so the struct is deliberately empty rather than
+/// borrowing the shared arguments and ignoring them.
+///
+/// Empty, and not collapsed into a bare unit variant, so that a later flag — a section filter, a
+/// `--json` rendering — lands as a field here rather than as a change to the command's shape.
+#[derive(Debug, Args)]
+pub struct RulesArgs {}
 
 /// How to reach the archive, shared by every lane. Flattened rather than repeated so
 /// `--patwari-url` cannot come to mean two slightly different things in two subcommands.

@@ -89,8 +89,10 @@ use thiserror::Error;
 use crate::ask::{Ask, Escalation, Query};
 use crate::ask_report::{AskInstrumentation, AskReport, VerbatimStats};
 use crate::cache::BlobCache;
+use crate::catalogue;
 use crate::cli::{
-    ArchiveArgs, AskArgs, CostArgs, DoctorArgs, FlowsArgs, ReportArgs, StandupArgs, Window,
+    ArchiveArgs, AskArgs, CostArgs, DoctorArgs, FlowsArgs, ReportArgs, RulesArgs, StandupArgs,
+    Window,
 };
 use crate::cost::{self, CostTotals, SessionCost};
 use crate::cost_report::{CostInstrumentation, CostReport};
@@ -946,6 +948,22 @@ pub fn flows(args: &FlowsArgs, out: &mut impl Write) -> Result<(), CommandError>
     .render();
 
     out.write_all(markdown.as_bytes())
+        .map_err(CommandError::Output)
+}
+
+/// The catalogue lane: what this build looks for, with no archive behind it.
+///
+/// The only command here that neither syncs nor folds. It renders [`crate::catalogue`] — the rules,
+/// their thresholds, the lanes those rules score into, the price table, and the redaction pattern
+/// names — from the constants the runtime itself reads, and writes them to `out`. The committed
+/// `RULES.md` at the repository root is exactly this output.
+///
+/// # Errors
+///
+/// Only [`CommandError::Output`]: there is nothing else here that can fail. No network, no cache,
+/// no clock.
+pub fn rules(_args: &RulesArgs, out: &mut impl Write) -> Result<(), CommandError> {
+    out.write_all(catalogue::render().as_bytes())
         .map_err(CommandError::Output)
 }
 

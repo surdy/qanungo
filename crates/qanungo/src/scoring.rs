@@ -286,6 +286,45 @@ impl Lane {
             | Self::ContextManagement => None,
         }
     }
+
+    /// What this lane is scored from, described rather than read — the same [`Lane::signals`] the
+    /// digest hashes and the score reads, rendered for a catalogue.
+    ///
+    /// It exists so a document can state the lane→signal mapping without re-listing it: a lane
+    /// that gains or loses a component here changes what the catalogue prints and the rule-pack
+    /// digest in the same edit.
+    pub fn components(self) -> Vec<LaneComponent> {
+        self.signals()
+            .iter()
+            .map(|signal| LaneComponent {
+                key: signal.key(),
+                label: signal.label(),
+                denominator: signal.denominator(),
+            })
+            .collect()
+    }
+}
+
+/// One of a lane's readings, named for a document — the *definition* of a component, as opposed
+/// to [`Component`], which is one lane's reading of it over an actual window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneComponent {
+    /// The stable machine name the rule-pack digest hashes — `fire-rate:<rule key>`, or
+    /// `pooled-tool-error-rate`.
+    pub key: String,
+    /// The component's label in the report.
+    pub label: &'static str,
+    /// Which sessions (or calls) the reading is *of*, said in words.
+    pub denominator: String,
+}
+
+/// Which sessions a rule's fire rate is *of*, said in words.
+///
+/// The denominator lives on the signal because that is what divides by it; this is how a document
+/// outside this module states a rule's eligibility without re-deriving it from
+/// [`RuleId::verdict`](crate::rules::RuleId::verdict).
+pub fn fire_rate_denominator(rule: RuleId) -> String {
+    Signal::FireRate(rule).denominator()
 }
 
 /// One reading a lane's score is made of.

@@ -254,6 +254,35 @@ impl PatternId {
         }
     }
 
+    /// The [`PATTERN_REVISION`] this pattern arrived in.
+    ///
+    /// Every pattern's provenance is a dated file in `docs/`, so this is the date of the document
+    /// that argues for it: the original research for the fourteen the scrub shipped with, and the
+    /// amendment that added each one since. It is stated per pattern rather than per set because
+    /// the set's revision only ever names the *latest* change, and a reader asking when a pattern
+    /// started firing is asking about one pattern.
+    pub const fn added_in(self) -> &'static str {
+        match self {
+            Self::GithubToken
+            | Self::AnthropicKey
+            | Self::OpenAiKey
+            | Self::AwsAccessKeyId
+            | Self::AwsSecretKey
+            | Self::SlackToken
+            | Self::GitlabToken
+            | Self::NpmToken
+            | Self::GoogleApiKey
+            | Self::Jwt
+            | Self::PrivateKeyBlock
+            | Self::AuthorizationHeader
+            | Self::UrlCredentials
+            | Self::SecretAssignment
+            | Self::Profanity => "2026-08-24",
+            Self::ProseCredential | Self::PairedUsername => "2026-08-31",
+            Self::ProsePairedUsername => "2026-09-04",
+        }
+    }
+
     /// Position in [`PATTERNS`], which is how [`RedactionReport`] indexes its counters.
     const fn index(self) -> usize {
         self as usize

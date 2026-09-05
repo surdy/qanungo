@@ -97,6 +97,50 @@ use crate::evidence::{
 };
 use crate::rules::thresholds::IDLE_GAP;
 
+/// One of this module's folds, named for a document that has to list them.
+///
+/// The list below is what a generated catalogue renders, so it is the module's own inventory
+/// rather than a restatement of the header — a fold added here without an entry is a fold the
+/// catalogue would not mention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldKind {
+    /// What the fold is called.
+    pub name: &'static str,
+    /// What it reads, and what it refuses to claim when the signal is absent.
+    pub reads: &'static str,
+}
+
+/// Every fold, in the order the module documentation introduces them.
+///
+/// Six, not the five the header enumerates as *metrics*: review activity arrived with munshi#77
+/// pull B to feed the Code Review lane and is folded exactly like the rest.
+pub const FOLDS: [FoldKind; 6] = [
+    FoldKind {
+        name: "Tool error rate",
+        reads: "the outcome fields a tool event carries (`success`, `is_error`), per session and per tool name. Only events with an *explicit* outcome enter the denominator, so a harness that cannot express failure reports no rate rather than a flattering zero.",
+    },
+    FoldKind {
+        name: "Tool-per-request ratio",
+        reads: "tool activities over user requests — how much the agent does per thing it is asked for.",
+    },
+    FoldKind {
+        name: "Cadence and duration",
+        reads: "sessions per day, and each session's active time: the gaps between consecutive records, with anything longer than `IDLE_GAP` counted as the operator having walked away. Wall-clock span is derived as context, never as a trigger.",
+    },
+    FoldKind {
+        name: "Repeated-command churn",
+        reads: "the typed `command` field on a tool event: how much of a session's command-bearing activity was the same command run again. A session whose harness records no command field has no churn reading, not a zero one.",
+    },
+    FoldKind {
+        name: "Context compaction",
+        reads: "the compaction markers a record may carry — completed, not known to have failed. For the two harnesses that write markers, a transcript with none is a reading of *none*; for one that writes none, it is no reading at all.",
+    },
+    FoldKind {
+        name: "Review activity",
+        reads: "commits (`git commit` invocations) and skill invocations classified as a review pass, plus whether the harness types **every** surface a review could arrive on. A harness that does not is left out of the rate entirely.",
+    },
+];
+
 /// Upper bound on remembered call-id -> tool-name pairs per session. A transcript is one
 /// conversation, so this is orders of magnitude above any real session; it exists so a
 /// pathological or adversarial transcript cannot make the fold's memory grow without bound.

@@ -3626,6 +3626,9 @@ fn document(lane: &str, base: &str, cache: &std::path::Path) -> String {
         // never supplies the query ask requires, so a run reaching here is a test wiring mistake.
         Command::Ask(_) => panic!("`{lane}` is not driven by this helper"),
         Command::Dashboard(_) => panic!("`{lane}` is not a document lane"),
+        // The catalogue is a document, but not an archive-reading one: it takes none of the flags
+        // this helper passes and would have refused them at parse time.
+        Command::Rules(_) => panic!("`{lane}` reads no archive"),
     }
     String::from_utf8(out).expect("a document is UTF-8")
 }

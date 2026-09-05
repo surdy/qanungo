@@ -253,6 +253,7 @@
 pub mod ask;
 pub mod ask_report;
 pub mod cache;
+pub mod catalogue;
 pub mod cli;
 pub mod command;
 pub mod cost;

@@ -151,6 +151,72 @@ pub mod thresholds {
     pub const COMPACTION_CHURN_COMPLETIONS: u64 = 4;
 }
 
+/// What the two duration constants were measured against, said once for the two rules that read
+/// them. Stated beside the pair rather than beside either half, because moving one without the
+/// other rescales every sitting in the archive.
+const IDLE_GAP_NOTE: &str = "half of a two-part setting, measured 2026-08-18 over 564 transcripts \
+                             and 606k records: the pooled gap distribution has no valley, so this \
+                             is chosen behaviourally — above the harness's 180 s timeout artifact \
+                             and below any break a person would call still being in the session";
+
+/// One threshold constant, named as the source names it, for a catalogue to render.
+///
+/// The `value` is rendered from the constant at call time by [`RuleId::thresholds`]; nothing here
+/// stores a number of its own, so a document built on this cannot state a threshold the rules do
+/// not use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Threshold {
+    /// The constant's Rust name in [`thresholds`], so a reader can go and find it.
+    pub name: &'static str,
+    /// The constant's value, rendered the way the report renders it.
+    pub value: String,
+    /// What the number was measured against, for the constants that have had that pass run over
+    /// them. `None` is an honest "still a first guess" — see the module documentation.
+    pub note: Option<&'static str>,
+}
+
+impl Threshold {
+    /// A fraction, rendered as a percentage.
+    fn percent(name: &'static str, value: f64, note: Option<&'static str>) -> Self {
+        Self {
+            name,
+            value: format::percent(value),
+            note,
+        }
+    }
+
+    /// A multiplier or a per-request ratio.
+    fn ratio(name: &'static str, value: f64, note: Option<&'static str>) -> Self {
+        Self {
+            name,
+            value: format::ratio(value),
+            note,
+        }
+    }
+
+    /// A plain count.
+    fn count(
+        name: &'static str,
+        value: impl std::fmt::Display,
+        note: Option<&'static str>,
+    ) -> Self {
+        Self {
+            name,
+            value: value.to_string(),
+            note,
+        }
+    }
+
+    /// A duration.
+    fn span(name: &'static str, value: chrono::TimeDelta, note: Option<&'static str>) -> Self {
+        Self {
+            name,
+            value: format::span(value),
+            note,
+        }
+    }
+}
+
 /// Which rule produced a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuleId {
@@ -250,6 +316,280 @@ impl RuleId {
             | Self::Babysitting
             | Self::CompactionChurn => EvidenceKind::Structural,
             Self::FireAndForget | Self::UnreviewedShip => EvidenceKind::Mixed,
+        }
+    }
+
+    /// The constants this rule's trigger reads, named as the source names them.
+    ///
+    /// The values are rendered from [`thresholds`] rather than restated, so a catalogue built on
+    /// this cannot print a number the rule does not use — which is the whole reason it exists.
+    /// A rule with no constant returns an empty list, and that is a fact about the rule rather
+    /// than a gap here: see [`RuleId::UnreviewedShip`], whose trigger is a zero.
+    pub fn thresholds(self) -> Vec<Threshold> {
+        match self {
+            Self::HighToolErrorRate => vec![
+                Threshold::percent(
+                    "SESSION_TOOL_ERROR_RATE",
+                    thresholds::SESSION_TOOL_ERROR_RATE,
+                    None,
+                ),
+                Threshold::count(
+                    "MIN_SESSION_TOOL_ATTEMPTS",
+                    thresholds::MIN_SESSION_TOOL_ATTEMPTS,
+                    None,
+                ),
+                Threshold::percent("TOOL_ERROR_RATE", thresholds::TOOL_ERROR_RATE, None),
+                Threshold::count("MIN_TOOL_ATTEMPTS", thresholds::MIN_TOOL_ATTEMPTS, None),
+            ],
+            Self::RetryLoop => vec![Threshold::count(
+                "RETRY_LOOP_REPEATS",
+                thresholds::RETRY_LOOP_REPEATS,
+                Some(
+                    "archive p95 of the busiest command's run count, measured 2026-08-18 against a \
+                     proxy and confirmed the same day on the promoted `command` field: 20 of 408 \
+                     measurable sessions (4.9%)",
+                ),
+            )],
+            Self::MarathonSession => vec![
+                Threshold::span(
+                    "MARATHON_SITTING_ACTIVE",
+                    thresholds::MARATHON_SITTING_ACTIVE,
+                    Some(
+                        "the archive's p95 longest-sitting at this idle gap, measured 2026-08-18 \
+                         over 564 transcripts: 25 sessions (4.4%)",
+                    ),
+                ),
+                Threshold::span("IDLE_GAP", thresholds::IDLE_GAP, Some(IDLE_GAP_NOTE)),
+            ],
+            Self::ResumedSession => vec![
+                Threshold::ratio(
+                    "RESUMED_SPAN_TO_ACTIVE",
+                    thresholds::RESUMED_SPAN_TO_ACTIVE,
+                    Some(
+                        "roughly twice the archive's median dilution (4.9x), measured 2026-08-18; \
+                         59.6% of sessions are multi-sitting, so being resumed is the normal shape",
+                    ),
+                ),
+                Threshold::count(
+                    "RESUMED_MIN_SITTINGS",
+                    thresholds::RESUMED_MIN_SITTINGS,
+                    None,
+                ),
+                Threshold::span("IDLE_GAP", thresholds::IDLE_GAP, Some(IDLE_GAP_NOTE)),
+            ],
+            Self::Babysitting => vec![
+                Threshold::ratio(
+                    "BABYSITTING_TOOLS_PER_REQUEST",
+                    thresholds::BABYSITTING_TOOLS_PER_REQUEST,
+                    None,
+                ),
+                Threshold::count(
+                    "BABYSITTING_MIN_USER_REQUESTS",
+                    thresholds::BABYSITTING_MIN_USER_REQUESTS,
+                    None,
+                ),
+            ],
+            Self::FireAndForget => vec![
+                Threshold::ratio(
+                    "FIRE_AND_FORGET_TOOLS_PER_REQUEST",
+                    thresholds::FIRE_AND_FORGET_TOOLS_PER_REQUEST,
+                    None,
+                ),
+                Threshold::count(
+                    "FIRE_AND_FORGET_USER_REQUESTS",
+                    thresholds::FIRE_AND_FORGET_USER_REQUESTS,
+                    None,
+                ),
+            ],
+            Self::CompactionChurn => vec![Threshold::count(
+                "COMPACTION_CHURN_COMPLETIONS",
+                thresholds::COMPACTION_CHURN_COMPLETIONS,
+                Some(
+                    "the p75 of the compacting distribution, measured 2026-08-24 over 734 \
+                     transcripts: 27 of 734 eligible sessions (3.7%)",
+                ),
+            )],
+            Self::UnreviewedShip => Vec::new(),
+        }
+    }
+
+    /// What makes this rule fire, in one sentence, with every number in it interpolated from
+    /// [`thresholds`] rather than typed out.
+    ///
+    /// It restates [`RuleId::verdict`] in prose for a reader who is not going to open the source.
+    /// The conditions that are *not* constants live here too — fire-and-forget's "and it hit at
+    /// least one error", and the whole of unreviewed-ship, whose trigger is the absence of a
+    /// review pass and therefore has no number to state.
+    pub fn fires_when(self) -> String {
+        match self {
+            Self::HighToolErrorRate => format!(
+                "A session's overall tool failure rate is over {}, or any single tool's rate \
+                 within it is over {}. Either rate is read only once enough calls reported an \
+                 outcome; a session under both minimums is not looked at rather than passed.",
+                format::percent(thresholds::SESSION_TOOL_ERROR_RATE),
+                format::percent(thresholds::TOOL_ERROR_RATE),
+            ),
+            Self::RetryLoop => format!(
+                "One *exact* command value ran {}+ times inside a single session. The busiest \
+                 command's run count is the only trigger; the repeat share rides along as \
+                 evidence and decides nothing. A session whose harness records no command field \
+                 is skipped, not scored.",
+                thresholds::RETRY_LOOP_REPEATS,
+            ),
+            Self::MarathonSession => format!(
+                "The session's longest continuous *sitting* — consecutive records separated by no \
+                 gap longer than {} — ran over {}. Never wall-clock span, and never total active \
+                 time.",
+                format::span(thresholds::IDLE_GAP),
+                format::span(thresholds::MARATHON_SITTING_ACTIVE),
+            ),
+            Self::ResumedSession => format!(
+                "The session's calendar span is at least {}x its active time *and* it was picked \
+                 up in {}+ separate sittings. Both halves, so neither one long break nor a \
+                 handful of brisk sittings fires on its own.",
+                format::ratio(thresholds::RESUMED_SPAN_TO_ACTIVE),
+                thresholds::RESUMED_MIN_SITTINGS,
+            ),
+            Self::Babysitting => format!(
+                "The session carried {}+ user requests at under {} tool activities per request.",
+                thresholds::BABYSITTING_MIN_USER_REQUESTS,
+                format::ratio(thresholds::BABYSITTING_TOOLS_PER_REQUEST),
+            ),
+            Self::FireAndForget => format!(
+                "The session carried exactly {} user request, ran {}+ tool activities per \
+                 request, *and* at least one call reported failure. All three, so an enormous \
+                 clean run is not a finding.",
+                thresholds::FIRE_AND_FORGET_USER_REQUESTS,
+                format::ratio(thresholds::FIRE_AND_FORGET_TOOLS_PER_REQUEST),
+            ),
+            Self::CompactionChurn => format!(
+                "The session completed {}+ context-window compactions. Compacting once is \
+                 deliberately not a finding at any threshold.",
+                thresholds::COMPACTION_CHURN_COMPLETIONS,
+            ),
+            Self::UnreviewedShip => "The session committed code and nothing in it ran a review \
+                                     pass. **There is no threshold to tune**: the trigger is a \
+                                     count of none, so there is no constant to write down and \
+                                     none to defend."
+                .to_owned(),
+        }
+    }
+
+    /// The finding's **Problem** line, stated over a folded window.
+    ///
+    /// Every rule's problem opens the same way — how many of the folded sessions matched — and
+    /// then says what they matched, which is [`RuleId::problem_predicate`]. Split so that a
+    /// catalogue can render the sentence without a window to count, and joined here so the report
+    /// and the catalogue cannot come to word the same finding two ways.
+    pub fn problem(self, matched: usize, folded: usize) -> String {
+        format!(
+            "{matched} of {folded} folded sessions {}",
+            self.problem_predicate()
+        )
+    }
+
+    /// What the matching sessions did, as the **Problem** line words it — the sentence after
+    /// "*n* of *m* folded sessions".
+    pub fn problem_predicate(self) -> String {
+        match self {
+            Self::HighToolErrorRate => format!(
+                "ran tool failure rates over threshold ({} session-wide, {} for a single tool).",
+                format::percent(thresholds::SESSION_TOOL_ERROR_RATE),
+                format::percent(thresholds::TOOL_ERROR_RATE),
+            ),
+            Self::RetryLoop => format!(
+                "ran one identical command {}+ times.",
+                thresholds::RETRY_LOOP_REPEATS,
+            ),
+            Self::MarathonSession => format!(
+                "worked for more than {} without a break longer than {}.",
+                format::span(thresholds::MARATHON_SITTING_ACTIVE),
+                format::span(thresholds::IDLE_GAP),
+            ),
+            Self::ResumedSession => format!(
+                "were worked in {}+ separate sittings, with a calendar footprint at least {}x \
+                 their active time.",
+                thresholds::RESUMED_MIN_SITTINGS,
+                format::ratio(thresholds::RESUMED_SPAN_TO_ACTIVE),
+            ),
+            Self::Babysitting => format!(
+                "carried {}+ user requests at under {} tool activities each — turn-by-turn \
+                 steering rather than delegation.",
+                thresholds::BABYSITTING_MIN_USER_REQUESTS,
+                format::ratio(thresholds::BABYSITTING_TOOLS_PER_REQUEST),
+            ),
+            Self::FireAndForget => format!(
+                "ran {}+ tool activities on a single request and hit errors on the way.",
+                format::ratio(thresholds::FIRE_AND_FORGET_TOOLS_PER_REQUEST),
+            ),
+            Self::CompactionChurn => format!(
+                "compacted their context window {}+ times.",
+                thresholds::COMPACTION_CHURN_COMPLETIONS,
+            ),
+            Self::UnreviewedShip => {
+                "committed code without running a review pass first.".to_owned()
+            }
+        }
+    }
+
+    /// The finding's **Action** line: what to do differently.
+    ///
+    /// Constant per rule and lifted out of the evaluators so that one string is what the report,
+    /// the dashboard, and the catalogue all render.
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::HighToolErrorRate => {
+                "Failing calls are re-work: the agent spends a turn discovering what the \
+                 environment already knew. Pin the failing tool's preconditions where the agent \
+                 reads them — a CLAUDE.md note, a skill, or a wrapper that fails loudly — rather \
+                 than correcting the same call again next session."
+            }
+            Self::RetryLoop => {
+                "Repetition is the cheapest signal that a loop is not closing: the same command, \
+                 the same disagreement, another turn. Fix what the command keeps arguing with — \
+                 the stale config, the missing dependency, the wrong working directory — and say \
+                 so where the agent reads it, rather than letting it rediscover the answer by \
+                 running the command again. Where the repeat is legitimate re-checking after each \
+                 edit, it is a watch mode or a single script waiting to be written."
+            }
+            Self::MarathonSession => {
+                "Split the work at the next natural boundary and start the follow-on in a fresh \
+                 session. Write the handoff down first — what is done, what is next, which files \
+                 matter — so the new context starts from a summary rather than from hours of \
+                 accumulated conversation."
+            }
+            Self::ResumedSession => {
+                "Start a fresh session per work item rather than returning to a standing one. \
+                 The archive keeps the old transcript, so nothing is lost by leaving it closed — \
+                 and a session that maps onto one piece of work is the unit every summary, \
+                 metric, and coaching finding here is actually about."
+            }
+            Self::Babysitting => {
+                "Ask bigger. State the outcome and the constraints once and let the agent plan \
+                 the steps. Where the same sequence of small asks keeps recurring, it is a skill \
+                 waiting to be written — capture it once instead of retyping it every session."
+            }
+            Self::FireAndForget => {
+                "Put a checkpoint in the middle. Ask for a plan before the work, or for a report \
+                 at a named milestone, so a wrong turn surfaces while it is still one wrong turn \
+                 rather than at the end of an hour of unattended tool calls."
+            }
+            Self::CompactionChurn => {
+                "Repeated compaction is the window telling you the transcript has outgrown the \
+                 work. Each round discards context the next round has to rediscover, and what \
+                 survives is a summary of a summary. Land the current piece, write the handoff \
+                 down — what is done, what is next, which files matter — and start the follow-on \
+                 in a fresh session, so the new context begins from that handoff rather than from \
+                 whatever the last compaction happened to keep."
+            }
+            Self::UnreviewedShip => {
+                "A review pass is the cheapest place to catch what the writing missed, and it is \
+                 cheapest before the commit rather than after it: once the work is committed the \
+                 next reader is a diff nobody asked for. Run the review skill against the diff \
+                 before committing — the same session, while the context that wrote the code is \
+                 still loaded — rather than trusting the pass that wrote it to also be the pass \
+                 that checks it."
+            }
         }
     }
 
@@ -431,19 +771,8 @@ fn high_tool_error_rate(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::HighToolErrorRate,
-        problem: format!(
-            "{} of {} folded sessions ran tool failure rates over threshold \
-             ({} session-wide, {} for a single tool).",
-            evidence.len(),
-            sessions.len(),
-            format::percent(thresholds::SESSION_TOOL_ERROR_RATE),
-            format::percent(thresholds::TOOL_ERROR_RATE),
-        ),
-        action: "Failing calls are re-work: the agent spends a turn discovering what the \
-                 environment already knew. Pin the failing tool's preconditions where the agent \
-                 reads them — a CLAUDE.md note, a skill, or a wrapper that fails loudly — rather \
-                 than correcting the same call again next session."
-            .to_owned(),
+        problem: RuleId::HighToolErrorRate.problem(evidence.len(), sessions.len()),
+        action: RuleId::HighToolErrorRate.action().to_owned(),
         evidence,
     })
 }
@@ -548,19 +877,8 @@ fn retry_loop(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::RetryLoop,
-        problem: format!(
-            "{} of {} folded sessions ran one identical command {}+ times.",
-            evidence.len(),
-            sessions.len(),
-            thresholds::RETRY_LOOP_REPEATS,
-        ),
-        action: "Repetition is the cheapest signal that a loop is not closing: the same command, \
-                 the same disagreement, another turn. Fix what the command keeps arguing with — \
-                 the stale config, the missing dependency, the wrong working directory — and say \
-                 so where the agent reads it, rather than letting it rediscover the answer by \
-                 running the command again. Where the repeat is legitimate re-checking after each \
-                 edit, it is a watch mode or a single script waiting to be written."
-            .to_owned(),
+        problem: RuleId::RetryLoop.problem(evidence.len(), sessions.len()),
+        action: RuleId::RetryLoop.action().to_owned(),
         evidence,
     })
 }
@@ -600,18 +918,8 @@ fn marathon_session(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::MarathonSession,
-        problem: format!(
-            "{} of {} folded sessions worked for more than {} without a break longer than {}.",
-            evidence.len(),
-            sessions.len(),
-            format::span(thresholds::MARATHON_SITTING_ACTIVE),
-            format::span(thresholds::IDLE_GAP),
-        ),
-        action: "Split the work at the next natural boundary and start the follow-on in a fresh \
-                 session. Write the handoff down first — what is done, what is next, which files \
-                 matter — so the new context starts from a summary rather than from hours of \
-                 accumulated conversation."
-            .to_owned(),
+        problem: RuleId::MarathonSession.problem(evidence.len(), sessions.len()),
+        action: RuleId::MarathonSession.action().to_owned(),
         evidence,
     })
 }
@@ -652,19 +960,8 @@ fn resumed_session(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::ResumedSession,
-        problem: format!(
-            "{} of {} folded sessions were worked in {}+ separate sittings, with a calendar \
-             footprint at least {}x their active time.",
-            evidence.len(),
-            sessions.len(),
-            thresholds::RESUMED_MIN_SITTINGS,
-            format::ratio(thresholds::RESUMED_SPAN_TO_ACTIVE),
-        ),
-        action: "Start a fresh session per work item rather than returning to a standing one. \
-                 The archive keeps the old transcript, so nothing is lost by leaving it closed — \
-                 and a session that maps onto one piece of work is the unit every summary, \
-                 metric, and coaching finding here is actually about."
-            .to_owned(),
+        problem: RuleId::ResumedSession.problem(evidence.len(), sessions.len()),
+        action: RuleId::ResumedSession.action().to_owned(),
         evidence,
     })
 }
@@ -702,18 +999,8 @@ fn babysitting(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::Babysitting,
-        problem: format!(
-            "{} of {} folded sessions carried {}+ user requests at under {} tool activities each \
-             — turn-by-turn steering rather than delegation.",
-            evidence.len(),
-            sessions.len(),
-            thresholds::BABYSITTING_MIN_USER_REQUESTS,
-            format::ratio(thresholds::BABYSITTING_TOOLS_PER_REQUEST),
-        ),
-        action: "Ask bigger. State the outcome and the constraints once and let the agent plan \
-                 the steps. Where the same sequence of small asks keeps recurring, it is a skill \
-                 waiting to be written — capture it once instead of retyping it every session."
-            .to_owned(),
+        problem: RuleId::Babysitting.problem(evidence.len(), sessions.len()),
+        action: RuleId::Babysitting.action().to_owned(),
         evidence,
     })
 }
@@ -744,17 +1031,8 @@ fn fire_and_forget(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::FireAndForget,
-        problem: format!(
-            "{} of {} folded sessions ran {}+ tool activities on a single request and hit errors \
-             on the way.",
-            evidence.len(),
-            sessions.len(),
-            format::ratio(thresholds::FIRE_AND_FORGET_TOOLS_PER_REQUEST),
-        ),
-        action: "Put a checkpoint in the middle. Ask for a plan before the work, or for a report \
-                 at a named milestone, so a wrong turn surfaces while it is still one wrong turn \
-                 rather than at the end of an hour of unattended tool calls."
-            .to_owned(),
+        problem: RuleId::FireAndForget.problem(evidence.len(), sessions.len()),
+        action: RuleId::FireAndForget.action().to_owned(),
         evidence,
     })
 }
@@ -791,19 +1069,8 @@ fn compaction_churn(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::CompactionChurn,
-        problem: format!(
-            "{} of {} folded sessions compacted their context window {}+ times.",
-            evidence.len(),
-            sessions.len(),
-            thresholds::COMPACTION_CHURN_COMPLETIONS,
-        ),
-        action: "Repeated compaction is the window telling you the transcript has outgrown the \
-                 work. Each round discards context the next round has to rediscover, and what \
-                 survives is a summary of a summary. Land the current piece, write the handoff \
-                 down — what is done, what is next, which files matter — and start the follow-on \
-                 in a fresh session, so the new context begins from that handoff rather than from \
-                 whatever the last compaction happened to keep."
-            .to_owned(),
+        problem: RuleId::CompactionChurn.problem(evidence.len(), sessions.len()),
+        action: RuleId::CompactionChurn.action().to_owned(),
         evidence,
     })
 }
@@ -894,18 +1161,8 @@ fn unreviewed_ship(sessions: &[SessionMetrics]) -> Option<Finding> {
         .collect();
     (!evidence.is_empty()).then(|| Finding {
         rule: RuleId::UnreviewedShip,
-        problem: format!(
-            "{} of {} folded sessions committed code without running a review pass first.",
-            evidence.len(),
-            sessions.len(),
-        ),
-        action: "A review pass is the cheapest place to catch what the writing missed, and it is \
-                 cheapest before the commit rather than after it: once the work is committed the \
-                 next reader is a diff nobody asked for. Run the review skill against the diff \
-                 before committing — the same session, while the context that wrote the code is \
-                 still loaded — rather than trusting the pass that wrote it to also be the pass \
-                 that checks it."
-            .to_owned(),
+        problem: RuleId::UnreviewedShip.problem(evidence.len(), sessions.len()),
+        action: RuleId::UnreviewedShip.action().to_owned(),
         evidence,
     })
 }

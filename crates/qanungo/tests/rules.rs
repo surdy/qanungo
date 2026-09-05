@@ -907,3 +907,122 @@ fn the_unreviewed_ship_rule_anchors_the_commits_and_redacts_their_messages() {
         "the commit message is served — that is what makes the anchor worth having",
     );
 }
+
+/// The committed `RULES.md` is the catalogue this build renders, byte for byte.
+///
+/// This repository has no CI, so a generator nobody runs is a document that goes stale the first
+/// time somebody moves a threshold. The gate is therefore the test suite itself: change a
+/// constant, a lane mapping, a price row, or a redaction pattern, and this fails until the file
+/// is regenerated — which makes the catalogue part of the change rather than a follow-up.
+///
+/// The same idiom the dashboard's "the page computes nothing itself" tests use, applied to a file
+/// on disk instead of to a served payload.
+#[test]
+fn rules_md_matches_the_rendered_catalogue() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("RULES.md");
+    let committed = std::fs::read_to_string(&path).expect("RULES.md is committed at the repo root");
+    let rendered = qanungo::catalogue::render();
+    // Not `assert_eq!`: the two sides are a whole document each, and dumping both of them twice
+    // buries the one sentence a developer needs under 25 KB of Markdown they can already read.
+    assert!(
+        committed == rendered,
+        "RULES.md is out of date with the code it describes. Regenerate it:\n\n    \
+         cargo run -- rules > RULES.md\n\nand commit the result with the change that moved it.",
+    );
+}
+
+/// The catalogue needs no archive, and says so by not taking one.
+///
+/// `qanungo rules` describes the build rather than a window of history. If it ever came to flatten
+/// [`ArchiveArgs`](qanungo::cli::ArchiveArgs), a person could not read what the tool looks for
+/// until they had finished setting the tool up — so the absence of `--patwari-url` is the property
+/// under test, in both directions.
+#[test]
+fn the_catalogue_command_takes_no_archive_arguments() {
+    assert!(
+        matches!(
+            Cli::try_parse_from(["qanungo", "rules"])
+                .expect("rules parses with nothing else")
+                .command,
+            Command::Rules(_),
+        ),
+        "rules parses as itself",
+    );
+    assert!(
+        Cli::try_parse_from(["qanungo", "rules", "--patwari-url", "http://127.0.0.1:9"]).is_err(),
+        "the catalogue must not accept an archive it never reads",
+    );
+}
+
+/// Two renders of the same build are the same bytes.
+///
+/// The equality test above is only a drift gate if the render is a function of the code alone. A
+/// clock, an environment variable, or a filesystem read in there would turn it into a flake that
+/// eventually gets deleted rather than fixed.
+#[test]
+fn the_catalogue_is_deterministic() {
+    assert_eq!(qanungo::catalogue::render(), qanungo::catalogue::render());
+}
+
+/// Every rule reaches the catalogue, with the text the report renders.
+///
+/// The point of generating the document is that it cannot describe a pack the build does not run,
+/// so the assertion is over `RuleId::ALL` rather than over a list of eight names typed here.
+#[test]
+fn the_catalogue_carries_every_rule_and_lane() {
+    let rendered = qanungo::catalogue::render();
+    for rule in RuleId::ALL {
+        assert!(
+            rendered.contains(rule.key()),
+            "{} is missing from the catalogue",
+            rule.key(),
+        );
+        assert!(
+            rendered.contains(rule.title()),
+            "{} is missing its title",
+            rule.key(),
+        );
+        assert!(
+            rendered.contains(rule.action()),
+            "{} is missing its action text",
+            rule.key(),
+        );
+    }
+    for lane in Lane::ALL {
+        assert!(
+            rendered.contains(lane.key()),
+            "{} is missing from the catalogue",
+            lane.key(),
+        );
+    }
+    assert!(rendered.contains(RulePack::current().stamp()));
+}
+
+/// The redaction section names patterns and shows none of them.
+///
+/// A catalogue of secret *shapes* committed to a repository is a different document with a
+/// different audience, so the section carries ids and revision dates only. The canaries below are
+/// the prefixes the scrub anchors on: their presence here would mean the generator had started
+/// printing the pattern set itself.
+#[test]
+fn the_catalogue_names_redaction_patterns_without_printing_them() {
+    let rendered = qanungo::catalogue::render();
+    for pattern in qanungo::redaction::PATTERNS {
+        assert!(
+            rendered.contains(pattern.as_str()),
+            "{pattern} is missing from the catalogue",
+        );
+        assert!(
+            rendered.contains(pattern.added_in()),
+            "{pattern} does not say which revision added it",
+        );
+    }
+    for shape in ["ghp_", "sk-ant-", "AKIA", "xoxb-", "glpat-", "BEGIN "] {
+        assert!(
+            !rendered.contains(shape),
+            "the catalogue printed a pattern rather than its name: {shape}",
+        );
+    }
+}

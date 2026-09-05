@@ -95,6 +95,7 @@ fn run(command: &Command) -> Result<(), Box<dyn Error>> {
         Command::Doctor(args) => command::doctor(args, &mut out)?,
         Command::Flows(args) => command::flows(args, &mut out)?,
         Command::Dashboard(args) => return Ok(dashboard_server::run(args)?),
+        Command::Rules(args) => command::rules(args, &mut out)?,
     }
     out.flush().map_err(command::CommandError::Output)?;
     Ok(())

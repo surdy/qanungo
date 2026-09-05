@@ -27,7 +27,7 @@ Building it is the "first consumer" event that ADR waits for. It exposes a web d
 
 ## Install
 
-qanungo builds with a Rust 1.85+ toolchain (edition 2024) and reads a patwari archive over HTTP. There is **no default archive**: `--patwari-url` is required on every command, and it also reads the `PATWARI_URL` environment variable, so set it once in your shell.
+qanungo builds with a Rust 1.85+ toolchain (edition 2024) and reads a patwari archive over HTTP. There is **no default archive**: `--patwari-url` is required on every command that reads the archive — which is all of them but `rules`, the generated catalogue — and it also reads the `PATWARI_URL` environment variable, so set it once in your shell.
 
 ```sh
 cargo build --release
@@ -58,6 +58,7 @@ cargo run -- doctor --clusters-per-repo 50           # and read the clusters the
 cargo run -- flows                                   # what do I keep asking for, anywhere
 cargo run -- flows --clusters 50 --flows 40          # each section's cut is a default, not a ceiling
 cargo run -- dashboard --bind 192.0.2.10:8878        # a routable address on your private network, unauthenticated, and it says so
+cargo run -- rules                                   # what it looks for; the one command that needs no archive
 ```
 
 The window grammar takes `h`, `d`, and `w` and deliberately not `m`, which would read as either
@@ -72,11 +73,11 @@ and an interval faster than a minute is refused rather than clamped: a warm thre
 measures about **13 s** against the production archive (the snapshot index cut it from ~45 s), and
 polling near that is load on a LAN archive rather than a fresher page.
 
-`--patwari-url` is **required** — there is no built-in archive to fall back on — and it also reads
+`--patwari-url` is **required** on every lane that reads the archive — there is no built-in archive to fall back on — and it also reads
 `PATWARI_URL`, so set that once in your shell and no lane needs the flag again; `--cache-dir`
 overrides the cache root — the blob cache plus the snapshot index beside it — which otherwise lives
 in `$XDG_CACHE_HOME/qanungo` (falling back to `~/.cache/qanungo`) at `0o700` / `0o600`. Both flags
-work on every lane. The coaching report renders **aggregates, tool names, and content hashes only**,
+work on every archive-reading lane; `rules` takes neither, because it reads no archive. The coaching report renders **aggregates, tool names, and content hashes only**,
 and the cost report adds exactly the model, billing-modifier, and repository identifiers the archive
 itself recorded, each clamped on the way out — never transcript content, in either. The four
 documents that do render archived text — the standup's summary prose, `ask`'s matched snippets and
@@ -113,6 +114,10 @@ ADR 0012 anticipated qanungo carrying "application commands such as a prompt-cor
 - **cost** — token/cost breakdown by model and repo (by-machine deferred — the cost fold has no by-device slice yet), and premium-waste flags.
 - **skill & agent finder** — detects repeated requests and the multi-step flows they fall into, pooled across the whole archive rather than per repository, and leaves drafting the reusable skill or custom subagent to a harness skill. It reports requests, never outcomes: an ordering in a transcript is not a cause, and whether a repetition is worth tooling is yours to decide.
 
+## What it looks for
+
+Every rule, every threshold it fires at, the lanes those rules score into, the scoring formula, the price table, and the names of the redaction patterns are catalogued in **[RULES.md](RULES.md)** — and that file is *generated*, not written: `cargo run -- rules` renders it from the same constants the runtime reads, a test fails while the committed copy and the build disagree, and `rules` is the one subcommand that needs no archive and no `--patwari-url`, so you can read what the tool looks for before you have finished setting it up.
+
 ## The dashboard
 
 A plain web app on the tailnet (laptop, phone, TV; no editor, no extension), mirroring
@@ -128,6 +133,7 @@ qanungo itself.
 
 | Document | What it covers |
 | --- | --- |
+| [RULES.md](RULES.md) | **Generated** by `qanungo rules`: the eight rules and what fires each, every threshold with the measurement behind it, the five lanes and the scoring formula, the folds, the price table, the ask rubric, the repetition constants, and the redaction pattern names — pinned to the build by an equality test |
 | [ADR 0001 — Recompute all history with the current rule pack](docs/adr/0001-recompute-all-history-with-the-current-rule-pack.md) | Why no score is ever frozen per session, and what the rule-pack digest in every footer is for |
 | [Pricing sources (2026-08-23)](docs/pricing-sources-2026-08-23.md) | The sourced provenance of every row in the cost lane's date-versioned price table, and every figure it refuses to invent |
 | [Redaction patterns (2026-08-24)](docs/redaction-patterns-2026-08-24.md) | The original pattern research: every prefix, length class, and charset the scrub anchors on, and every deliberate gap |
