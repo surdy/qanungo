@@ -22,6 +22,11 @@
 //! because its excerpt route renders the text of the events a rule counted. The flag is read
 //! **once, at launch**, and belongs to the process rather than to a request: see
 //! [`DashboardArgs`].
+//!
+//! [`OutputArgs`] is the third flattened group and the newest: `--json` on every document lane,
+//! Markdown still the default. It is one flag on one shared struct for the reason the other two
+//! are — six spellings of "give me the data" would be six chances for one of them to mean
+//! something slightly else.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -214,6 +219,25 @@ impl RedactionArgs {
     }
 }
 
+/// Which document a lane writes to stdout, shared by every lane that writes one.
+///
+/// Flattened for the reason [`ArchiveArgs`] and [`RedactionArgs`] are: `--json` has to mean the
+/// same thing on all six lanes, and a seventh inherits it by declaring one field rather than by
+/// somebody remembering to copy a flag.
+///
+/// **Markdown stays the default**, on every lane. The documents are the product — a report is meant
+/// to be read by a person, piped into a pager, or pasted into a skill — and `--json` is the same
+/// fold under a shape a program can index. It is never a *different* fold: see [`crate::json`],
+/// which serializes what the renderers render and computes nothing of its own.
+#[derive(Debug, Args, Clone, Copy)]
+pub struct OutputArgs {
+    /// Write this lane's own data as a JSON envelope on stdout instead of Markdown. The same
+    /// numbers under the same scrub, wrapped in `schema_version`, `command`, `window`,
+    /// `rule_pack`, `generated_at`, `provenance`, and `data`.
+    #[arg(long = "json")]
+    pub json: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct ReportArgs {
     /// How far back to report, as `<count><unit>` with unit `h`, `d`, or `w`.
@@ -222,6 +246,9 @@ pub struct ReportArgs {
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -233,6 +260,9 @@ pub struct CostArgs {
 
     #[command(flatten)]
     pub archive: ArchiveArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 /// The standup lane, and the first command to flatten [`RedactionArgs`].
@@ -251,6 +281,9 @@ pub struct StandupArgs {
 
     #[command(flatten)]
     pub redaction: RedactionArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 /// The ask lane (qanungo #10): plain-language search over the summaries munshi already wrote.
@@ -307,6 +340,9 @@ pub struct AskArgs {
 
     #[command(flatten)]
     pub redaction: RedactionArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 /// The doctor lane (qanungo #11): instructions the archive shows you giving more than once.
@@ -366,6 +402,9 @@ pub struct DoctorArgs {
 
     #[command(flatten)]
     pub redaction: RedactionArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 /// The flows lane (qanungo #13): requests you have repeated anywhere, and the sequences they fall
@@ -434,6 +473,9 @@ pub struct FlowsArgs {
 
     #[command(flatten)]
     pub redaction: RedactionArgs,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 /// The dashboard lane (qanungo #5).

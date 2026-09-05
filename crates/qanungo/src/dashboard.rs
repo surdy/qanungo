@@ -488,173 +488,206 @@ impl Payload<'_> {
         heatmap_value(&Heatmap::fold(&folded.sessions), &columns)
     }
 
-    /// The coaching lane: the window pair, the five lanes, and the findings under them.
+    /// The coaching lane, over this payload's own window. See [`coaching_section`].
     fn coaching_section(&self, tags: &ScopeTags) -> Value {
-        let window = &self.windows.coaching;
-        let folded = self.coaching;
-        // The same two questions the report asks in the same order: is there a comparison window at
-        // all, and if so what did it score? A window too long to place an equal-length one before it
-        // has no `before`, and therefore no arrow anywhere on the page.
-        let comparison_opens_at = folded
-            .compared
-            .then(|| window.comparison_opens_at(folded.generated_at))
-            .flatten();
-        let now = Scorecard::fold(&folded.sessions);
-        let before = comparison_opens_at.map(|_| Scorecard::fold(&folded.previous));
-        let columns = report::harness_columns(&now, before.as_ref());
-        let by_hash: BTreeMap<&str, &SessionMetrics> = folded
-            .sessions
-            .iter()
-            .map(|session| (session.source_hash.as_str(), session))
-            .collect();
-
-        json!({
-            "window": {
-                "last": window.to_string(),
-                "opens_at": stamp(window.opens_at(folded.generated_at)),
-                "comparison_opens_at": comparison_opens_at.map(stamp),
-                "generated_at": stamp(folded.generated_at),
-                "compared": folded.compared,
-            },
-            "sessions": sessions_value(folded, self.redactor),
-            "lanes": Lane::ALL
-                .iter()
-                .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns, self.redactor))
-                .collect::<Vec<_>>(),
-            "findings": folded
-                .findings
-                .iter()
-                .map(|finding| finding_value(finding, &by_hash, tags, self.redactor))
-                .collect::<Vec<_>>(),
-        })
+        coaching_section(&self.windows.coaching, self.coaching, tags, self.redactor)
     }
 
-    /// The cost lane, over its own window: what was spent, on what, where, and what the fold
-    /// refused to turn into money.
+    /// The cost lane, over this payload's own window. See [`cost_section`].
     fn cost_section(&self) -> Value {
-        let window = &self.windows.cost;
-        let folded = self.cost;
-        let totals = &folded.totals;
-        json!({
-            "window": {
-                "last": window.to_string(),
-                "opens_at": stamp(window.opens_at(folded.generated_at)),
-                "comparison_opens_at": folded
-                    .previous
-                    .as_ref()
-                    .and_then(|_| window.comparison_opens_at(folded.generated_at))
-                    .map(stamp),
-                "generated_at": stamp(folded.generated_at),
-            },
-            "sessions": {
-                "priced": totals.priceable_sessions,
-                "token_only": totals.token_only_sessions,
-                "no_signal": totals
-                    .no_signal_sessions
-                    .iter()
-                    .map(|(agent, count)| json!({
-                        "source_agent": format::identifier(agent),
-                        "sessions": count,
-                    }))
-                    .collect::<Vec<_>>(),
-            },
-            "priced": priced_total_value(totals),
-            "by_model": by_model_value(totals),
-            "by_repository": by_repository_value(totals, self.redactor),
-            "caching": caching_value(&totals.priced),
-            "comparison": self.cost_comparison(),
-            "copilot": copilot_value(totals),
-            "flagged": flagged_value(&totals.flagged),
-            "premium": premium_value(&totals.premium),
-            "records_read": totals.records_read,
-            "duplicate_records": totals.duplicate_records,
-            "price_table_revision": PRICE_TABLE_REVISION,
-            "gaps": gaps_value(&folded.skipped),
-        })
+        cost_section(&self.windows.cost, self.cost, self.redactor)
     }
 
-    /// The window-over-window move on the bill, under the CLI's own two refusals.
-    ///
-    /// Three states, because collapsing any two of them would be a page reporting the archive's
-    /// shape as spending: no comparison window was asked for at all; one was, and priced nothing;
-    /// or both windows priced something and there is a real delta to draw. `▲` is more money, which
-    /// is a direction and not a verdict — the page says so beside it.
-    fn cost_comparison(&self) -> Value {
-        let folded = self.cost;
-        let (Some(previous), Some(opens_at)) = (
-            folded.previous.as_ref(),
-            self.windows.cost.comparison_opens_at(folded.generated_at),
-        ) else {
-            return json!({ "state": "no-window" });
-        };
-        if !previous.priced_anything() {
-            return json!({
-                "state": "nothing-priced",
-                "opens_at": stamp(opens_at),
-            });
-        }
-        let now = folded.totals.priced.dollars;
-        let was = previous.priced.dollars;
-        json!({
-            "state": "compared",
-            "opens_at": stamp(opens_at),
-            "was": was,
-            "was_rendered": format::dollars(was),
-            "was_sessions": previous.priceable_sessions,
-            "delta": now - was,
-            "delta_rendered": format::dollars((now - was).abs()),
-            // The glyph the coaching lane's arrows use, chosen the same way, so one page does not
-            // spell "more" two ways. Equality is exact on purpose: two windows that priced the same
-            // float to the cent still moved by nothing.
-            "direction": if now > was {
-                "up"
-            } else if now < was {
-                "down"
-            } else {
-                "flat"
-            },
-            "glyph": if now > was {
-                "▲"
-            } else if now < was {
-                "▼"
-            } else {
-                "="
-            },
-        })
-    }
-
-    /// The standup lane, over its own window: the archive's own words, as the fold scrubbed them.
+    /// The standup lane, over this payload's own window. See [`standup_section`].
     fn standup_section(&self) -> Value {
-        let window = &self.windows.standup;
-        let folded = self.standup;
-        let standup = &folded.standup;
-        json!({
-            "window": {
-                "last": window.to_string(),
-                "opens_at": stamp(window.opens_at(folded.generated_at)),
-                "generated_at": stamp(folded.generated_at),
-            },
-            "sessions": standup.sessions,
-            "repositories_narrated": standup.repositories_narrated(),
-            "repositories": standup
-                .repositories
+        standup_section(&self.windows.standup, self.standup)
+    }
+
+    /// Tags every session of the reported coaching window. See [`scope_tags`].
+    fn scope_tags(&self) -> ScopeTags {
+        scope_tags(self.coaching, self.redactor)
+    }
+}
+
+/// The coaching lane: the window pair, the five lanes, and the findings under them.
+///
+/// A free function over `(window, fold, tags, redactor)` rather than a method, because the CLI's
+/// `report --json` serializes the *same* section over the *same* [`Folded`] ([`crate::json`]). A
+/// second builder for the terminal would be a second shape to keep in step with this one, and
+/// "the page and the `--json` output disagree" is exactly the class of bug the fold/render split
+/// was made to rule out in the first place.
+pub(crate) fn coaching_section(
+    window: &Window,
+    folded: &Folded,
+    tags: &ScopeTags,
+    redactor: &Redactor,
+) -> Value {
+    // The same two questions the report asks in the same order: is there a comparison window at
+    // all, and if so what did it score? A window too long to place an equal-length one before it
+    // has no `before`, and therefore no arrow anywhere on the page.
+    let comparison_opens_at = folded
+        .compared
+        .then(|| window.comparison_opens_at(folded.generated_at))
+        .flatten();
+    let now = Scorecard::fold(&folded.sessions);
+    let before = comparison_opens_at.map(|_| Scorecard::fold(&folded.previous));
+    let columns = report::harness_columns(&now, before.as_ref());
+    let by_hash: BTreeMap<&str, &SessionMetrics> = folded
+        .sessions
+        .iter()
+        .map(|session| (session.source_hash.as_str(), session))
+        .collect();
+
+    json!({
+        "window": {
+            "last": window.to_string(),
+            "opens_at": stamp(window.opens_at(folded.generated_at)),
+            "comparison_opens_at": comparison_opens_at.map(stamp),
+            "generated_at": stamp(folded.generated_at),
+            "compared": folded.compared,
+        },
+        "sessions": sessions_value(folded, redactor),
+        "lanes": Lane::ALL
+            .iter()
+            .map(|lane| lane_value(*lane, &now, before.as_ref(), &columns, redactor))
+            .collect::<Vec<_>>(),
+        "findings": folded
+            .findings
+            .iter()
+            .map(|finding| finding_value(finding, &by_hash, tags, redactor))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The cost lane, over its own window: what was spent, on what, where, and what the fold
+/// refused to turn into money.
+///
+/// A free function for the reason [`coaching_section`] is: `qanungo cost --json` serves this
+/// section over the [`FoldedCost`] the Markdown priced, rather than a second shape beside it.
+pub(crate) fn cost_section(window: &Window, folded: &FoldedCost, redactor: &Redactor) -> Value {
+    let totals = &folded.totals;
+    json!({
+        "window": {
+            "last": window.to_string(),
+            "opens_at": stamp(window.opens_at(folded.generated_at)),
+            "comparison_opens_at": folded
+                .previous
+                .as_ref()
+                .and_then(|_| window.comparison_opens_at(folded.generated_at))
+                .map(stamp),
+            "generated_at": stamp(folded.generated_at),
+        },
+        "sessions": {
+            "priced": totals.priceable_sessions,
+            "token_only": totals.token_only_sessions,
+            "no_signal": totals
+                .no_signal_sessions
                 .iter()
-                .map(|group| json!({
-                    "repository": group.repository,
-                    "sessions": group
-                        .sessions
-                        .iter()
-                        .map(standup_session_value)
-                        .collect::<Vec<_>>(),
+                .map(|(agent, count)| json!({
+                    "source_agent": format::identifier(agent),
+                    "sessions": count,
                 }))
                 .collect::<Vec<_>>(),
-            "decisions": rolled_up_value(&standup.decisions),
-            "open_items": rolled_up_value(&standup.open_items),
-            "gaps": gaps_value(&standup.gaps),
-            "redaction": redaction_value(&standup.redaction),
-        })
-    }
+        },
+        "priced": priced_total_value(totals),
+        "by_model": by_model_value(totals),
+        "by_repository": by_repository_value(totals, redactor),
+        "caching": caching_value(&totals.priced),
+        "comparison": cost_comparison(window, folded),
+        "copilot": copilot_value(totals),
+        "flagged": flagged_value(&totals.flagged),
+        "premium": premium_value(&totals.premium),
+        "records_read": totals.records_read,
+        "duplicate_records": totals.duplicate_records,
+        "price_table_revision": PRICE_TABLE_REVISION,
+        "gaps": gaps_value(&folded.skipped),
+    })
+}
 
+/// The window-over-window move on the bill, under the CLI's own two refusals.
+///
+/// Three states, because collapsing any two of them would be a page reporting the archive's
+/// shape as spending: no comparison window was asked for at all; one was, and priced nothing;
+/// or both windows priced something and there is a real delta to draw. `▲` is more money, which
+/// is a direction and not a verdict — the page says so beside it.
+fn cost_comparison(window: &Window, folded: &FoldedCost) -> Value {
+    let (Some(previous), Some(opens_at)) = (
+        folded.previous.as_ref(),
+        window.comparison_opens_at(folded.generated_at),
+    ) else {
+        return json!({ "state": "no-window" });
+    };
+    if !previous.priced_anything() {
+        return json!({
+            "state": "nothing-priced",
+            "opens_at": stamp(opens_at),
+        });
+    }
+    let now = folded.totals.priced.dollars;
+    let was = previous.priced.dollars;
+    json!({
+        "state": "compared",
+        "opens_at": stamp(opens_at),
+        "was": was,
+        "was_rendered": format::dollars(was),
+        "was_sessions": previous.priceable_sessions,
+        "delta": now - was,
+        "delta_rendered": format::dollars((now - was).abs()),
+        // The glyph the coaching lane's arrows use, chosen the same way, so one page does not
+        // spell "more" two ways. Equality is exact on purpose: two windows that priced the same
+        // float to the cent still moved by nothing.
+        "direction": if now > was {
+            "up"
+        } else if now < was {
+            "down"
+        } else {
+            "flat"
+        },
+        "glyph": if now > was {
+            "▲"
+        } else if now < was {
+            "▼"
+        } else {
+            "="
+        },
+    })
+}
+
+/// The standup lane, over its own window: the archive's own words, as the fold scrubbed them.
+///
+/// It takes no redactor, and that is the point rather than an omission: [`FoldedStandup`] holds
+/// nothing pre-scrub, so there is nothing here to scrub and no second posture to keep in step. The
+/// terminal's `standup --json` reaches this same function for the same reason the page does.
+pub(crate) fn standup_section(window: &Window, folded: &FoldedStandup) -> Value {
+    let standup = &folded.standup;
+    json!({
+        "window": {
+            "last": window.to_string(),
+            "opens_at": stamp(window.opens_at(folded.generated_at)),
+            "generated_at": stamp(folded.generated_at),
+        },
+        "sessions": standup.sessions,
+        "repositories_narrated": standup.repositories_narrated(),
+        "repositories": standup
+            .repositories
+            .iter()
+            .map(|group| json!({
+                "repository": group.repository,
+                "sessions": group
+                    .sessions
+                    .iter()
+                    .map(standup_session_value)
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "decisions": rolled_up_value(&standup.decisions),
+        "open_items": rolled_up_value(&standup.open_items),
+        "gaps": gaps_value(&standup.gaps),
+        "redaction": redaction_value(&standup.redaction),
+    })
+}
+
+impl Payload<'_> {
     /// The scope control's whole vocabulary, and every number a scope selection can put on screen.
     ///
     /// # Why the payload carries every scope
@@ -1337,7 +1370,7 @@ fn rolled_up_value(lines: &[RolledUp]) -> Value {
 
 /// Sessions that contributed nothing, grouped by reason. The same shape all three lanes' gaps take,
 /// because they are the same [`SkippedNote`].
-fn gaps_value(notes: &[SkippedNote]) -> Value {
+pub(crate) fn gaps_value(notes: &[SkippedNote]) -> Value {
     notes
         .iter()
         .map(|note| json!({ "count": note.count, "reason": note.reason }))
@@ -1348,7 +1381,7 @@ fn gaps_value(notes: &[SkippedNote]) -> Value {
 ///
 /// The type has nothing else to render: a [`RedactionReport`] cannot carry what it matched, which is
 /// qanungo #8's counts-only invariant held by construction rather than by this function's restraint.
-fn redaction_value(report: &RedactionReport) -> Value {
+pub(crate) fn redaction_value(report: &RedactionReport) -> Value {
     json!({
         "total": report.total(),
         "fired": report
@@ -1511,41 +1544,36 @@ fn trend_value(trend: Option<Trend>) -> Value {
 /// anything. That equality is the contract: a tag is a claim about which scope's numbers a row is
 /// counted in, and it is pinned by a test that reconciles the tags against the per-scope fire
 /// counts serialized beside them.
-type ScopeTags = BTreeMap<String, ScopeTag>;
+pub(crate) type ScopeTags = BTreeMap<String, ScopeTag>;
 
 /// One session's scope membership, as the wire spells it. The device label is the second primary
 /// axis; the harness label is the free sub-axis both primary axes carry.
-struct ScopeTag {
+pub(crate) struct ScopeTag {
     repository: String,
     device: String,
     harness: String,
 }
 
-impl Payload<'_> {
-    /// Tags every session of the reported coaching window.
-    ///
-    /// The comparison window is deliberately not in here. Nothing on the page cites a comparison
-    /// session — it exists to produce an earlier score and nothing else — and a tag for a row that
-    /// cannot be rendered would be an index into a list that does not exist.
-    fn scope_tags(&self) -> ScopeTags {
-        self.coaching
-            .sessions
-            .iter()
-            .map(|session| {
-                (
-                    session.source_hash.clone(),
-                    ScopeTag {
-                        repository: scopes::repository_label(
-                            session.repository.as_deref(),
-                            self.redactor,
-                        ),
-                        device: scopes::device_label(session.hostname.as_deref(), self.redactor),
-                        harness: evidence::identifier_field(&session.source_agent, self.redactor),
-                    },
-                )
-            })
-            .collect()
-    }
+/// Tags every session of the reported coaching window.
+///
+/// The comparison window is deliberately not in here. Nothing on the page cites a comparison
+/// session — it exists to produce an earlier score and nothing else — and a tag for a row that
+/// cannot be rendered would be an index into a list that does not exist.
+pub(crate) fn scope_tags(folded: &Folded, redactor: &Redactor) -> ScopeTags {
+    folded
+        .sessions
+        .iter()
+        .map(|session| {
+            (
+                session.source_hash.clone(),
+                ScopeTag {
+                    repository: scopes::repository_label(session.repository.as_deref(), redactor),
+                    device: scopes::device_label(session.hostname.as_deref(), redactor),
+                    harness: evidence::identifier_field(&session.source_agent, redactor),
+                },
+            )
+        })
+        .collect()
 }
 
 fn finding_value(
@@ -1826,7 +1854,7 @@ impl AskAnswer<'_> {
 
 /// What this route searches, stated in one word wherever it is stated. All of history, and cut by no
 /// scope: see [`AskAnswer`].
-const ASK_SCOPE: &str = "all-history";
+pub(crate) const ASK_SCOPE: &str = "all-history";
 
 /// One ranked hit: where the session is, why it ranked, and the one line that shows it.
 ///
@@ -1837,7 +1865,7 @@ const ASK_SCOPE: &str = "all-history";
 /// `source_hash` is a citation and **not a link**. The page renders it as selectable text; there is
 /// no `href` anywhere on that page and there will not be one, because Patwari serves unredacted
 /// blobs (decision 11).
-fn ask_hit_value(rank: usize, hit: &crate::ask::AskHit) -> Value {
+pub(crate) fn ask_hit_value(rank: usize, hit: &crate::ask::AskHit) -> Value {
     json!({
         "rank": rank,
         "title": hit.title,
